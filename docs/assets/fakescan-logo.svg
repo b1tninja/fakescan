@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 560" role="img" aria-label="fakescan">
+  <title>fakescan</title>
+  <rect class="body" x="72" y="268" width="368" height="72" rx="10" fill="#1a1f26"/>
+  <rect x="96" y="332" width="320" height="18" rx="4" fill="#1a1f26"/>
+  <circle cx="396" cy="304" r="8" fill="#0d9488"/>
+  <path d="M96 268 L416 268 L400 148 L112 160 Z" fill="#2a313c"/>
+  <rect x="248" y="262" width="16" height="12" rx="2" fill="#0d9488"/>
+  <rect x="128" y="176" width="256" height="92" rx="2" fill="#f4f2ea"/>
+  <!-- Corner L-marks -->
+  <path d="M140 188h22v6h-16v16h-6z" fill="#1a1f26"/>
+  <path d="M372 188h-22v6h16v16h6z" fill="#1a1f26"/>
+  <path d="M140 256h6v-16h16v-6h-22z" fill="#1a1f26"/>
+  <path d="M372 256h-6v-16h-16v-6h22z" fill="#1a1f26"/>
+  <!-- Asymmetric F -->
+  <path d="M168 198h48v10h-34v12h28v10h-28v18h-14z" fill="#0d9488"/>
+  <!-- Mini QR -->
+  <g transform="translate(320 214)">
+    <rect width="42" height="42" fill="#f4f2ea"/>
+    <rect x="0" y="0" width="14" height="14" fill="#1a1f26"/>
+    <rect x="3" y="3" width="8" height="8" fill="#f4f2ea"/>
+    <rect x="5" y="5" width="4" height="4" fill="#1a1f26"/>
+    <rect x="28" y="0" width="14" height="14" fill="#1a1f26"/>
+    <rect x="31" y="3" width="8" height="8" fill="#f4f2ea"/>
+    <rect x="33" y="5" width="4" height="4" fill="#1a1f26"/>
+    <rect x="0" y="28" width="14" height="14" fill="#1a1f26"/>
+    <rect x="3" y="31" width="8" height="8" fill="#f4f2ea"/>
+    <rect x="5" y="33" width="4" height="4" fill="#1a1f26"/>
+    <rect x="18" y="0" width="4" height="4" fill="#1a1f26"/>
+    <rect x="18" y="10" width="4" height="4" fill="#1a1f26"/>
+    <rect x="24" y="18" width="4" height="4" fill="#1a1f26"/>
+    <rect x="18" y="24" width="4" height="4" fill="#1a1f26"/>
+    <rect x="28" y="28" width="4" height="4" fill="#1a1f26"/>
+    <rect x="34" y="34" width="4" height="4" fill="#1a1f26"/>
+    <rect x="18" y="34" width="4" height="4" fill="#1a1f26"/>
+    <rect x="28" y="18" width="4" height="4" fill="#1a1f26"/>
+  </g>
+  <text x="256" y="420" text-anchor="middle" fill="#1a1f26"
+        font-family="ui-sans-serif, system-ui, Segoe UI, sans-serif"
+        font-weight="700" font-size="56" letter-spacing="0.06em">fakescan</text>
+</svg>
