@@ -1,0 +1,23 @@
+services:
+  fakescan:
+    build: .
+    image: fakescan:local
+    ports:
+      - "3920:3920"
+    environment:
+      RUST_LOG: fakescan=info
+    # Discovery needs host networking on Linux so UDP 3702 reaches the LAN.
+    # Uncomment when testing Windows WSD install against this host:
+    # network_mode: host
+    command:
+      - --listen
+      - 0.0.0.0:3920
+      - --profiles
+      - /app/profiles
+      - --profile
+      - brother-wsd
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3920/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

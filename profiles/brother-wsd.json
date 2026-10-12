@@ -1,0 +1,15 @@
+{
+  "id": "brother-wsd",
+  "label": "Fake WSD scanner (lite caps)",
+  "connection": "wsd",
+  "optical": null,
+  "feeder": {
+    "sticky_ready": false,
+    "pages_min": 0,
+    "pages_max": 30
+  },
+  "dpi": [100, 200, 300],
+  "formats": ["jpeg", "tiff"],
+  "page_sizes": ["letter", "a4", "legal", "photo", "business_card"],
+  "sources": ["feeder", "glass"]
+}

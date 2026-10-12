@@ -1,0 +1,23 @@
+{
+  "name": "fakescan",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "runArgs": ["--network=host"],
+  "forwardPorts": [3920],
+  "postCreateCommand": "cargo build -p fakescan",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.targetDir": "target"
+      }
+    }
+  },
+  "remoteUser": "root"
+}

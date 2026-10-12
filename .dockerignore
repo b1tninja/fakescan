@@ -1,0 +1,10 @@
+.git
+.github
+.target
+target
+**/*.md
+!README.md
+.devcontainer
+docs
+*.pdb
+.env

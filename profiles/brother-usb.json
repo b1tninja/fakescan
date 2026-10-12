@@ -1,0 +1,15 @@
+{
+  "id": "brother-usb",
+  "label": "Fake USB scanner (full caps)",
+  "connection": "usb",
+  "optical": { "x_dpi": 1200, "y_dpi": 2400 },
+  "feeder": {
+    "sticky_ready": true,
+    "pages_min": 0,
+    "pages_max": 30
+  },
+  "dpi": [100, 150, 200, 300, 600, 1200],
+  "formats": ["bmp"],
+  "page_sizes": ["letter", "a4", "legal"],
+  "sources": ["feeder", "glass"]
+}
