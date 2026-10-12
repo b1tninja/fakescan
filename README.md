@@ -1,4 +1,4 @@
-﻿# fakescan
+# fakescan
 
 <p align="center">
   <img src="docs/assets/fakescan-logo.svg" alt="fakescan" width="220" />
@@ -6,7 +6,7 @@
 
 A **fake scanner** for testing acquire paths: scriptable glass/feeder, synthetic page patterns, image defects, and capability profiles that look like real WIA / WSD devices â€” without a physical MFP.
 
-Built for [pdfcraft](https://github.com/) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). Companion **[fakeprint](../fakeprint)** covers WSD Print on `:3921` â€” [docs/siblings.md](docs/siblings.md).
+Built for [pdfcraft](https://github.com/) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). Companion **[fakeprint](https://github.com/b1tninja/fakeprint)** covers WSD Print on `:3921` â€” [docs/siblings.md](docs/siblings.md).
 
 ## Docs
 

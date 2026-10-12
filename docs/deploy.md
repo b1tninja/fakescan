@@ -51,3 +51,5 @@ docker run --rm -p 3920:3920 ghcr.io/b1tninja/fakescan:latest
 ## What Docker does *not* give you
 
 Windows still must **install** the device (WSDScan) before pdfcraft’s WIA path can see it. The container is the Scan Service endpoint; Imaging Devices registration is a separate Windows step.
+
+Use `scripts/fakescan.ps1 install` to verify SOAP/discovery and open Add device — see [windows.md](windows.md).
