@@ -50,6 +50,29 @@ curl -X POST http://127.0.0.1:3920/v1/pattern \
 | `duplex_pair` | Even → blue front, odd → red back; also COM `fakescan-side:front\|back` |
 | `qr` | Large centered QR (decode robustness) |
 | `wia_plain` | WIA accept trial: gray wedges only — **no** banner, QR, or COM; baseline JPEG Q≈80 (`EncodeOpts::WIA_PLAIN`) |
+| `info` | Server diagnostics: profile, UUID, DPI, format, job id, client IP, timestamp. QR carries `client=<ip>` when caller is known. |
+| `anac` / `whoami` | ANAC-style client IP readback: caller's `ip:port` in large text, centred. QR carries `client=<ip>`. |
+| `slant_edge` | ~5° slanted edge (ISO 16067-1 style; no MTF math) — dark left / light right with narrow gradient transition; use to check for edge fringing or softening |
+| `textladder` | Text size ladder — the phrase "SCAN TEST 12345 ABCDE" rendered at seven scales (8× → 1×); the smallest readable row indicates effective resolution |
+| `testpage` | All-in-one composite (see below) |
+| `cmyk` | CMYK bars + tint ladders — four columns (C, M, Y, K) with solid 100 % bar (labelled), eight tint steps fading to light, and a bottom overprint strip (C+M, M+Y, C+Y, C+M+Y); RGB-approximated |
+| `nozzle` | Nozzle-check bands — 7 colour channels (C, M, Y, K, R, G, B) as horizontal line groups in the top half and vertical line groups in the bottom half; a missing or broken stripe indicates a channel gap |
+| `align` | Alignment / registration crosses — centre accent crosshair, corner registration crosses with open-square surrounds, mid-edge marks, and tick marks at regular intervals along all four edges |
+| `grid` | Margin frames + scale rules — inner 0.5-inch margin frame, light inch-grid, and ruler ticks (inch + quarter-inch) along all four edges; page is letter (8.5 × 11 in) so tick spacing scales with DPI |
+| `lines` | Resolution line ladder — six coarse-to-fine horizontal line groups (left half) and the same six frequencies as vertical lines (right half); half-periods 32, 16, 8, 4, 3, 2 px so effective lpi scales with DPI |
+
+## testpage composition
+
+`testpage` divides the page into four horizontal bands:
+
+| Band | Height | Content |
+|------|--------|---------|
+| Top | 45 % | Left 38 %: gray step wedges (black → white) · Right 62 %: ~5° slant edge |
+| Patches | 12 % | R / G / B / gray cells (four equal columns) |
+| Ladder | 33 % | Text size ladder at three scales: 5×, 3×, 1× |
+| Corners | 10 % | L-corner marks at the four corners of the band + a centre cross |
+
+All sub-regions are drawn with primitive `fill_rect` / `draw_glyph` calls; no recursive JPEG encode. The top banner and corner QR code are stamped by the normal render path.
 
 ## Machine-readable IDs (no OCR)
 

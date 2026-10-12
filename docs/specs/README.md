@@ -23,12 +23,18 @@
    └──────────────────────────────────────────────────────────┘
 ```
 
+## Prefer `docs/reference/` for schema rules
+
+Element-level rules (Format fallback, MustHonor, Validate vs Create, fault QNames, checked-in XSD/WSDL) live in **[../reference/](../reference/README.md)**. Spec → implementation map: **[../coverage.md](../coverage.md)**.
+
+This folder is the **stack narrative** (how DPWS pieces fit together on the wire).
+
 ## Documents in this folder
 
 | Doc | Spec | What it covers |
 |-----|------|----------------|
-| [ws-scan.md](ws-scan.md) | Microsoft Scan Service Definition V1.0 | Scan SOAP ops, namespaces, tickets, MTOM |
-| [mtom-retrieveimage.md](mtom-retrieveimage.md) | MS RetrieveImageResponse + XOP/MTOM | packaging A/B closed; JPEG payload next vs `mtom_response` |
+| [ws-scan.md](ws-scan.md) | Microsoft Scan Service Definition V1.0 | Scan SOAP ops overview, namespaces, tickets, MTOM |
+| [mtom-retrieveimage.md](mtom-retrieveimage.md) | MS RetrieveImageResponse + XOP/MTOM | accept cleared (XOP `2004/08` + optical SOF); packaging unit-locked via `build_mtom` |
 | [dpws.md](dpws.md) | OASIS DPWS 1.1 | Device vs hosted service, metadata shape |
 | [ws-discovery.md](ws-discovery.md) | OASIS WS-Discovery 1.1 (+ 2005/04 wire) | Hello / Probe / Resolve, UDP 3702 |
 | [ws-transfer.md](ws-transfer.md) | W3C Submission WS-Transfer | `Get` on the Device EPR |
@@ -39,7 +45,7 @@
 
 | Artifact | Where |
 |----------|--------|
-| **Scan Service Definition V1.0** (Word + WSDL/XSD, ~1.5 MB) | [Implementing Web Services on Devices for Printing](https://learn.microsoft.com/en-us/windows-hardware/design/whitepapers/implementing-web-services-on-devices-for-printing) (same page hosts Scan Device Definition V1.0) |
+| **Scan Service Definition V1.0** (Word + WSDL/XSD) | Zip + mirror: [reference/sources.md](../reference/sources.md) / [reference/schema/](../reference/schema/) |
 | HTML op catalog | [WSD Scan Service Operation Elements](https://learn.microsoft.com/en-us/windows-hardware/drivers/image/wsd-scan-service-operation-elements) |
 | DPWS 1.1 | [docs.oasis-open.org/ws-dd/dpws](https://docs.oasis-open.org/ws-dd/dpws/wsdd-dpws-1.1-spec.html) |
 | WS-Discovery 1.1 | [docs.oasis-open.org/ws-dd/discovery](https://docs.oasis-open.org/ws-dd/discovery/1.1/os/wsdd-discovery-1.1-spec-os.html) |

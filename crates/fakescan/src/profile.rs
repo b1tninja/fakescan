@@ -15,6 +15,33 @@ pub struct Profile {
     pub formats: Vec<String>,
     pub page_sizes: Vec<String>,
     pub sources: Vec<String>,
+    /// WSD ColorProcessing tokens this profile accepts (`RGB24`, `Grayscale8`,
+    /// `BlackAndWhite1`). Empty / omitted → any token soft-maps via
+    /// [`crate::effects::ColorMode::parse`] (no allow-list).
+    #[serde(default)]
+    pub colors: Vec<String>,
+    /// When true, ValidateScanTicket / CreateScanJob refuse dpi, format, or
+    /// color values that are not in this profile's lists (default true).
+    #[serde(default = "default_refuse_unknown")]
+    pub refuse_unknown: bool,
+    /// When true (default), JFIF / JPEG embeds inject `fakescan-page:` COM
+    /// markers. Set false for WIA experiments that suspect COM breaks accept.
+    /// Overridable at runtime via `POST /v1/jpeg-com` or `FAKESCAN_JPEG_COM`.
+    #[serde(default = "default_jpeg_com")]
+    pub jpeg_com: bool,
+    /// When true, ImageInformation `BytesPerLine` is 0 for compressed formats
+    /// (MS remarks). Default false keeps Brother/wsdscdrv stride (JFIF =
+    /// width×3).
+    #[serde(default)]
+    pub bytes_per_line_ms: bool,
+}
+
+fn default_refuse_unknown() -> bool {
+    true
+}
+
+fn default_jpeg_com() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +55,10 @@ pub struct FeederCaps {
     pub sticky_ready: bool,
     pub pages_min: u32,
     pub pages_max: u32,
+    /// Hardware ADF duplex (`ADFSupportsDuplex` + `ADFBack`; `InputSource` ADFDuplex).
+    /// Distinct from manual duplex (`POST /v1/pages` side/order + pdfcraft `--reverse`).
+    #[serde(default)]
+    pub duplex: bool,
 }
 
 impl Profile {

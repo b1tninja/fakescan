@@ -35,9 +35,9 @@ Invoke-RestMethod -Method POST -Uri http://127.0.0.1:3920/v1/jpeg-com `
 
 `EncodeOpts` knobs: `inject_jpeg_com`, `stamp_qr`, `stamp_banner`, `jpeg_quality`. Pattern `wia_plain` selects `EncodeOpts::WIA_PLAIN` regardless of `jpeg_com`.
 
-JFIF encode (all patterns) uses `jpeg-encoder` toward Brother WSD shape: baseline SOF0, **4:2:0**, APP0 density in dpi, DRI = one MCU row, component ids 1/2/3. Live WIA Transfer on Fake still CancelJob after that change — see [e2e-wia-status.md](e2e-wia-status.md).
+JFIF encode (all patterns) uses `jpeg-encoder` toward Brother WSD shape: baseline SOF0, **4:2:0**, APP0 density in dpi, DRI = one MCU row, component ids 1/2/3, then `reshape_jpeg_brother_layout` packs **one DQT + one DHT** and orders APP0→DQT→DRI→SOF→DHT→SOS. Live WIA Transfer on Fake still CancelJob after that change — see [e2e-wia-status.md](e2e-wia-status.md).
 
-Protocol faults (`jam`, `cover_open`, `slow`, `jam_after_n`, `empty_mid_job`) are separate — see below and [roadmap.md](roadmap.md) for remaining mid-job knobs (`multi_feed`, …).
+Protocol faults (`jam`, `cover_open`, `multi_feed`, `slow`, `jam_after_n`, `empty_mid_job`, `offline`, `offline_after_n`, `multi_feed_after_n`, `abort_retrieve`, …) are separate — see below and [roadmap.md](roadmap.md).
 
 ## Set effects
 
@@ -105,7 +105,7 @@ CreateScanJob / ValidateScanTicket read `<wscn:ColorProcessing>`:
 | `Grayscale8` / `Grayscale` / `Gray8` | Luma (R=G=B) |
 | `BW1` / `BlackAndWhite1` | Threshold bilevel |
 
-GetScannerElements advertises `RGB24`, `Grayscale8`, and `BlackAndWhite1` (WSD ColorEntry; not the shorthand `BW1`).
+GetScannerElements advertises ColorEntry values from the profile `colors` allow-list (WSD tokens: `RGB24`, `Grayscale8`, `BlackAndWhite1` — not the shorthand `BW1`). Empty `colors` → Brother-shaped BW → Gray → RGB.
 
 ## Compose recipes
 
@@ -135,12 +135,20 @@ curl -X POST http://127.0.0.1:3920/v1/fault -H "content-type: application/json" 
 | Field | Meaning |
 |-------|---------|
 | `jam` / `cover_open` | Immediate ScannerStatus reasons |
-| `ms` | Same as `POST /v1/slow` |
-| `jam_after_n` | Trip MediaJam when `page_index >= N` (0 = off) |
-| `empty_mid_job` | Return NoImagesAvailable when `page_index >= N` (0 = off) |
+| `multi_feed` | Immediate `MultipleFeedError` (double-pick) |
+| `lamp_error` | Immediate `LampError` + refuse job ops |
+| `busy` | Status `Processing`; refuse Subscribe/Create/Retrieve |
+| `offline` | Sticky offline (`AttentionRequired` + NotAcceptingJobs) |
+| `ms` | Same as `POST /v1/slow` `ms` (pre-retrieve sleep) |
+| `bps` (on `/v1/slow` only) | Throttle RetrieveImage MTOM send (bytes/sec). `0` clears. Keeps `Content-Length` — do not use HTTP chunked framing (wsdscdrv hangs). |
+| `jam_after_n` | After N pages, RetrieveImage faults with SOAP subcode `wscn:ClientErrorMediaJam` (0 = off) |
+| `multi_feed_after_n` | After N pages, RetrieveImage faults with `wscn:ClientErrorMultipleFeed` (0 = off) |
+| `empty_mid_job` | After N pages, RetrieveImage faults with SOAP subcode `wscn:ClientErrorNoImagesAvailable` (0 = off) |
+| `offline_after_n` | After N pages, go offline and refuse further Retrieve/Create (0 = off) |
+| `abort_retrieve` | Cut every RetrieveImage MTOM mid-send (stream error; full `Content-Length`) |
+| `abort_retrieve_after_n` | After N pages, abort MTOM mid-send and arm sticky `abort_retrieve` (0 = off) |
+| `abort_retrieve_bytes` | Bytes to send before abort (`0` = half the assembled MTOM body) |
 | `lamp_warmup_ms` | Extra delay on the first RetrieveImage of each job |
-
-Still later (roadmap): `multi_feed`, `abort_retrieve`.
 
 Python / PowerShell:
 

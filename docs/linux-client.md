@@ -94,7 +94,7 @@ docker compose up --build -d --wait
 docker compose down
 ```
 
-The script waits for `/health`, loads one page, lists devices, opens the device, and attempts a one-page acquire. Listing/open are required; acquire is best-effort if a SOAP gap blocks the scan job (exit still 0 unless `ACQUIRE_REQUIRED=1`). Against the current WS-Scan stubs (`GetScannerElements` → `CreateScanJob` → `RetrieveImage` MTOM), a one-page PNG acquire has been observed to succeed.
+The script waits for `/health`, loads one page, lists devices, opens the device, and attempts a one-page acquire. Listing/open are required; acquire is best-effort if a SOAP gap blocks the scan job (exit still 0 unless `ACQUIRE_REQUIRED=1`). Against `GetScannerElements` → `CreateScanJob` → `RetrieveImage` (MTOM), a one-page PNG acquire has been observed to succeed.
 
 On GitHub Actions, the `linux-sane` job in `.github/workflows/ci.yml` runs the same path on `ubuntu-latest`.
 

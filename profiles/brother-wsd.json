@@ -6,10 +6,14 @@
   "feeder": {
     "sticky_ready": false,
     "pages_min": 0,
-    "pages_max": 30
+    "pages_max": 30,
+    "duplex": true
   },
   "dpi": [100, 200, 300],
-  "formats": ["jpeg", "tiff"],
+  "formats": ["jfif", "tiff-single-uncompressed"],
+  "jpeg_com": true,
   "page_sizes": ["letter", "a4", "legal", "photo", "business_card"],
-  "sources": ["feeder", "glass"]
+  "sources": ["feeder", "glass"],
+  "colors": ["RGB24", "Grayscale8", "BlackAndWhite1"],
+  "refuse_unknown": true
 }

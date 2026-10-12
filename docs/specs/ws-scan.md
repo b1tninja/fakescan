@@ -12,6 +12,7 @@ The **scanner application protocol**: SOAP operations on the hosted Scan Service
 | Companion | **Scan Device Definition V1.0** (device-level types / categories) |
 | Download hub | [Implementing Web Services on Devices for Printing](https://learn.microsoft.com/en-us/windows-hardware/design/whitepapers/implementing-web-services-on-devices-for-printing) |
 | HTML element catalog | [WSD Scan Service Operation Elements](https://learn.microsoft.com/en-us/windows-hardware/drivers/image/wsd-scan-service-operation-elements) |
+| Distilled rules + XSD | [docs/reference/](../reference/README.md) · coverage [coverage.md](../coverage.md) |
 
 Windows calls the inbox consumer path **WDP (Windows Device Protocol) for scanners**; the XML namespace still says `wdp/scan`.
 
@@ -71,11 +72,11 @@ Two initiation modes in the spec:
 
 `MustHonor` on ticket fields: if true and unsupported → reject; if false → substitute/ignore.
 
-Important faults: `ClientErrorNoImagesAvailable`, `ClientErrorFormatNotSupported`, `ServerErrorNotAcceptingJobs`, …
+Important faults: `wscn:ClientErrorNoImagesAvailable`, `wscn:ClientErrorMediaJam` (mid-job `jam_after_n`), `ClientErrorFormatNotSupported`, `ServerErrorNotAcceptingJobs`, …
 
 ### RetrieveImage
 
-Requires `JobId` + `JobToken` from CreateScanJob. Response body is `ScanData` with an `xop:Include` pointing at an MTOM MIME part (`jfif`, `png`, `tiff-…`, etc.). Faults when no pages left: `ClientErrorNoImagesAvailable`.
+Requires `JobId` + `JobToken` from CreateScanJob. Response body is `ScanData` with an `xop:Include` pointing at an MTOM MIME part (`jfif`, `png`, `tiff-…`, etc.). Faults when no pages left: `wscn:ClientErrorNoImagesAvailable`. Mid-job jam (`jam_after_n`): SOAP subcode `wscn:ClientErrorMediaJam`.
 
 Image formats catalog for fakescan: [formats.md](../formats.md).
 

@@ -76,5 +76,5 @@ Sticky WIA offline after restart (PnP OK, no `/ScannerService` POST): see [windo
 | Message | Code |
 |---------|------|
 | Announcer + Bye | `crates/fakescan/src/discovery.rs` |
-| Counters | `/v1/status` → `wsd_hellos_sent`, `probes_answered`, … |
+| Counters | `/v1/status` → `wsd_hellos_sent`, `wsd_probes_answered`, `wsd_instance_id`, `wsd_metadata_version`, … |
 | Stable EPR | `--device-uuid` (PnP sees a new device if UUID changes) |

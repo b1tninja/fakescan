@@ -1,0 +1,17 @@
+{
+  "id": "glass-jfif",
+  "label": "Fake WSD scanner (glass jfif)",
+  "connection": "wsd",
+  "optical": null,
+  "feeder": {
+    "sticky_ready": false,
+    "pages_min": 0,
+    "pages_max": 0
+  },
+  "dpi": [100, 200, 300],
+  "formats": ["jfif"],
+  "jpeg_com": true,
+  "page_sizes": ["letter"],
+  "sources": ["glass"],
+  "refuse_unknown": true
+}

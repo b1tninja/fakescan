@@ -69,20 +69,34 @@ Prior art: [bad_scanner](https://github.com/LucidTruthTechnologies/bad_scanner),
 |------|--------|
 | `jam` / `cover_open` → ScannerStatus | **shipped** |
 | `slow_retrieve_ms` | **shipped** |
+| `retrieve_bps` (`/v1/slow` `bps`) | **shipped** — throttle RetrieveImage MTOM send for progress UI labs |
 | `jam_after_n` | **shipped** (`POST /v1/fault`) |
 | `empty_mid_job` | **shipped** (`POST /v1/fault`) |
 | `lamp_warmup_ms` | **shipped** (`POST /v1/fault`; first image only) |
-| `multi_feed` | later |
-| `abort_retrieve` | later |
+| `offline` / `offline_after_n` | **shipped** (`POST /v1/fault`) |
+| `multi_feed` / `multi_feed_after_n` | **shipped** (`MultipleFeedError` / `ClientErrorMultipleFeed`) |
+| `abort_retrieve` / `abort_retrieve_after_n` / `abort_retrieve_bytes` | **shipped** — cut MTOM mid-send (stream error; `Content-Length` still full) |
+| `lamp_error` | **shipped** — Status `LampError` + refuse jobs (`NotAcceptingJobs`) |
+| `busy` | **shipped** — Status `Processing` + refuse Subscribe/Create/Retrieve |
+
+## Feeder / duplex
+
+| Item | Status |
+|------|--------|
+| Glass + ADF sources | **shipped** (`sources`; glass-only profiles) |
+| Sticky FEED_READY + empty tray | **shipped** (`sticky_ready`) |
+| Manual duplex (`side` / `order` / `--reverse`) | **shipped** |
+| Hardware ADF duplex (`feeder.duplex` / ADFDuplex) | **shipped** |
+| Multiple printer trays | **n/a** — fakeprint `InputBins` |
 
 ## Diagnostic pages
 
 | Pattern | Role | Status |
 |---------|------|--------|
-| `info` | Server diagnostics on the page | later |
-| `anac` | Client IP readback ([ANAC](https://en.wikipedia.org/wiki/Automatic_number_announcement_circuit)-style) | later |
+| `info` | Server diagnostics on the page | **shipped** |
+| `anac` / `whoami` | Client IP readback ([ANAC](https://en.wikipedia.org/wiki/Automatic_number_announcement_circuit)-style) | **shipped** |
 
-Wiring sketch: `PageContext` + axum `ConnectInfo` on RetrieveImage; multi-line banner glyphs; QR `client=`.
+Wiring: `PageContext` built in `retrieve_image_with_peer`; axum `ConnectInfo` threaded through `wsd::dispatch`; multi-line `stamp_text_block` with 5×7 glyphs (`.` and `:` added); QR `client=` field appended when peer known.
 
 ## Printer / scanner test-page patterns
 
@@ -95,14 +109,14 @@ Wiring sketch: `PageContext` + axum `ConnectInfo` on RetrieveImage; multi-line b
 | Corner L-marks | `corners` | **shipped** |
 | Duplex pair | `duplex_pair` | **shipped** |
 | QR focus | `qr` | **shipped** |
-| CMYK bars + tint ladders | `cmyk` | later |
-| Nozzle-check bands | `nozzle` | later |
-| Alignment / registration grid | `align` | later |
-| Margin frames + scale rules | `grid` | later |
-| All-in-one composite | `testpage` | later |
-| Resolution line ladder | `lines` | later |
-| ~5° slanted edge (ISO 16067-1 style) | `slant_edge` | later |
-| Text size ladder | `textladder` | later |
+| CMYK bars + tint ladders | `cmyk` | **shipped** |
+| Nozzle-check bands | `nozzle` | **shipped** |
+| Alignment / registration grid | `align` | **shipped** |
+| Margin frames + scale rules | `grid` | **shipped** |
+| All-in-one composite | `testpage` | **shipped** |
+| Resolution line ladder | `lines` | **shipped** |
+| ~5° slanted edge (ISO 16067-1 style) | `slant_edge` | **shipped** |
+| Text size ladder | `textladder` | **shipped** |
 
 Not planned: licensed IT8 charts, vendor diagnostic bitmaps, in-process MTF math.
 
@@ -135,5 +149,7 @@ See [windows.md](windows.md) and [e2e-wia-status.md](e2e-wia-status.md).
 |------|--------|
 | Doc index | **shipped** (this pass) |
 | Accurate README status | **shipped** (this pass) |
+| Official WSD reference distillate + XSD/WSDL | **shipped** ([reference/](reference/README.md)) |
+| Spec coverage map | **shipped** ([coverage.md](coverage.md)) — schema gaps feed “Highest-value gaps” there |
 | Encode full WSD Format catalog (except jbig) | **shipped** ([formats.md](formats.md); `wia-rich`) |
 | `jbig` (JBIG1) | **not planned** (JBIG-KIT GPL; no MIT/Apache encoder) |

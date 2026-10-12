@@ -6,10 +6,12 @@
   "feeder": {
     "sticky_ready": true,
     "pages_min": 0,
-    "pages_max": 30
+    "pages_max": 30,
+    "duplex": true
   },
   "dpi": [100, 150, 200, 300, 600, 1200],
   "formats": ["bmp"],
   "page_sizes": ["letter", "a4", "legal"],
-  "sources": ["feeder", "glass"]
+  "sources": ["feeder", "glass"],
+  "refuse_unknown": true
 }

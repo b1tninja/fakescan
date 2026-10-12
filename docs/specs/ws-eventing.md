@@ -21,7 +21,7 @@ Lab (2026-10-11): WIA open sequence hit `/ScannerService` with:
 2. **`Subscribe`** → fakescan faulted `action not implemented`
 3. pdfcraft / WIA reported **`WIA_ERROR_OFFLINE` (0x80210005)**
 
-So Eventing is on the **critical path for “device online”**, not an optional push-scan feature.
+So Eventing is on the **critical path for “device online”**, not an optional push-scan feature. Subscribe is accepted now; that October log is why it stays on the online path.
 
 ## Operations (2004/08)
 
@@ -99,9 +99,9 @@ Do **not** report `ScannerStateReason=AttentionRequired` merely because the ADF 
 
 | Op | Status |
 |----|--------|
-| Subscribe / Renew / Unsubscribe / GetStatus | **implemented** stub accept (`wsd/mod.rs`) |
+| Subscribe / Renew / Unsubscribe / GetStatus | **done** — Accept; Identifier + Expires (`PT…` / `P1D` / `P1DT…` / UTC `Z`/`+00:00`); Renew/GetStatus/Unsubscribe check Identifier when present (absent = lab-accept); expired → clear + fault; Filter/@Dialect logged; SubscriptionManager EPR = ScannerService Address + Identifier; single active sub (re-Subscribe replaces) |
 | DestinationResponses when ScanDestinations present | **implemented** (stub tokens echoing ClientContext) |
-| Notification push to NotifyTo | not implemented |
-| ScanAvailableEvent → device-push CreateScanJob | not implemented (client-pull WIA does not need it) |
+| Notification push to NotifyTo | **done** — JobStatus, JobEnd, condition, status summary, elements change, and ScanAvailableEvent POST when Subscribe stored a NotifyTo; otherwise a no-op |
+| ScanAvailableEvent → device-push CreateScanJob | **implemented** — `ctl push_scan` mints the identifier and POSTs; CreateScanJob checks ScanIdentifier + DestinationToken |
 
-Filter dialects: DPWS prefers Action filter; Windows may send scan-specific filters — ignore unknown filters in the stub rather than faulting when possible.
+Filter dialects: DPWS prefers Action filter; Windows may send scan-specific filters — ignore unknown filters in the stub rather than faulting when possible. `soap::eventing_filter_dialect` extracts `@Dialect` for Subscribe logs (Brother compare); the filter body is not evaluated.

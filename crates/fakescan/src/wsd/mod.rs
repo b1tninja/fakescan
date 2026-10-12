@@ -1,95 +1,447 @@
 //! WSD Scan Service HTTP endpoint (SOAP + MTOM RetrieveImage).
 
 mod elements;
-mod soap;
+mod envelope;
+pub mod job_events;
+pub mod notify;
+mod scan_schema;
+pub mod soap;
+pub mod status_matrix;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Extension, State};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::state::World;
-use crate::wsd::soap::SCAN_NS;
+use crate::wsd::soap::{SCAN_NS, SCAN_NS_AIRSCAN};
 
-pub async fn scanner_service(State(world): State<Arc<RwLock<World>>>, body: Bytes) -> Response {
+pub async fn scanner_service(
+    State(world): State<Arc<RwLock<World>>>,
+    // `Option<ConnectInfo<_>>` does not implement the axum 0.8 extractor.
+    // `Extension<ConnectInfo<_>>` does, and the connect-info service inserts that.
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let peer = peer
+        .map(|Extension(ConnectInfo(addr))| addr.to_string())
+        .unwrap_or_else(|| "-".into());
+    let path = uri.path();
     let text = String::from_utf8_lossy(&body);
     let action = soap::action(&text).unwrap_or_else(|| "(unknown)".into());
     let short = soap::short_action(&action);
     let relates = soap::message_id(&text);
-    info!(%short, bytes = body.len(), "WSD Scan Service request");
-
-    let result = dispatch(&world, &action, &text, relates.as_deref()).await;
-    match result {
-        Ok(SoapOut::Xml(xml)) => (
-            StatusCode::OK,
+    if let Some(finding) = soap::Envelope::parse(&text)
+        .request_findings()
+        .into_iter()
+        .find(|finding| finding.reject)
+    {
+        warn!(field = finding.field, "WSD header rejected");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
-            xml,
+            soap::fault_with_code(
+                Some("soap:MustUnderstand"),
+                finding.note,
+                relates.as_deref(),
+            ),
         )
-            .into_response(),
+            .into_response();
+    }
+    let scan_ns = soap::scan_ns_from_body(&text);
+    info!(%path, %short, %peer, scan_ns, bytes = body.len(), "WSD request");
+    debug!(%path, %action, "WSD Action URI");
+
+    let seq_before = world.read().await.trace_seq();
+    let result = dispatch(&world, &action, scan_ns, &text, relates.as_deref(), &peer).await;
+    let ms = started.elapsed().as_millis();
+    let (outcome, detail) = match &result {
+        Ok(SoapOut::Xml(_)) => ("ok".to_string(), "soap".to_string()),
+        Ok(SoapOut::Mtom {
+            image,
+            abort_after: Some(_),
+            ..
+        }) => (
+            "abort".to_string(),
+            format!("mtom abort bytes={}", image.len()),
+        ),
+        Ok(SoapOut::Mtom { image, .. }) => {
+            ("ok".to_string(), format!("mtom bytes={}", image.len()))
+        }
+        Err(FaultOut { reason, .. }) => ("fault".to_string(), reason.clone()),
+    };
+    {
+        let mut w = world.write().await;
+        if !w.absorb_call(seq_before, short, &outcome, &peer, ms) {
+            w.note_wsd("wsd", &peer, short, &outcome, ms, &detail);
+        }
+    }
+    match result {
+        Ok(SoapOut::Xml(xml)) => {
+            info!(%path, %short, ms, out_bytes = xml.len(), kind = "soap", "WSD ok");
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
+                xml,
+            )
+                .into_response()
+        }
         Ok(SoapOut::Mtom {
             soap_xml,
             image,
             content_type,
-        }) => mtom_response(&soap_xml, &image, &content_type),
-        Err(msg) => {
-            warn!(%short, %msg, "WSD fault");
+            retrieve_bps,
+            abort_after,
+        }) => {
+            info!(
+                %path,
+                %short,
+                ms,
+                image_bytes = image.len(),
+                %content_type,
+                retrieve_bps,
+                ?abort_after,
+                kind = "mtom",
+                "WSD ok"
+            );
+            mtom_response(&soap_xml, &image, &content_type, retrieve_bps, abort_after)
+        }
+        Err(FaultOut { subcode, reason }) => {
+            warn!(%path, %short, ms, %reason, "WSD fault");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
-                soap::fault(&msg),
+                soap::fault_with_code(subcode.as_deref(), &reason, relates.as_deref()),
             )
                 .into_response()
         }
     }
 }
 
+#[derive(Debug)]
 enum SoapOut {
     Xml(String),
     Mtom {
         soap_xml: String,
         image: Vec<u8>,
         content_type: String,
+        /// Body send throttle (bytes/sec). `0` = one-shot.
+        retrieve_bps: u64,
+        /// When set, send this many body bytes then error the stream (mid-MTOM abort).
+        abort_after: Option<usize>,
     },
+}
+
+/// All XSD-authorized fault subcodes + common real-driver extensions that
+/// drivers like Brother and Canon emit during actual scanning.
+const ALL_FAULT_SUBCODES: &[&str] = &[
+    "wscn:InvalidArgs",
+    "wscn:OperationFailed",
+    "wscn:ServerErrorTemporaryError",
+    "wscn:ServerErrorInternalError",
+    "wscn:ServerErrorNotAcceptingJobs",
+    "wscn:ClientErrorJobCancelled",
+    "wscn:ClientErrorJobIdNotFound",
+    "wscn:ClientErrorFormatNotSupported",
+    "wscn:ClientErrorInvalidScanIdentifier",
+    "wscn:ClientErrorInvalidDestinationToken",
+    "wscn:ClientErrorNoImagesAvailable",
+    "wscn:ClientErrorInvalidJobToken",
+    "wscn:ClientErrorConflictingRequiredParameters",
+    // Common real-driver extensions (not in WDPScan.xsd but emitted by Brother/Canon):
+    "wscn:ClientErrorMediaJam",
+    "wscn:ClientErrorCoverOpen",
+    "wscn:ClientErrorMultipleFeed",
+    "wscn:ClientErrorInterlockOpen",
+    "wscn:ClientErrorInternalStorageFull",
+    // WS-Eventing fault codes used by Windows WSDScan:
+    "wse:UnableToRenew",
+    "wse:InvalidMessage",
+];
+
+#[derive(Debug)]
+struct FaultOut {
+    subcode: Option<String>,
+    reason: String,
+}
+
+/// `wscn:Override` / `wscn:UsedDefault` attribute fragment for FinalParameters.
+fn final_param_attr(overridden: bool, used_default: bool) -> &'static str {
+    if used_default {
+        r#" wscn:UsedDefault="true""#
+    } else if overridden {
+        r#" wscn:Override="true""#
+    } else {
+        ""
+    }
+}
+
+impl From<String> for FaultOut {
+    fn from(reason: String) -> Self {
+        // Format refusal: XSD / WSDL subcode is wscn:ClientErrorFormatNotSupported.
+        // Inbound still matches Document* (MS Format remarks — WIA fallback) and the
+        // legacy "format … not in profile" phrase so CreateScanJob keeps driving
+        // PNG → EXIF → G4 TIFF → tiff-single-uncompressed.
+        let subcode = if reason.contains("ClientErrorNoImagesAvailable") {
+            Some("wscn:ClientErrorNoImagesAvailable".into())
+        } else if reason.contains("ClientErrorMediaJam") {
+            Some("wscn:ClientErrorMediaJam".into())
+        } else if reason.contains("ClientErrorCoverOpen") {
+            Some("wscn:ClientErrorCoverOpen".into())
+        } else if reason.contains("ClientErrorMultipleFeed") {
+            // Lab convention: maps to ScannerStateReason MultipleFeedError / WIA MULTI_FEED.
+            Some("wscn:ClientErrorMultipleFeed".into())
+        } else if reason.contains("ClientErrorInterlockOpen") {
+            Some("wscn:ClientErrorInterlockOpen".into())
+        } else if reason.contains("ClientErrorInternalStorageFull") {
+            Some("wscn:ClientErrorInternalStorageFull".into())
+        } else if reason.contains("ClientErrorDocumentFormatNotSupported")
+            || reason.contains("ClientErrorFormatNotSupported")
+            || (reason.contains("format ") && reason.contains("not in profile"))
+        {
+            Some("wscn:ClientErrorFormatNotSupported".into())
+        } else if reason.contains("ClientErrorConflictingRequiredParameters") {
+            Some("wscn:ClientErrorConflictingRequiredParameters".into())
+        } else if reason.contains("ClientErrorInvalidScanIdentifier") {
+            Some("wscn:ClientErrorInvalidScanIdentifier".into())
+        } else if reason.contains("ClientErrorInvalidDestinationToken") {
+            Some("wscn:ClientErrorInvalidDestinationToken".into())
+        } else if reason.contains("ClientErrorInvalidJobToken") {
+            Some("wscn:ClientErrorInvalidJobToken".into())
+        } else if reason.contains("InvalidArgs") {
+            Some("wscn:InvalidArgs".into())
+        } else if reason.contains("ServerErrorTemporaryError") || reason.contains("TemporaryError")
+        {
+            Some("wscn:ServerErrorTemporaryError".into())
+        } else if reason.contains("ServerErrorInternalError") || reason.contains("InternalError") {
+            Some("wscn:ServerErrorInternalError".into())
+        } else if reason.contains("ServerErrorNotAcceptingJobs")
+            || reason.contains("device offline")
+        {
+            Some("wscn:ServerErrorNotAcceptingJobs".into())
+        } else if reason.contains("JobTimedOut") {
+            // JobStateReason is JobTimedOut; SOAP fault is OperationFailed (no dedicated subcode).
+            Some("wscn:OperationFailed".into())
+        } else if reason.contains("ClientErrorJobCancelled") || reason.contains("JobCancelled") {
+            // XSD British spelling (Cancelled); history reason stays JobCanceledAtDevice (one L).
+            Some("wscn:ClientErrorJobCancelled".into())
+        } else if reason.contains("UnableToRenew") {
+            Some("wse:UnableToRenew".into())
+        } else if reason.contains("InvalidMessage") {
+            // WS-Eventing: unknown / mismatched Identifier or expired subscription.
+            Some("wse:InvalidMessage".into())
+        } else if reason.contains("not found") {
+            Some("wscn:ClientErrorJobIdNotFound".into())
+        } else {
+            None
+        };
+        Self { subcode, reason }
+    }
 }
 
 async fn dispatch(
     world: &Arc<RwLock<World>>,
     action: &str,
+    scan_ns: &str,
     body: &str,
     relates: Option<&str>,
-) -> Result<SoapOut, String> {
+    peer: &str,
+) -> Result<SoapOut, FaultOut> {
     let short = soap::short_action(action);
+    // Normalize Action URI short name even when client used 08 vs 01.
+    let short = match short {
+        "GetResponse" => "Get",
+        other => other,
+    };
     match short {
         "GetScannerElements" => {
             let w = world.read().await;
-            let inner = elements::get_scanner_elements(w.profile(), w.feeder_ready(), body);
+            let scanning = w.status().active_jobs > 0;
+            let inner = elements::get_scanner_elements(
+                elements::ScannerView {
+                    profile: w.profile(),
+                    jam: w.jam(),
+                    cover_open: w.cover_open(),
+                    multi_feed: w.multi_feed(),
+                    lamp_error: w.lamp_error(),
+                    busy: w.busy(),
+                    offline: w.offline(),
+                    calibrating: w.calibrating(),
+                    interlock_open: w.interlock_open(),
+                    storage_full: w.storage_full(),
+                    paused: w.paused(),
+                    lamp_warning: w.lamp_warning(),
+                    lamp_warming: w.lamp_warming(),
+                    feeder_ready: w.feeder_ready(),
+                    pages_remaining: w.pages_remaining(),
+                    scanning,
+                    condition_history: w.condition_history(),
+                },
+                body,
+            );
+            info!(
+                names = ?elements::requested_names(body),
+                "GetScannerElements request"
+            );
             Ok(SoapOut::Xml(soap::envelope(
-                &format!("{SCAN_NS}/GetScannerElements"),
+                scan_ns,
+                &soap::scan_action(scan_ns, "GetScannerElementsResponse"),
                 relates,
                 &inner,
             )))
         }
         "ValidateScanTicket" => {
-            let inner = r#"    <wscn:ValidateScanTicketResponse>
+            let w = world.read().await;
+            let check = w.validate_ticket(body);
+            // Named Validate fault (Learn): conflicting MustHonor=true parameters.
+            if check
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("ClientErrorConflictingRequiredParameters"))
+            {
+                return Err(FaultOut::from(check.reason.clone().unwrap_or_else(|| {
+                    "ClientErrorConflictingRequiredParameters".into()
+                })));
+            }
+            // WIA Connect requires ImageInformation in ValidationInfo (MS sample);
+            // ValidTicket alone → 0x80210001 after Status.
+            //
+            // Soft-accept DocumentFormatNotSupported here: inbox WSD still CreateScanJobs
+            // a MustHonor jfif even when RetrievableDocumentTypes omit it. If Validate
+            // returns ValidTicket=false, that probe often stops without the MS Format
+            // fallback (PNG→…→uncompressed TIFF / dib). CreateScanJob still faults
+            // wscn:ClientErrorFormatNotSupported (XSD; Document* matched inbound) so the
+            // retry loop can run.
+            let format_soft = check.reason.as_deref().is_some_and(|r| {
+                r.contains("ClientErrorDocumentFormatNotSupported")
+                    || (r.contains("format ") && r.contains("not in profile"))
+            });
+            let valid_ticket = check.valid || format_soft;
+            if format_soft && !check.valid {
+                info!(
+                    format = %check.format,
+                    "ValidateScanTicket soft-accept format (CreateScanJob will fault)"
+                );
+            }
+            // Learn invalid example: zero ImageInformation + corrected ValidScanTicket.
+            // Soft-accepted format miss stays ValidTicket=true (no rewrite).
+            let (width_px, height_px, bpl, valid_scan_ticket) = if valid_ticket {
+                let (width_px, height_px) = crate::image_gen::job_page_pixels(check.dpi);
+                // Brother live jfif uses RGB stride for BytesPerLine (not MS compressed=0)
+                // unless profile.bytes_per_line_ms is set.
+                let bpl = crate::image_gen::bytes_per_line(
+                    &check.format,
+                    width_px,
+                    check.color,
+                    w.profile().bytes_per_line_ms,
+                );
+                (width_px, height_px, bpl, String::new())
+            } else {
+                let (corr_dpi, corr_format) = w.corrected_ticket_params(&check);
+                (
+                    0,
+                    0,
+                    0,
+                    format!(
+                        "\n{}",
+                        valid_scan_ticket_xml(body, &check, corr_dpi, &corr_format)
+                    ),
+                )
+            };
+            info!(
+                valid = check.valid,
+                valid_ticket,
+                dpi = check.dpi,
+                format = %check.format,
+                color = %check.color.wsd_token(),
+                width_px,
+                height_px,
+                bytes_per_line = bpl,
+                "ValidateScanTicket"
+            );
+            let image_info = format!(
+                r#"
+        <wscn:ImageInformation>
+          <wscn:MediaFrontImageInfo>
+            <wscn:PixelsPerLine>{width_px}</wscn:PixelsPerLine>
+            <wscn:NumberOfLines>{height_px}</wscn:NumberOfLines>
+            <wscn:BytesPerLine>{bpl}</wscn:BytesPerLine>
+          </wscn:MediaFrontImageInfo>
+        </wscn:ImageInformation>"#
+            );
+            let inner = format!(
+                r#"    <wscn:ValidateScanTicketResponse>
       <wscn:ValidationInfo>
-        <wscn:ValidTicket>true</wscn:ValidTicket>
+        <wscn:ValidTicket>{valid}</wscn:ValidTicket>{image_info}{valid_scan_ticket}
       </wscn:ValidationInfo>
-    </wscn:ValidateScanTicketResponse>"#;
+    </wscn:ValidateScanTicketResponse>"#,
+                valid = valid_ticket,
+            );
             Ok(SoapOut::Xml(soap::envelope(
-                &format!("{SCAN_NS}/ValidateScanTicket"),
+                scan_ns,
+                &soap::scan_action(scan_ns, "ValidateScanTicketResponse"),
                 relates,
-                inner,
+                &inner,
             )))
         }
         "CreateScanJob" => {
+            // Lab: dump ticket Format / size tags so Create→no-RetrieveImage is diagnosable.
+            info!(%body, "CreateScanJob request body");
+            {
+                let path = std::env::temp_dir().join("fakescan-last-create-body.xml");
+                if let Err(e) = std::fs::write(&path, body.as_bytes()) {
+                    warn!(path = %path.display(), error = %e, "failed to dump CreateScanJob body");
+                }
+            }
             let mut w = world.write().await;
-            let job = w.create_job(body).map_err(|e| e.to_string())?;
-            let bytes_per_line = job.width_px * 3;
+            let job = w
+                .create_job(body)
+                .map_err(|e| FaultOut::from(e.to_string()))?;
+            info!(
+                job_id = job.id,
+                dpi = job.dpi,
+                source = %job.input_source,
+                format = %job.format,
+                color = %job.color.wsd_token(),
+                pages = job.pages_left,
+                width_px = job.width_px,
+                height_px = job.height_px,
+                "CreateScanJob"
+            );
+            // Idle→Processing (active_jobs); NotifyTo no-op when unset.
+            job_events::maybe_emit_status_summary(&w, scan_ns);
+            // Brother live jfif: BytesPerLine = width×3 (lab capture 2480→7440)
+            // unless profile.bytes_per_line_ms is set.
+            let bytes_per_line = crate::image_gen::bytes_per_line(
+                &job.format,
+                job.width_px,
+                job.color,
+                w.profile().bytes_per_line_ms,
+            );
+            // Lab 2026-10-12: ticket Grayscale8 + FinalParams Grayscale8 → CreateScanJob
+            // Pending then no RetrieveImage. JFIF FinalParams must say RGB24 (wire JPEG
+            // is RGB). Keep job.color for encode/loopback; only the FinalParams token.
+            let final_color = jfif_wire_color(&job.format, job.color.wsd_token());
+            // DocumentFinalParameters must fill known params (MS remarks) —
+            // bare Format/Resolution alone → WIA CreateScanJob OK then no RetrieveImage.
+            // Override / UsedDefault: Learn DocumentFinalParameters — device replaced
+            // or filled a default (MustHonor=false substitution sets Override).
+            let fmt_attr = final_param_attr(job.format_overridden, job.format_used_default);
+            let dpi_attr = final_param_attr(job.dpi_overridden, job.dpi_used_default);
+            let color_attr = if final_color != job.color.wsd_token() {
+                r#" wscn:Override="true""#
+            } else {
+                ""
+            };
             let inner = format!(
                 r#"    <wscn:CreateScanJobResponse>
       <wscn:JobId>{id}</wscn:JobId>
@@ -102,23 +454,41 @@ async fn dispatch(
         </wscn:MediaFrontImageInfo>
       </wscn:ImageInformation>
       <wscn:DocumentFinalParameters>
-        <wscn:Format>{fmt}</wscn:Format>
-        <wscn:CompressionQualityFactor>80</wscn:CompressionQualityFactor>
+        <wscn:Format{fmt_attr}>{fmt}</wscn:Format>
+        <wscn:CompressionQualityFactor wscn:UsedDefault="true">100</wscn:CompressionQualityFactor>
         <wscn:ImagesToTransfer>{pages}</wscn:ImagesToTransfer>
         <wscn:InputSource>{src}</wscn:InputSource>
-        <wscn:ContentType>Auto</wscn:ContentType>
+        <wscn:ContentType wscn:UsedDefault="true">Auto</wscn:ContentType>
         <wscn:InputSize>
           <wscn:InputMediaSize>
-            <wscn:Width>8500</wscn:Width>
-            <wscn:Height>11000</wscn:Height>
+            <wscn:Width>{media_w}</wscn:Width>
+            <wscn:Height>{media_h}</wscn:Height>
           </wscn:InputMediaSize>
         </wscn:InputSize>
+        <wscn:Exposure>
+          <wscn:ExposureSettings>
+            <wscn:Contrast>0</wscn:Contrast>
+            <wscn:Brightness>0</wscn:Brightness>
+            <wscn:Sharpness wscn:UsedDefault="true">0</wscn:Sharpness>
+          </wscn:ExposureSettings>
+        </wscn:Exposure>
+        <wscn:Scaling>
+          <wscn:ScalingWidth>100</wscn:ScalingWidth>
+          <wscn:ScalingHeight>100</wscn:ScalingHeight>
+        </wscn:Scaling>
+        <wscn:Rotation>0</wscn:Rotation>
         <wscn:MediaSides>
           <wscn:MediaFront>
-            <wscn:ColorProcessing>RGB24</wscn:ColorProcessing>
+            <wscn:ScanRegion>
+              <wscn:ScanRegionXOffset>0</wscn:ScanRegionXOffset>
+              <wscn:ScanRegionYOffset>0</wscn:ScanRegionYOffset>
+              <wscn:ScanRegionWidth>{media_w}</wscn:ScanRegionWidth>
+              <wscn:ScanRegionHeight>{media_h}</wscn:ScanRegionHeight>
+            </wscn:ScanRegion>
+            <wscn:ColorProcessing{color_attr}>{color}</wscn:ColorProcessing>
             <wscn:Resolution>
-              <wscn:Width>{dpi}</wscn:Width>
-              <wscn:Height>{dpi}</wscn:Height>
+              <wscn:Width{dpi_attr}>{dpi}</wscn:Width>
+              <wscn:Height{dpi_attr}>{dpi}</wscn:Height>
             </wscn:Resolution>
           </wscn:MediaFront>
         </wscn:MediaSides>
@@ -129,119 +499,555 @@ async fn dispatch(
                 w = job.width_px,
                 h = job.height_px,
                 bpl = bytes_per_line,
+                fmt_attr = fmt_attr,
                 fmt = job.format,
                 pages = job.pages_left,
                 src = job.input_source,
+                color_attr = color_attr,
+                color = final_color,
+                dpi_attr = dpi_attr,
                 dpi = job.dpi,
+                media_w = crate::image_gen::LETTER_W_THOU,
+                media_h = crate::image_gen::LETTER_H_THOU,
             );
             Ok(SoapOut::Xml(soap::envelope(
-                &format!("{SCAN_NS}/CreateScanJob"),
+                scan_ns,
+                &soap::scan_action(scan_ns, "CreateScanJobResponse"),
                 relates,
                 &inner,
             )))
         }
         "RetrieveImage" => {
             let job_id: i32 = soap::extract_tagged(body, "JobId")
-                .ok_or_else(|| "JobId missing".to_string())?
+                .ok_or_else(|| FaultOut::from("JobId missing".to_string()))?
                 .parse()
-                .map_err(|_| "JobId invalid".to_string())?;
+                .map_err(|_| FaultOut::from("JobId invalid".to_string()))?;
             let token = soap::extract_tagged(body, "JobToken")
-                .ok_or_else(|| "JobToken missing".to_string())?;
+                .ok_or_else(|| FaultOut::from("JobToken missing".to_string()))?;
             let mut w = world.write().await;
-            let (job, image) = w
-                .retrieve_image(job_id, &token)
-                .map_err(|e| e.to_string())?;
-            let cid = format!("{}@fakescan", Uuid::new_v4());
+            // page_index before this transfer — abort_after_n trips like jam_after_n.
+            let page_index_before = w
+                .get_job(job_id)
+                .filter(|j| j.token == token)
+                .map(|j| j.page_index)
+                .unwrap_or(0);
+            let abort_planned = w.plan_abort_retrieve(page_index_before);
+            let (job, image) =
+                match w.retrieve_image_with_peer(job_id, &token, Some(peer.to_string())) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = e.to_string();
+                        // Idle timeout: job already Aborted + JobTimedOut in World.
+                        if err.contains("JobTimedOut") {
+                            if let Some(j) = w.get_job(job_id) {
+                                job_events::maybe_emit_job_end(&w, scan_ns, j);
+                            }
+                            job_events::maybe_emit_status_summary(&w, scan_ns);
+                        }
+                        return Err(FaultOut::from(err));
+                    }
+                };
+            // Optional NotifyTo: every Retrieve → JobStatusEvent; last page → JobEndStateEvent.
+            job_events::maybe_emit_job_status(&w, scan_ns, &job);
+            if job.pages_left == 0 {
+                job_events::maybe_emit_job_end(&w, scan_ns, &job);
+            }
+            // Often Processing while pages remain; re-emit after JobEnd path too.
+            job_events::maybe_emit_status_summary(&w, scan_ns);
+            info!(
+                job_id,
+                image_bytes = image.len(),
+                pages_left = job.pages_left,
+                format = %job.format,
+                width_px = job.width_px,
+                height_px = job.height_px,
+                abort_planned,
+                "RetrieveImage"
+            );
+            // Lab dump: last RetrieveImage body for SOF / accept-gate diffs.
+            {
+                let ext = if job.format.eq_ignore_ascii_case("jfif")
+                    || job.format.eq_ignore_ascii_case("image/jpeg")
+                {
+                    "jpg"
+                } else {
+                    "bin"
+                };
+                let path = std::env::temp_dir().join(format!("fakescan-last-retrieve.{ext}"));
+                if let Err(e) = std::fs::write(&path, &image) {
+                    warn!(path = %path.display(), error = %e, "failed to dump RetrieveImage body");
+                } else {
+                    info!(
+                        path = %path.display(),
+                        bytes = image.len(),
+                        "dumped RetrieveImage body"
+                    );
+                }
+            }
+            // Content-ID shape matches MS RetrieveImageResponse sample (`…@uuid`).
+            // xmlns:xop is added on the Envelope in mtom_response (not on Include).
+            let cid = format!("{}@uuid", Uuid::new_v4());
             let inner = format!(
                 r#"    <wscn:RetrieveImageResponse>
       <wscn:ScanData>
-        <xop:Include xmlns:xop="http://www.w3.org/2003/12/xop/include" href="cid:{cid}" />
+        <xop:Include href="cid:{cid}" />
       </wscn:ScanData>
     </wscn:RetrieveImageResponse>"#
             );
-            let soap_xml = soap::envelope(&format!("{SCAN_NS}/RetrieveImage"), relates, &inner);
-            // Always JPEG for now (profile may list tiff/bmp; encode path is jpeg).
-            let _ = job;
+            // Action …/RetrieveImageResponse (tried bare …/RetrieveImage per MS
+            // sample; same CancelJob-after-~30s outcome).
+            let soap_xml = soap::envelope(
+                scan_ns,
+                &soap::scan_action(scan_ns, "RetrieveImageResponse"),
+                relates,
+                &inner,
+            );
+            let content_type = crate::image_gen::mime_for_format(&job.format).to_string();
+            let retrieve_bps = w.retrieve_bps();
+            // `Some(n)` arms abort: `n == 0` → cut at half the assembled MTOM body.
+            let abort_after = abort_planned.then_some(w.abort_retrieve_bytes() as usize);
             Ok(SoapOut::Mtom {
                 soap_xml,
                 image,
-                content_type: "image/jpeg".into(),
+                content_type,
+                retrieve_bps,
+                abort_after,
             })
         }
         "CancelJob" => {
             let job_id: i32 = soap::extract_tagged(body, "JobId")
-                .ok_or_else(|| "JobId missing".to_string())?
+                .ok_or_else(|| FaultOut::from("JobId missing".to_string()))?
                 .parse()
-                .map_err(|_| "JobId invalid".to_string())?;
-            world
-                .write()
-                .await
-                .cancel_job(job_id)
-                .map_err(|e| e.to_string())?;
+                .map_err(|_| FaultOut::from("JobId invalid".to_string()))?;
+            let mut w = world.write().await;
+            // Snapshot before remove — only emit when cancel ends an active job.
+            let end_snap = w
+                .get_job(job_id)
+                .filter(|j| !j.aborted && j.pages_left > 0)
+                .map(job_events::JobEventSnap::canceled);
+            w.cancel_job(job_id)
+                .map_err(|e| FaultOut::from(e.to_string()))?;
+            if let Some(snap) = end_snap {
+                job_events::maybe_emit_job_end_snap(&w, scan_ns, &snap);
+            }
+            // Processing→Idle when the canceled job was the last active one.
+            job_events::maybe_emit_status_summary(&w, scan_ns);
             let inner = r#"    <wscn:CancelJobResponse/>"#;
             Ok(SoapOut::Xml(soap::envelope(
-                &format!("{SCAN_NS}/CancelJob"),
+                scan_ns,
+                &soap::scan_action(scan_ns, "CancelJobResponse"),
                 relates,
                 inner,
             )))
         }
         "GetActiveJobs" => {
-            let inner = r#"    <wscn:GetActiveJobsResponse>
-      <wscn:ActiveJobs/>
-    </wscn:GetActiveJobsResponse>"#;
+            let w = world.read().await;
+            let mut jobs_xml = String::new();
+            for job in w.jobs_snapshot() {
+                // JobSummaryType order: JobId, JobName, User, State, Reasons, ScansCompleted.
+                jobs_xml.push_str(&format!(
+                    r#"
+        <wscn:JobSummary>
+          <wscn:JobId>{id}</wscn:JobId>
+          <wscn:JobName>fakescan</wscn:JobName>
+          <wscn:JobOriginatingUserName>fakescan</wscn:JobOriginatingUserName>
+          <wscn:JobState>{state}</wscn:JobState>
+          <wscn:JobStateReasons>
+            <wscn:JobStateReason>{reason}</wscn:JobStateReason>
+          </wscn:JobStateReasons>
+          <wscn:ScansCompleted>{done}</wscn:ScansCompleted>
+        </wscn:JobSummary>"#,
+                    id = job.id,
+                    state = job.job_state(),
+                    reason = soap::esc(&job.state_reason),
+                    done = job.page_index,
+                ));
+            }
+            let inner = format!(
+                r#"    <wscn:GetActiveJobsResponse>
+      <wscn:ActiveJobs>{jobs_xml}
+      </wscn:ActiveJobs>
+    </wscn:GetActiveJobsResponse>"#
+            );
             Ok(SoapOut::Xml(soap::envelope(
-                &format!("{SCAN_NS}/GetActiveJobs"),
+                scan_ns,
+                &soap::scan_action(scan_ns, "GetActiveJobsResponse"),
                 relates,
-                inner,
+                &inner,
+            )))
+        }
+        "GetJobElements" => {
+            let job_id: i32 = soap::extract_tagged(body, "JobId")
+                .ok_or_else(|| FaultOut::from("JobId missing".to_string()))?
+                .parse()
+                .map_err(|_| FaultOut::from("JobId invalid".to_string()))?;
+            let mut w = world.write().await;
+            w.ensure_job_not_timed_out(job_id)
+                .map_err(|e| FaultOut::from(e.to_string()))?;
+            let job = w.get_job(job_id).ok_or_else(|| {
+                // Canceled JobId lives only in history → ClientErrorJobCancelled.
+                FaultOut::from(w.missing_job_fault(job_id))
+            })?;
+            let inner = elements::get_job_elements(job, body);
+            Ok(SoapOut::Xml(soap::envelope(
+                scan_ns,
+                &soap::scan_action(scan_ns, "GetJobElementsResponse"),
+                relates,
+                &inner,
+            )))
+        }
+        "GetJobHistory" => {
+            let w = world.read().await;
+            let mut jobs_xml = String::new();
+            for entry in w.job_history() {
+                jobs_xml.push_str(&format!(
+                    r#"
+        <wscn:JobSummary>
+          <wscn:JobId>{id}</wscn:JobId>
+          <wscn:JobState>{state}</wscn:JobState>
+          <wscn:JobStateReasons>
+            <wscn:JobStateReason>{reason}</wscn:JobStateReason>
+          </wscn:JobStateReasons>
+          <wscn:JobName>fakescan</wscn:JobName>
+          <wscn:JobOriginatingUserName>fakescan</wscn:JobOriginatingUserName>
+        </wscn:JobSummary>"#,
+                    id = entry.id,
+                    state = soap::esc(&entry.state),
+                    reason = soap::esc(&entry.reason),
+                ));
+            }
+            let inner = format!(
+                r#"    <wscn:GetJobHistoryResponse>
+      <wscn:JobHistory>{jobs_xml}
+      </wscn:JobHistory>
+    </wscn:GetJobHistoryResponse>"#
+            );
+            Ok(SoapOut::Xml(soap::envelope(
+                scan_ns,
+                &soap::scan_action(scan_ns, "GetJobHistoryResponse"),
+                relates,
+                &inner,
+            )))
+        }
+        // WS-Eventing: WIA/WSDScan Subscribes before CreateScanJob; a fault here
+        // surfaces as WIA_ERROR_OFFLINE even after GetScannerElements succeeds.
+        "Subscribe" => {
+            let mut w = world.write().await;
+            if let Some(reason) = w.not_accepting_reason() {
+                return Err(FaultOut::from(reason.to_string()));
+            }
+            let mgr = soap::esc(w.service_endpoint());
+            let sub_id = Uuid::new_v4();
+            let identifier = format!("uuid:{sub_id}");
+            let expires = soap::eventing_expires(body);
+            let contexts = soap::scan_destination_contexts(body);
+            let notify_url = soap::notify_to_address(body);
+            let filter_dialect = soap::eventing_filter_dialect(body);
+            w.set_notify_to(notify_url.as_deref());
+            w.set_subscription_id(Some(&identifier));
+            w.set_subscription_expires(Some(&expires));
+            w.set_subscription_deadline(soap::expires_deadline_now(&expires));
+            // Windows Subscribe often carries wscn:ScanDestinations; the service
+            // must return matching DestinationResponses / DestinationToken or
+            // WIA may leave the device "not online".
+            let dests = if contexts.is_empty() {
+                String::new()
+            } else {
+                let mut blocks = String::new();
+                for ctx in &contexts {
+                    let token = format!("fakescan-dest-{}", Uuid::new_v4());
+                    w.register_destination(&token, ctx);
+                    blocks.push_str(&format!(
+                        r#"
+        <wscn:DestinationResponse>
+          <wscn:ClientContext>{}</wscn:ClientContext>
+          <wscn:DestinationToken>{}</wscn:DestinationToken>
+        </wscn:DestinationResponse>"#,
+                        soap::esc(ctx),
+                        soap::esc(&token),
+                    ));
+                }
+                format!(
+                    r#"
+      <wscn:DestinationResponses>{blocks}
+      </wscn:DestinationResponses>"#
+                )
+            };
+            info!(
+                %sub_id,
+                %expires,
+                destinations = contexts.len(),
+                notify_to = notify_url.as_deref().unwrap_or("-"),
+                filter_dialect = filter_dialect.as_deref().unwrap_or("-"),
+                "WS-Eventing Subscribe accepted (stub)"
+            );
+            // Lab: WIA open may Subscribe then immediately Unsubscribe + offline —
+            // keep the request at info while diagnosing.
+            info!(%body, "Subscribe request body");
+            let inner = format!(
+                r#"    <wse:SubscribeResponse xmlns:wse="{wse}">
+      <wse:SubscriptionManager>
+        <wsa:Address>{mgr}</wsa:Address>
+        <wsa:ReferenceParameters>
+          <wse:Identifier>{identifier}</wse:Identifier>
+        </wsa:ReferenceParameters>
+      </wse:SubscriptionManager>
+      <wse:Expires>{expires}</wse:Expires>{dests}
+    </wse:SubscribeResponse>"#,
+                wse = soap::WSE_NS,
+                identifier = soap::esc(&identifier),
+            );
+            Ok(SoapOut::Xml(soap::envelope(
+                scan_ns,
+                &soap::eventing_action("SubscribeResponse"),
+                relates,
+                &inner,
+            )))
+        }
+        "Renew" => {
+            let expires = soap::eventing_expires(body);
+            let req_id = soap::eventing_identifier(body);
+            {
+                let mut w = world.write().await;
+                if w.subscription_deadline_elapsed(Instant::now()) {
+                    w.clear_subscriptions();
+                    return Err(FaultOut::from(
+                        "InvalidMessage: subscription expired".to_string(),
+                    ));
+                }
+                // Identifier present: must match an active subscription (WSE InvalidMessage).
+                // Identifier absent: lab-accept / WIA quirk — still refresh Expires.
+                if let Some(ref id) = req_id {
+                    match w.subscription_id() {
+                        Some(stored) if stored == id.as_str() => {}
+                        _ => {
+                            return Err(FaultOut::from(
+                                "InvalidMessage: unknown or mismatched Identifier".to_string(),
+                            ));
+                        }
+                    }
+                }
+                w.set_subscription_expires(Some(&expires));
+                w.set_subscription_deadline(soap::expires_deadline_now(&expires));
+            }
+            info!(%expires, "WS-Eventing Renew accepted");
+            let inner = format!(
+                r#"    <wse:RenewResponse xmlns:wse="{wse}">
+      <wse:Expires>{expires}</wse:Expires>
+    </wse:RenewResponse>"#,
+                wse = soap::WSE_NS,
+            );
+            Ok(SoapOut::Xml(soap::envelope(
+                scan_ns,
+                &soap::eventing_action("RenewResponse"),
+                relates,
+                &inner,
+            )))
+        }
+        "Unsubscribe" => {
+            let req_id = soap::eventing_identifier(body);
+            {
+                let mut w = world.write().await;
+                // Identifier present: must match an active subscription (WSE InvalidMessage).
+                // Identifier absent: lab-accept / WIA quirk — clear all.
+                if let Some(ref id) = req_id {
+                    match w.subscription_id() {
+                        Some(stored) if stored == id.as_str() => {}
+                        _ => {
+                            return Err(FaultOut::from(
+                                "InvalidMessage: unknown or mismatched Identifier".to_string(),
+                            ));
+                        }
+                    }
+                }
+                w.clear_subscriptions();
+            }
+            info!("WS-Eventing Unsubscribe cleared destinations / NotifyTo");
+            let inner = format!(
+                r#"    <wse:UnsubscribeResponse xmlns:wse="{wse}"/>"#,
+                wse = soap::WSE_NS,
+            );
+            Ok(SoapOut::Xml(soap::envelope(
+                scan_ns,
+                &soap::eventing_action("UnsubscribeResponse"),
+                relates,
+                &inner,
+            )))
+        }
+        "GetStatus" => {
+            let req_id = soap::eventing_identifier(body);
+            let stored = {
+                let mut w = world.write().await;
+                if w.subscription_deadline_elapsed(Instant::now()) {
+                    w.clear_subscriptions();
+                    return Err(FaultOut::from(
+                        "InvalidMessage: subscription expired".to_string(),
+                    ));
+                }
+                if let Some(ref id) = req_id {
+                    match w.subscription_id() {
+                        Some(stored) if stored == id.as_str() => {}
+                        _ => {
+                            return Err(FaultOut::from(
+                                "InvalidMessage: unknown or mismatched Identifier".to_string(),
+                            ));
+                        }
+                    }
+                }
+                w.subscription_expires().map(str::to_owned)
+            };
+            let expires = stored.unwrap_or_else(|| soap::eventing_expires(body));
+            let inner = format!(
+                r#"    <wse:GetStatusResponse xmlns:wse="{wse}">
+      <wse:Expires>{expires}</wse:Expires>
+    </wse:GetStatusResponse>"#,
+                wse = soap::WSE_NS,
+            );
+            Ok(SoapOut::Xml(soap::envelope(
+                scan_ns,
+                &soap::eventing_action("GetStatusResponse"),
+                relates,
+                &inner,
             )))
         }
         "Get" => {
-            // Minimal WS-Transfer Get so discovery clients get a ThisDevice stub.
-            let inner = r#"    <wsx:Metadata xmlns:wsx="http://schemas.xmlsoap.org/ws/2004/09/mex"
-                   xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
-                   xmlns:this="http://schemas.xmlsoap.org/ws/2005/08/wsdl">
-      <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/ThisDevice">
-        <wsdp:ThisDevice>
-          <wsdp:FriendlyName xml:lang="en-US">fakescan</wsdp:FriendlyName>
-          <wsdp:FirmwareVersion>0.1.0</wsdp:FirmwareVersion>
-          <wsdp:SerialNumber>FS-0001</wsdp:SerialNumber>
-        </wsdp:ThisDevice>
-      </wsx:MetadataSection>
+            let w = world.read().await;
+            let service = soap::esc(w.service_endpoint());
+            let uuid = w.device_uuid();
+            // Add-device / Function Discovery shows FriendlyName; prefer a name
+            // Test-FakescanLooksLike accepts ("fakescan" or "Fake WSD scanner").
+            let friendly = soap::esc(friendly_name_for_listing(&w.profile().label));
+            // PnP-X: DeviceCategory requires Hosted HardwareId + CompatibleId
+            // (Microsoft PnPXDeviceCategory docs). CompatibleId matches wsdscdrv.inf
+            // (UMB\…/ScannerServiceType) — Brother live metadata includes both.
+            let compat = format!("{SCAN_NS_AIRSCAN}/ScannerServiceType");
+            let inner = format!(
+                r#"    <wsx:Metadata xmlns:wsx="http://schemas.xmlsoap.org/ws/2004/09/mex">
       <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/ThisModel">
-        <wsdp:ThisModel>
+        <wsdp:ThisModel xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
+                        xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10"
+                        xmlns:df="http://schemas.microsoft.com/windows/2008/09/devicefoundation">
           <wsdp:Manufacturer xml:lang="en-US">fakescan</wsdp:Manufacturer>
           <wsdp:ManufacturerUrl>http://localhost/</wsdp:ManufacturerUrl>
           <wsdp:ModelName xml:lang="en-US">Fake WSD Scanner</wsdp:ModelName>
           <wsdp:ModelNumber>1</wsdp:ModelNumber>
+          <wsdp:ModelUrl>http://localhost/</wsdp:ModelUrl>
+          <wsdp:PresentationUrl>http://localhost/</wsdp:PresentationUrl>
+          <pnpx:DeviceCategory>Scanners</pnpx:DeviceCategory>
+          <df:DeviceCategory>Imaging.Scanner</df:DeviceCategory>
         </wsdp:ThisModel>
       </wsx:MetadataSection>
-    </wsx:Metadata>"#;
+      <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/ThisDevice">
+        <wsdp:ThisDevice xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof">
+          <wsdp:FriendlyName xml:lang="en-US">{friendly}</wsdp:FriendlyName>
+          <wsdp:FirmwareVersion>0.1.0</wsdp:FirmwareVersion>
+          <wsdp:SerialNumber>FS-0001</wsdp:SerialNumber>
+        </wsdp:ThisDevice>
+      </wsx:MetadataSection>
+      <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/Relationship">
+        <wsdp:Relationship Type="http://schemas.xmlsoap.org/ws/2006/02/devprof/host"
+                           xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
+                           xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">
+          <wsdp:Host>
+            <wsa:EndpointReference>
+              <wsa:Address>urn:uuid:{uuid}</wsa:Address>
+            </wsa:EndpointReference>
+            <wsdp:Types xmlns:wscn="{scan_ns}">wsdp:Device wscn:ScanDeviceType</wsdp:Types>
+            <wsdp:ServiceId>uri:{uuid}</wsdp:ServiceId>
+          </wsdp:Host>
+          <wsdp:Hosted>
+            <wsa:EndpointReference>
+              <wsa:Address>{service}</wsa:Address>
+            </wsa:EndpointReference>
+            <wsdp:Types xmlns:wscn="{scan_ns}">wscn:ScannerServiceType</wsdp:Types>
+            <wsdp:ServiceId>uri:{uuid}/ScannerService</wsdp:ServiceId>
+            <pnpx:HardwareId xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10">VEN_FAKE&amp;DEV_WSDSCAN</pnpx:HardwareId>
+            <pnpx:CompatibleId xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10">{compat}</pnpx:CompatibleId>
+          </wsdp:Hosted>
+        </wsdp:Relationship>
+      </wsx:MetadataSection>
+    </wsx:Metadata>"#,
+                scan_ns = SCAN_NS_AIRSCAN,
+            );
             Ok(SoapOut::Xml(soap::envelope(
+                SCAN_NS,
                 "http://schemas.xmlsoap.org/ws/2004/09/transfer/GetResponse",
                 relates,
-                inner,
+                &inner,
             )))
         }
-        other => Err(format!("action not implemented: {other}")),
+        other => Err(FaultOut::from(format!("action not implemented: {other}"))),
     }
 }
 
-fn mtom_response(soap_xml: &str, image: &[u8], image_ct: &str) -> Response {
-    let boundary = format!("uuid:{}", Uuid::new_v4());
-    let soap_cid = format!("soap@{}", Uuid::new_v4());
-    // Extract cid from soap
+/// Name shown in Add device / WIA; must match `Test-FakescanLooksLike` hints.
+fn friendly_name_for_listing(profile_label: &str) -> &str {
+    let lower = profile_label.to_ascii_lowercase();
+    if lower.contains("fakescan") || lower.contains("fake wsd scanner") {
+        profile_label
+    } else {
+        "fakescan"
+    }
+}
+
+/// XOP Include NS accepted by inbox wsdscdrv (Brother live). `2003/12` → CancelJob.
+const XOP_INCLUDE_NS: &str = "http://www.w3.org/2004/08/xop/include";
+
+/// Pure MTOM wire pieces (no HTTP). Unit-tested; [`mtom_response`] wraps this.
+#[allow(dead_code)] // boundary / cids asserted in unit tests; HTTP path uses CT + body.
+struct MtomWire {
+    boundary: String,
+    soap_cid: String,
+    image_cid: String,
+    outer_content_type: String,
+    body: Vec<u8>,
+}
+
+/// Force `xmlns:xop` on the Envelope to [`XOP_INCLUDE_NS`] (replace wrong URI if present).
+fn ensure_xop_xmlns_2004_08(soap_xml: &str) -> String {
+    if let Some(start) = soap_xml.find("xmlns:xop=\"") {
+        let after = start + "xmlns:xop=\"".len();
+        if let Some(end_rel) = soap_xml[after..].find('"') {
+            let mut out = soap_xml.to_string();
+            out.replace_range(after..after + end_rel, XOP_INCLUDE_NS);
+            return out;
+        }
+    }
+    soap_xml.replacen(
+        "<soap:Envelope ",
+        &format!("<soap:Envelope xmlns:xop=\"{XOP_INCLUDE_NS}\" "),
+        1,
+    )
+}
+
+/// Build RetrieveImage MTOM body + outer Content-Type (MS sample + Brother accept deltas).
+///
+/// https://learn.microsoft.com/en-us/windows-hardware/drivers/image/retrieveimageresponse
+fn build_mtom(soap_xml: &str, image: &[u8], image_ct: &str) -> MtomWire {
+    // bare UUID boundary, `@uuid` Content-IDs, MIME-Version, xmlns:xop on Envelope,
+    // `startinfo` (MS) + `start-info` (RFC), type-before-charset on root part,
+    // image CT without trailing `;`, CTE binary, CRLF throughout.
+    let boundary = Uuid::new_v4().to_string();
+    let soap_cid = format!("{}@uuid", Uuid::new_v4());
     let image_cid = soap_xml
         .split("cid:")
         .nth(1)
         .and_then(|s| s.split('"').next())
-        .unwrap_or("image@fakescan")
+        .unwrap_or("image@uuid")
         .to_string();
+
+    let soap_xml = ensure_xop_xmlns_2004_08(soap_xml);
+    // Multipart parts are CRLF-delimited; keep the SOAP Infoset on CRLF too.
+    let soap_xml = soap_xml.replace("\r\n", "\n").replace('\n', "\r\n");
 
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    // Brother live (2026-10-12): SOAP part CTE binary (not 8bit); image
+    // `Content-Type: image/jpeg` with no trailing `;`; Content-ID `<…@uuid>`
+    // with no space before `>`.
     body.extend_from_slice(
         format!(
-            "Content-Type: application/xop+xml; charset=utf-8; type=\"application/soap+xml\"\r\n\
+            "Content-Type: application/xop+xml; type=\"application/soap+xml\"; charset=utf-8\r\n\
 Content-Transfer-Encoding: binary\r\n\
 Content-ID: <{soap_cid}>\r\n\r\n"
         )
@@ -250,9 +1056,10 @@ Content-ID: <{soap_cid}>\r\n\r\n"
     body.extend_from_slice(soap_xml.as_bytes());
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    let image_ct_header = image_ct.trim_end_matches(';');
     body.extend_from_slice(
         format!(
-            "Content-Type: {image_ct}\r\n\
+            "Content-Type: {image_ct_header}\r\n\
 Content-Transfer-Encoding: binary\r\n\
 Content-ID: <{image_cid}>\r\n\r\n"
         )
@@ -261,15 +1068,553 @@ Content-ID: <{image_cid}>\r\n\r\n"
     body.extend_from_slice(image);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        format!(
-            "multipart/related; type=\"application/xop+xml\"; boundary=\"{boundary}\"; start=\"<{soap_cid}>\"; start-info=\"application/soap+xml\""
-        )
-        .parse()
-        .expect("content-type"),
+    // Emit both MS `startinfo` and W3C/RFC `start-info`. Boundary/start unquoted.
+    let outer_content_type = format!(
+        "multipart/related; type=application/xop+xml; boundary={boundary}; start=\"<{soap_cid}>\"; start-info=application/soap+xml; startinfo=application/soap+xml"
     );
 
-    (StatusCode::OK, headers, body).into_response()
+    MtomWire {
+        boundary,
+        soap_cid,
+        image_cid,
+        outer_content_type,
+        body,
+    }
+}
+
+fn mtom_response(
+    soap_xml: &str,
+    image: &[u8],
+    image_ct: &str,
+    retrieve_bps: u64,
+    abort_after: Option<usize>,
+) -> Response {
+    let wire = build_mtom(soap_xml, image, image_ct);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::HeaderName::from_static("mime-version"),
+        header::HeaderValue::from_static("1.0"),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        wire.outer_content_type.parse().expect("content-type"),
+    );
+    // Explicit length so wsdscdrv does not hang on chunked framing (~30s then CancelJob).
+    // Throttle paces the TCP send of that known-length body (not Transfer-Encoding: chunked).
+    // Abort still advertises the full length, then errors the stream mid-body (lab: drop).
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&wire.body.len().to_string()).expect("content-length"),
+    );
+
+    let body = wire.body;
+    let cut = abort_after.map(|cfg| abort_cut_len(body.len(), cfg));
+    if let Some(n) = cut {
+        warn!(
+            abort_after = n,
+            body_len = body.len(),
+            "RetrieveImage MTOM abort mid-send"
+        );
+        return (StatusCode::OK, headers, aborted_body(body, n, retrieve_bps)).into_response();
+    }
+    if retrieve_bps == 0 {
+        return (StatusCode::OK, headers, body).into_response();
+    }
+    (StatusCode::OK, headers, throttled_body(body, retrieve_bps)).into_response()
+}
+
+/// `cfg == 0` → half of `body_len`; otherwise min(cfg, body_len-1), at least 1.
+fn abort_cut_len(body_len: usize, cfg: usize) -> usize {
+    if body_len <= 1 {
+        return body_len.saturating_sub(1);
+    }
+    let cut = if cfg == 0 {
+        body_len / 2
+    } else {
+        cfg.min(body_len.saturating_sub(1))
+    };
+    cut.max(1)
+}
+
+/// Pace a known-length body at about `bps` bytes/sec (8 KiB chunks).
+fn throttled_body(body: Vec<u8>, bps: u64) -> axum::body::Body {
+    use bytes::Bytes;
+    use futures_util::stream::unfold;
+    use std::time::Duration;
+
+    let bps = bps.max(1);
+    // ~8 KiB chunks; delay = chunk / bps.
+    let chunk = 8 * 1024usize;
+    let delay = Duration::from_nanos(
+        (u128::from(chunk as u64) * 1_000_000_000u128 / u128::from(bps))
+            .try_into()
+            .unwrap_or(u64::MAX),
+    );
+    let stream = unfold((body, 0usize, true), move |(data, off, first)| async move {
+        if off >= data.len() {
+            return None;
+        }
+        if !first {
+            tokio::time::sleep(delay).await;
+        }
+        let end = (off + chunk).min(data.len());
+        let piece = Bytes::copy_from_slice(&data[off..end]);
+        Some((Ok::<_, std::io::Error>(piece), (data, end, false)))
+    });
+    axum::body::Body::from_stream(stream)
+}
+
+/// Send up to `abort_after` bytes (optionally paced), then fail the stream so the
+/// client sees a mid-transfer drop while `Content-Length` still claimed the full body.
+fn aborted_body(body: Vec<u8>, abort_after: usize, bps: u64) -> axum::body::Body {
+    use bytes::Bytes;
+    use futures_util::stream::unfold;
+    use std::io::{Error, ErrorKind};
+    use std::time::Duration;
+
+    let abort_after = abort_after
+        .min(body.len().saturating_sub(1))
+        .max(1.min(body.len()));
+    let chunk = 8 * 1024usize;
+    let delay = if bps == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(
+            (u128::from(chunk as u64) * 1_000_000_000u128 / u128::from(bps.max(1)))
+                .try_into()
+                .unwrap_or(u64::MAX),
+        )
+    };
+    let stream = unfold(
+        (body, 0usize, true, false),
+        move |(data, off, first, failed)| async move {
+            if failed {
+                return None;
+            }
+            if off >= abort_after {
+                let err = Error::new(
+                    ErrorKind::ConnectionReset,
+                    format!("fakescan abort_retrieve after {abort_after} bytes"),
+                );
+                return Some((Err(err), (data, off, false, true)));
+            }
+            if !first && !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let end = (off + chunk).min(abort_after);
+            let piece = Bytes::copy_from_slice(&data[off..end]);
+            Some((Ok::<_, Error>(piece), (data, end, false, false)))
+        },
+    );
+    axum::body::Body::from_stream(stream)
+}
+
+/// Learn-style corrected ticket for `ValidationInfo` when `ValidTicket` is false.
+fn valid_scan_ticket_xml(
+    request_body: &str,
+    check: &crate::state::TicketValidation,
+    dpi: u32,
+    format: &str,
+) -> String {
+    let job_name =
+        crate::state::extract_tag(request_body, "JobName").unwrap_or_else(|| "fakescan".into());
+    let job_user = crate::state::extract_tag(request_body, "JobOriginatingUserName")
+        .unwrap_or_else(|| "fakescan".into());
+    let job_info = crate::state::extract_tag(request_body, "JobInformation");
+    let input_source =
+        crate::state::extract_tag(request_body, "InputSource").unwrap_or_else(|| "Platen".into());
+    let job_info_xml = job_info
+        .as_ref()
+        .map(|s| {
+            format!(
+                "\n            <wscn:JobInformation>{}</wscn:JobInformation>",
+                soap::esc(s)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"        <wscn:ValidScanTicket>
+          <wscn:JobDescription>
+            <wscn:JobName>{name}</wscn:JobName>
+            <wscn:JobOriginatingUserName>{user}</wscn:JobOriginatingUserName>{info}
+          </wscn:JobDescription>
+          <wscn:DocumentParameters>
+            <wscn:Format>{fmt}</wscn:Format>
+            <wscn:InputSource>{src}</wscn:InputSource>
+            <wscn:MediaSides>
+              <wscn:MediaFront>
+                <wscn:ColorProcessing>{color}</wscn:ColorProcessing>
+                <wscn:Resolution>
+                  <wscn:Width>{dpi}</wscn:Width>
+                  <wscn:Height>{dpi}</wscn:Height>
+                </wscn:Resolution>
+              </wscn:MediaFront>
+            </wscn:MediaSides>
+          </wscn:DocumentParameters>
+        </wscn:ValidScanTicket>"#,
+        name = soap::esc(&job_name),
+        user = soap::esc(&job_user),
+        info = job_info_xml,
+        fmt = soap::esc(format),
+        src = soap::esc(&input_source),
+        color = jfif_wire_color(format, check.color.wsd_token()),
+        dpi = dpi,
+    )
+}
+
+/// ColorProcessing token for JFIF/JPEG/EXIF FinalParams / ValidScanTicket.
+/// Lab: Grayscale8 here → Create Pending with no RetrieveImage; RGB24 accepts.
+fn jfif_wire_color<'a>(format: &str, ticket_color: &'a str) -> &'a str {
+    if format.eq_ignore_ascii_case("jfif")
+        || format.eq_ignore_ascii_case("jpeg")
+        || format.eq_ignore_ascii_case("exif")
+    {
+        "RGB24"
+    } else {
+        ticket_color
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::Profile;
+    use std::path::PathBuf;
+
+    fn test_world() -> Arc<RwLock<World>> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        let profile = Profile::load(&dir, "brother-wsd").expect("profile");
+        Arc::new(RwLock::new(World::new(dir, profile)))
+    }
+
+    #[test]
+    fn ensure_xop_xmlns_injects_2004_08() {
+        let xml = "<soap:Envelope xmlns:wscn=\"urn:scan\">\n  <soap:Body/>\n</soap:Envelope>";
+        let out = ensure_xop_xmlns_2004_08(xml);
+        assert!(
+            out.contains(&format!("xmlns:xop=\"{XOP_INCLUDE_NS}\"")),
+            "{out}"
+        );
+        assert!(!out.contains("2003/12/xop/include"), "{out}");
+    }
+
+    #[test]
+    fn ensure_xop_xmlns_replaces_2003_12() {
+        let xml = concat!(
+            "<soap:Envelope xmlns:xop=\"http://www.w3.org/2003/12/xop/include\" ",
+            "xmlns:wscn=\"urn:scan\"><soap:Body/></soap:Envelope>"
+        );
+        let out = ensure_xop_xmlns_2004_08(xml);
+        assert!(out.contains(XOP_INCLUDE_NS), "{out}");
+        assert!(!out.contains("2003/12/xop/include"), "{out}");
+    }
+
+    #[test]
+    fn build_mtom_locks_wsdscdrv_accept_shape() {
+        // Packaging invariants from docs/specs/mtom-retrieveimage.md (no live WIA).
+        let image_cid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@uuid";
+        let soap = format!(
+            "<soap:Envelope xmlns:wscn=\"urn:scan\">\n\
+             <soap:Body><wscn:RetrieveImageResponse>\
+             <wscn:ScanData><xop:Include href=\"cid:{image_cid}\" /></wscn:ScanData>\
+             </wscn:RetrieveImageResponse></soap:Body></soap:Envelope>"
+        );
+        let jpeg = b"\xff\xd8\xff\xd9";
+        let wire = build_mtom(&soap, jpeg, "image/jpeg;");
+
+        // Outer CT: MS startinfo + RFC start-info; bare UUID boundary; start → SOAP CID.
+        assert!(
+            !wire.boundary.contains(':'),
+            "boundary must be bare UUID, not uuid:…: {}",
+            wire.boundary
+        );
+        assert!(wire.outer_content_type.contains("multipart/related"));
+        assert!(wire.outer_content_type.contains("type=application/xop+xml"));
+        assert!(wire
+            .outer_content_type
+            .contains(&format!("boundary={}", wire.boundary)));
+        let start_needle = format!(r#"start="<{}>""#, wire.soap_cid);
+        assert!(
+            wire.outer_content_type.contains(&start_needle),
+            "missing {start_needle:?} in {}",
+            wire.outer_content_type
+        );
+        assert!(wire
+            .outer_content_type
+            .contains("start-info=application/soap+xml"));
+        assert!(wire
+            .outer_content_type
+            .contains("startinfo=application/soap+xml"));
+
+        // CID linkage: xop:Include cid: equals image part Content-ID (no <> in href).
+        assert_eq!(wire.image_cid, image_cid);
+        let body = String::from_utf8_lossy(&wire.body);
+        assert!(
+            body.contains(&format!("href=\"cid:{image_cid}\"")),
+            "Include href must stay cid: without brackets"
+        );
+        assert!(
+            body.contains(&format!("Content-ID: <{image_cid}>\r\n")),
+            "image Content-ID must be <cid> with no space before >: {}",
+            body.lines().take(20).collect::<Vec<_>>().join(" | ")
+        );
+        assert!(body.contains(&format!("Content-ID: <{}>\r\n", wire.soap_cid)));
+
+        // XOP NS on Envelope; never 2003/12.
+        assert!(body.contains(XOP_INCLUDE_NS));
+        assert!(!body.contains("2003/12/xop/include"));
+
+        // Part headers: type-before-charset; CTE binary; image CT strips trailing `;`.
+        assert!(body.contains(
+            "Content-Type: application/xop+xml; type=\"application/soap+xml\"; charset=utf-8\r\n"
+        ));
+        assert!(body.contains("Content-Transfer-Encoding: binary\r\n"));
+        assert!(body.contains("Content-Type: image/jpeg\r\n"));
+        assert!(!body.contains("Content-Type: image/jpeg;\r\n"));
+
+        // CRLF separators + closing boundary; JPEG present; SOAP Infoset uses CRLF.
+        assert!(wire.body.windows(4).any(|w| w == b"\xff\xd8\xff\xd9"));
+        assert!(body.contains(&format!("\r\n--{}--\r\n", wire.boundary)));
+        assert!(
+            body.contains("\r\n<soap:Envelope"),
+            "SOAP Infoset must use CRLF after part headers"
+        );
+        // HTTP chunked framing is not part of the multipart body (only CTE headers).
+        assert!(!body.contains("\nTransfer-Encoding:"));
+        assert!(!body.contains("\rTransfer-Encoding:"));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_wrong_identifier_faults() {
+        let world = test_world();
+        {
+            let mut w = world.write().await;
+            w.set_subscription_id(Some("uuid:active-sub"));
+            w.set_subscription_expires(Some("PT1H"));
+        }
+        let body = r#"<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+  xmlns:wse="http://schemas.xmlsoap.org/ws/2004/08/eventing">
+  <soap:Header>
+    <wsa:Action>http://schemas.xmlsoap.org/ws/2004/08/eventing/Unsubscribe</wsa:Action>
+    <wsa:MessageID>uuid:unsub-bad-0000-0000-000000000001</wsa:MessageID>
+    <wsa:ReferenceParameters>
+      <wse:Identifier>uuid:deadbeef</wse:Identifier>
+    </wsa:ReferenceParameters>
+  </soap:Header>
+  <soap:Body>
+    <wse:Unsubscribe/>
+  </soap:Body>
+</soap:Envelope>"#;
+        let result = dispatch(
+            &world,
+            &soap::eventing_action("Unsubscribe"),
+            SCAN_NS,
+            body,
+            None,
+            "test",
+        )
+        .await;
+        let Err(err) = result else {
+            panic!("mismatched Identifier must fault");
+        };
+        assert_eq!(err.subcode.as_deref(), Some("wse:InvalidMessage"));
+        assert!(
+            err.reason.contains("mismatched") || err.reason.contains("unknown"),
+            "reason={}",
+            err.reason
+        );
+        // Active subscription must remain (do not clear on mismatch).
+        assert_eq!(
+            world.read().await.subscription_id(),
+            Some("uuid:active-sub")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_without_identifier_clears() {
+        let world = test_world();
+        {
+            let mut w = world.write().await;
+            w.set_subscription_id(Some("uuid:active-sub"));
+            w.set_subscription_expires(Some("PT1H"));
+        }
+        let body = r#"<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+  xmlns:wse="http://schemas.xmlsoap.org/ws/2004/08/eventing">
+  <soap:Header>
+    <wsa:Action>http://schemas.xmlsoap.org/ws/2004/08/eventing/Unsubscribe</wsa:Action>
+    <wsa:MessageID>uuid:unsub-ok-0000-0000-000000000001</wsa:MessageID>
+  </soap:Header>
+  <soap:Body>
+    <wse:Unsubscribe/>
+  </soap:Body>
+</soap:Envelope>"#;
+        let result = dispatch(
+            &world,
+            &soap::eventing_action("Unsubscribe"),
+            SCAN_NS,
+            body,
+            None,
+            "test",
+        )
+        .await;
+        assert!(result.is_ok(), "absent Identifier clears");
+        assert!(world.read().await.subscription_id().is_none());
+    }
+
+    #[test]
+    fn job_timed_out_maps_operation_failed() {
+        let f = FaultOut::from("OperationFailed: JobTimedOut on job 3".to_string());
+        assert_eq!(f.subcode.as_deref(), Some("wscn:OperationFailed"));
+    }
+
+    #[test]
+    fn format_not_supported_maps_xsd_format_fault() {
+        // Document* inbound (WIA / Learn Format remarks) → XSD outbound name.
+        let f = FaultOut::from(
+            "ClientErrorDocumentFormatNotSupported: format jfif not in profile list".to_string(),
+        );
+        assert_eq!(
+            f.subcode.as_deref(),
+            Some("wscn:ClientErrorFormatNotSupported")
+        );
+        let xsd = FaultOut::from(
+            "ClientErrorFormatNotSupported: format jfif not in profile list".to_string(),
+        );
+        assert_eq!(
+            xsd.subcode.as_deref(),
+            Some("wscn:ClientErrorFormatNotSupported")
+        );
+        let legacy = FaultOut::from("format jfif not in profile list".to_string());
+        assert_eq!(
+            legacy.subcode.as_deref(),
+            Some("wscn:ClientErrorFormatNotSupported")
+        );
+    }
+
+    #[test]
+    fn conflicting_must_honor_maps_named_fault() {
+        let f = FaultOut::from(
+            "ClientErrorConflictingRequiredParameters: MustHonor conflict on Resolution+Format"
+                .to_string(),
+        );
+        assert_eq!(
+            f.subcode.as_deref(),
+            Some("wscn:ClientErrorConflictingRequiredParameters")
+        );
+    }
+
+    #[test]
+    fn job_cancelled_phrase_maps_xsd() {
+        assert_eq!(
+            FaultOut::from("ClientErrorJobCancelled: job 7 was cancelled".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ClientErrorJobCancelled")
+        );
+        assert_eq!(
+            FaultOut::from("JobCancelled: job already canceled".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ClientErrorJobCancelled")
+        );
+        // Unknown JobId stays JobIdNotFound (must not steal Cancelled mapping).
+        assert_eq!(
+            FaultOut::from("job 99 not found".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ClientErrorJobIdNotFound")
+        );
+    }
+
+    #[test]
+    fn push_and_job_token_faults_map_xsd() {
+        assert_eq!(
+            FaultOut::from("ClientErrorInvalidScanIdentifier: unknown".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ClientErrorInvalidScanIdentifier")
+        );
+        assert_eq!(
+            FaultOut::from("ClientErrorInvalidDestinationToken: bad".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ClientErrorInvalidDestinationToken")
+        );
+        assert_eq!(
+            FaultOut::from("ClientErrorInvalidJobToken: mismatch".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ClientErrorInvalidJobToken")
+        );
+        assert_eq!(
+            FaultOut::from(
+                "InvalidArgs: ScanIdentifier and DestinationToken required together".to_string()
+            )
+            .subcode
+            .as_deref(),
+            Some("wscn:InvalidArgs")
+        );
+    }
+
+    #[test]
+    fn temporary_and_internal_faults_map_xsd() {
+        assert_eq!(
+            FaultOut::from("ServerErrorTemporaryError: temporary".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ServerErrorTemporaryError")
+        );
+        assert_eq!(
+            FaultOut::from("TemporaryError: retry later".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ServerErrorTemporaryError")
+        );
+        assert_eq!(
+            FaultOut::from("ServerErrorInternalError: internal".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ServerErrorInternalError")
+        );
+        assert_eq!(
+            FaultOut::from("InternalError: permanent failure".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ServerErrorInternalError")
+        );
+        // Busy / offline stay NotAcceptingJobs (no TemporaryError/InternalError phrase).
+        assert_eq!(
+            FaultOut::from("ServerErrorNotAcceptingJobs: device busy".to_string())
+                .subcode
+                .as_deref(),
+            Some("wscn:ServerErrorNotAcceptingJobs")
+        );
+    }
+
+    #[test]
+    fn eventing_identifier_faults_map_wse() {
+        assert_eq!(
+            FaultOut::from("InvalidMessage: unknown or mismatched Identifier".to_string())
+                .subcode
+                .as_deref(),
+            Some("wse:InvalidMessage")
+        );
+        assert_eq!(
+            FaultOut::from("InvalidMessage: subscription expired".to_string())
+                .subcode
+                .as_deref(),
+            Some("wse:InvalidMessage")
+        );
+        assert_eq!(
+            FaultOut::from("UnableToRenew: refused".to_string())
+                .subcode
+                .as_deref(),
+            Some("wse:UnableToRenew")
+        );
+    }
 }

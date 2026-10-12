@@ -1,0 +1,34 @@
+{
+  "id": "wia-rich",
+  "label": "Fake WSD scanner (all encodable WIA/WSD formats)",
+  "connection": "wsd",
+  "optical": null,
+  "feeder": {
+    "sticky_ready": false,
+    "pages_min": 0,
+    "pages_max": 30,
+    "duplex": true
+  },
+  "dpi": [100, 200, 300],
+  "formats": [
+    "jpeg",
+    "exif",
+    "png",
+    "bmp",
+    "tiff",
+    "tiff-g4",
+    "tiff-g3mh",
+    "tiff-jpeg",
+    "tiff-multi",
+    "tiff-multi-g4",
+    "tiff-multi-g3mh",
+    "tiff-multi-jpeg-tn2",
+    "jpeg2k",
+    "pdf",
+    "xps"
+  ],
+  "page_sizes": ["letter", "a4", "legal", "photo", "business_card"],
+  "sources": ["feeder", "glass"],
+  "colors": ["RGB24", "Grayscale8", "BlackAndWhite1"],
+  "refuse_unknown": true
+}

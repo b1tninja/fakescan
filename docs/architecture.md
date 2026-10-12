@@ -46,13 +46,14 @@
 | `POST` | `/v1/profile` | switch `brother-usb` / `brother-wsd` / custom |
 | `POST` | `/v1/jpeg-com` | `{"enabled":false}` omit JFIF COM markers |
 | `POST` | `/v1/feeder` | `{ "ready": true\|false }` — sticky FEED_READY |
-| `POST` | `/v1/pages` | feeder count; optional `side`/`order` for manual duplex |
+| `POST` | `/v1/pages` | feeder sheet count; optional `side`/`order` for **manual** duplex |
+| Profile `feeder.duplex` | — | hardware ADF duplex (`ADFDuplex` → front+back faces; see [test-matrix.md](test-matrix.md) §8b) |
 | `POST` | `/v1/pattern` | synthetic layout id (`page_id`, `wia_plain`, …); `wia_plain` = minimal baseline JPEG |
 | `POST` | `/v1/effects` | image defects (skew, speckles, streaks, hole_punch); see [defects.md](defects.md) |
 | `GET` | `/v1/scenarios` | ordered tester progression |
 | `POST` | `/v1/scenario` | `{ "id":"order" }` — apply one progression step |
-| `POST` | `/v1/slow` | artificial RetrieveImage delay (ms) |
-| `POST` | `/v1/fault` | jam / cover_open / ms / `jam_after_n` / `empty_mid_job` / `lamp_warmup_ms` |
+| `POST` | `/v1/slow` | `{ "ms" }` pre-RetrieveImage sleep; optional `{ "bps" }` throttles MTOM TCP send (bytes/sec, Content-Length kept) for mid-page progress labs |
+| `POST` | `/v1/fault` | jam / cover_open / multi_feed / lamp_error / busy / temporary / internal / offline / ms / `*_after_n` / abort_retrieve* / `lamp_warmup_ms` — see [lab-harness.md](lab-harness.md) |
 | `GET`/`POST`/`DELETE` | `/v1/loopback` | hard page store (upload JFIF → exact RetrieveImage echo) |
 | `POST` | `/v1/reset` | clear jobs, effects, pattern, loopback, feeder defaults |
 
@@ -71,10 +72,10 @@ Protocol layering and authoritative links: **[specs/](specs/README.md)** (WS-Sca
 | `GetScannerElements` / `DefaultScanTicket` | done (profile → encodable WSD FormatValues) |
 | `CreateScanJob` / `RetrieveImage` (MTOM) | wire done (~200KB JFIF); wsdscdrv accept still CancelJob — [mtom-retrieveimage.md](specs/mtom-retrieveimage.md) |
 | WS-Transfer Get | ThisModel / ThisDevice / Relationship **Host+Hosted** + PnP-X ids |
-| WS-Eventing Subscribe / Unsubscribe / Renew | stub accept (needed for WIA online; no push notify yet) |
+| WS-Eventing Subscribe / Unsubscribe / Renew | accept; job, condition, status-summary, elements-change, and ScanAvailable events POST to NotifyTo when one is registered |
 | Windows Add → WIA Connect → acquire | person Add + Connect **live**; RetrieveImage accept gap — [e2e-wia-status.md](e2e-wia-status.md) |
 
-Reference prior art: [bobi/WsdScanService](https://github.com/bobi/WsdScanService) (CoreWCF). Stay in Rust with a thin SOAP layer unless GetScannerElements proves too painful.
+Reference prior art: [bobi/WsdScanService](https://github.com/bobi/WsdScanService) (CoreWCF). This service stays a thin Rust SOAP layer. GetScannerElements is driven by the active profile.
 
 Published capabilities come from the active JSON profile (dpi lists, formats, page sizes, presence/absence of optical dpi).
 

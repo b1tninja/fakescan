@@ -13,8 +13,8 @@ The scripts under `scripts/` help with everything around that.
 
 | Entry | Role |
 |-------|------|
-| `scripts/fakescan.ps1` | CLI (status / soap / discover / discoverable / fd / aep / swd / wia / install / elevated / remove / e2e / pages...) |
-| `scripts/Fakescan.psm1` | Importable module (`Get-Fakescan*`, `Find-FakescanFunctionDiscovery`, `Get-FakescanAssociationEndpoints`, `Install-FakescanScanner`, …) |
+| `scripts/fakescan.ps1` | CLI (status / soap / discover / discoverable / fd / aep / swd / wia / install / elevated / helper / remove / unpair / bounce-fd / rebind / e2e / pages...) |
+| `scripts/Fakescan.psm1` | Importable module (`Get-Fakescan*`, `Start-FakescanElevatedHelper`, `Install-FakescanScanner`, …) |
 | `scripts/Fakescan.FunctionDiscovery.cs` | COM interop for Function Discovery (loaded by the module) |
 | `scripts/e2e-wia.ps1` | Full WIA path: health -> discoverable -> install -> WIA assert -> optional pdfcraft-cli scan |
 
@@ -33,8 +33,9 @@ Import-Module .\scripts\Fakescan.psm1
 .\scripts\fakescan.ps1 wia
 .\scripts\fakescan.ps1 pages 3
 .\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -ProbeDiscovery -WaitSeconds 120
-.\scripts\fakescan.ps1 elevated   # UAC shell for remove only
-.\scripts\fakescan.ps1 remove
+.\scripts\fakescan.ps1 helper     # one UAC; then helper remove|whatif|unpair|bounce-fd|stop (suite stays unelevated)
+.\scripts\fakescan.ps1 elevated   # interactive UAC shell (remove / rebind / associate)
+.\scripts\fakescan.ps1 remove     # needs elevation in-process, or use helper remove
 .\scripts\fakescan.ps1 e2e -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
 ```
 
@@ -54,9 +55,12 @@ Import-Module .\scripts\Fakescan.psm1
 | `swd` | Local PnP | Installed `SWD\DAFWSDPROVIDER\...` nodes only |
 | `wia` | Local WIA/PnP list | Lists whatever is already installed |
 | `install` | HTTP + FD + AEP + optional Probe + Settings UI | Assists install; **cannot** force PnP / silent Add device |
-| `elevated` | UAC-elevated PowerShell + module | For `remove` / `rebind` / `pnputil` on installed nodes — **not** silent install |
-| `remove` | Local PnP | `pnputil /remove-device` on fakescan **Image + SoftwareDevice** nodes (never Brother) |
-| `rebind` | Local PnP + Settings | Sticky/offline recovery: remove → Printers & scanners → wait WIA |
+| `elevated` | UAC-elevated PowerShell + module | Interactive shell for `remove` / `rebind` / `associate` / `pnputil` — **not** silent install; **not** for running `fakescan.exe` |
+| `helper` | One UAC, then session remove / whatif / unpair / bounce-fd / stop | Preferred for WIA lab teardown. Suite stays unelevated. Fake nodes only. Idle default 1800s |
+| `remove` | Local PnP | `pnputil /remove-device` on fakescan **Image + SoftwareDevice** (never Brother). Needs elevation in-process, or `helper remove` |
+| `unpair` | WinRT AEP | `UnpairAsync` on fakescan AssociationEndpoint (not fakeprint `…f3`) |
+| `bounce-fd` | Local services | Restart **fdPHost**; **Start** DAS only if Stopped — never `Restart-Service -Force` on DAS (StopPending wedges Add/AEP). Never **dasHost**. Elevation or helper |
+| `rebind` | Local PnP + Settings | Sticky/offline: remove → Unpair → on AccessDenied bounce fdPHost+DAS → Printers & scanners → wait WIA |
 | `e2e` | HTTP + discovery + WIA + optional pdfcraft-cli | Runs `e2e-wia.ps1` (install wait, then glass/feeder acquire if CLI present) |
 
 ### Can PowerShell install the scanner?
@@ -64,12 +68,14 @@ Import-Module .\scripts\Fakescan.psm1
 | Goal | PowerShell? | How |
 |------|-------------|-----|
 | Enumerate / discover | **Yes** | `discover`, `discoverable`, `fd`, `aep`, `wia`, `swd` |
-| Open Add device UI + wait for WIA | **Assist only** | `install` / `Install-FakescanScanner` |
+| SOAP / local matrix (`pytest`, `lab loopback-soap`, `/v1`) | **Yes (unelevated)** | No Imaging remove; no UAC |
+| Open Add device UI + wait for WIA | **Assist only** | `install` / `Install-FakescanScanner` — **person** clicks Add device |
 | Silent install (no person) | **No** | Gate is **PnP-X association**, not the INF. Inbox `wsdscdrv.inf` already matches once associated. |
-| Remove installed fakescan | **Yes (elevated)** | `elevated` then `remove`, or elevated `Remove-FakescanScanner` |
-| Sticky WIA offline rebind | **Assist (elevated remove)** | `rebind` / `Repair-FakescanScanner` then person Add device |
+| Remove installed Fake Imaging | **Yes (elevated step)** | Prefer `helper` then `helper remove`; or `elevated` + `remove` / `Remove-FakescanScanner` |
+| Sticky WIA offline rebind | **Assist** | `rebind` / `Repair-FakescanScanner` (remove via helper or elevated) → person Add device. `stisvc` + DAS restart does **not** clear it. |
+| Ghost AEP (PnP gone, Add empty, Unpair AccessDenied) | **Assist** | After Unpair AccessDenied, `rebind` bounces **fdPHost** then **DeviceAssociationService**. Opt-in: `rebind -RestartDiscovery` / `bounce-fd`. **Never** `dasHost` (UDP 3702). |
 
-**Verdict stays:** scripts detect FD/AEP candidates and WIA completion; a person must click Add device. A custom INF does **not** create the association (see dead ends).
+**Verdict stays:** scripts detect FD/AEP candidates and WIA completion; a person must click Add device. A custom INF does **not** create the association (see dead ends). **Do not run `fakescan.exe` elevated** — keep the scanner in a normal terminal; elevate only PnP remove (helper or shell).
 
 ## soap-only vs on-wire-discoverable vs fd-installable vs installed
 
@@ -79,10 +85,11 @@ These are different readiness levels. `.\scripts\fakescan.ps1 discoverable` prin
 |---------|---------|------------|---------------|
 | **soap-only** | TCP `/ScannerService` answers (`SoapReachable`) but no fakescan ProbeMatch/Hello | Control plane + SOAP protocol tests | Windows Add device / WIA install (usually) |
 | **on-wire-discoverable** | SOAP OK **and** Hello/ProbeMatch and/or AEP hit without CanPair | UDP + metadata path alive | Not yet Add-device ready |
-| **aep-pairable** | SOAP OK **and** WinRT WSD AEP lists fakescan with `CanPair=true` | Strongest pre-UI signal on this lab; Add device should list it | `PairAsync` still Failed without person click |
+| **aep-pairable** | SOAP OK **and** WinRT WSD AEP lists fakescan with `CanPair=true` and **not** IsPaired | Strongest pre-UI signal on this lab; Add device should list it | `PairAsync` still Failed without person click |
 | **fd-installable** | SOAP OK **and** Function Discovery returned fakescan with `Installable=true` | Classic Add-device *candidate* | Still needs a person to click Add device |
 | **installed** | WIA enum has fakescan (`FakescanInWia` / `AlreadyInstalled`) | pdfcraft can open it | - |
-| **installed-offline** | PnP residue / sticky presence without usable WIA enum | Needs `rebind` (elevated remove + Add device) | stisvc restart alone does not fix |
+| **installed-offline** | PnP residue / sticky presence without usable WIA enum | Needs `rebind` (helper/elevated remove + person Add device) | `stisvc` restart alone does not fix (tried) |
+| **ghost-aep** | SOAP OK, Imaging node **gone**, AEP still `IsPaired` | Unpair / `bounce-fd` then person Add | Settings Add list is empty until the pairing store clears |
 | **unreachable** | SOAP failed | Nothing yet | Fix listen/advertise/firewall first |
 
 Quick signals:
@@ -152,7 +159,7 @@ Add device **cannot** be completed by a supported API. `Install-FakescanScanner`
 | `pnputil /add-driver wsdscdrv.inf` | Inbox INF is already present. Without a PnP-X **association**, nothing new attaches. |
 | Custom INF matching `UMB\VEN_FAKE&DEV_WSDSCAN` | Useful later for a **vendor WIA USD** on top of `WSDScan.sys` ([sample INF](https://learn.microsoft.com/en-us/windows-hardware/drivers/image/sample-inf-file-for-a-web-services-scanner)). Does **not** create the Imaging node. Live install already matched CompatibleId → inbox `wsdscdrv.inf`. |
 | `SilentInstall` class flag | Only suppresses UI when a **devnode already exists** and the package is in the driver store. Not association. |
-| `IPNPXDeviceAssociation::Associate` | Documented programmatic Install equivalent — needs an FD function instance with `PKEY_PNPX_GlobalIdentity`. Lab gap: fakescan often **absent from FD** even when AEP shows `CanPair`. Worth trying when FD lists fakescan; not proven here. |
+| `IPNPXDeviceAssociation::Associate` | Documented programmatic Install equivalent — needs an FD function instance with `PKEY_PNPX_GlobalIdentity`. **Wired (2026-10-12):** `Invoke-FakescanPnpxAssociate` / `fakescan.ps1 associate` (requires elevation). FD CAN list fakescan with `Installable=true` for an uninstalled device actively sending Hellos. When FD has the live instance, `Associate` call chain is correct. Whether it creates the Imaging node without a person is **unproven** (device was already installed on this lab). See [e2e-wia-status.md](e2e-wia-status.md) §FD/Associate. |
 | WinRT `PairAsync` on WSD AEP | Tried; returns `Failed` for fakescan. Does not create Imaging. |
 | `Enable-PnpDevice` / `Disable-PnpDevice` | Same as enable/disable existing nodes. Useful for `remove`, not create. |
 | `devcon create` / `devcon install` | Can invent hardware ids; does **not** wire Function Discovery + inbox WSDScan SOAP transport the way Add device does. Easy to leave junk devices; do not use against Brother. |
@@ -176,7 +183,7 @@ $env:RUST_LOG = 'fakescan=debug,tower_http=debug'   # optional; -v does the same
   --probe-listen -v
 ```
 
-`-v` logs each WSD SOAP Action with peer, path, elapsed ms, CreateScanJob / RetrieveImage details, and tower-http request lines. Hellos stay at `debug` (noisy but useful when diagnosing discovery). `fakescan.ps1 elevated` is only for `remove` / pnputil — not for running the scanner.
+`-v` logs each WSD SOAP Action with peer, path, elapsed ms, CreateScanJob / RetrieveImage details, and tower-http request lines. Hellos stay at `debug` (noisy but useful when diagnosing discovery). Elevate only Imaging remove (`helper` or `elevated` + `remove`) — **never** run `fakescan.exe` elevated.
 
 ## Typical lab flow
 
@@ -187,7 +194,7 @@ $env:RUST_LOG = 'fakescan=debug,tower_http=debug'   # optional; -v does the same
    docker run --rm --network host ghcr.io/b1tninja/fakescan:latest \
      --listen 0.0.0.0:3920 --advertise 192.168.1.10 \
      --profiles /app/profiles --profile brother-wsd \
-     --device-uuid 00000000-0000-4000-8000-000000000001
+     --device-uuid 00000000-0000-4000-8000-0000000000f2
    ```
 
    On Docker Desktop for Windows, bridge port-publish is fine for **SOAP/control**, but multicast discovery usually fails. For install, run the `fakescan.exe` binary on Windows (or a Linux VM on the LAN) with `--advertise <this-PC-LAN-IP>`. Pass a stable `--device-uuid` so Add device / PnP does not see a new EPR on every restart.
@@ -218,20 +225,43 @@ $env:RUST_LOG = 'fakescan=debug,tower_http=debug'   # optional; -v does the same
    # or: .\scripts\e2e-wia.ps1 -BaseUrl http://192.168.1.10:3920 -WaitSeconds 120
    ```
 
-6. Tear down / rebind when done or when WIA goes sticky-offline (elevated; Image + parent SoftwareDevice via `pnputil`; never Brother):
+6. Tear down / rebind when done or when WIA goes sticky-offline (Image + parent SoftwareDevice via `pnputil`; never Brother). Prefer the session **helper** so the WIA suite stays unelevated:
 
    ```powershell
+   .\scripts\fakescan.ps1 helper          # one UAC; idle default 1800s
+   .\scripts\fakescan.ps1 helper whatif   # preview Fake targets
+   .\scripts\fakescan.ps1 helper remove   # Remove-FakescanScanner via helper
+   .\scripts\fakescan.ps1 helper stop
+   # Interactive alternative:
    .\scripts\fakescan.ps1 elevated
    .\scripts\fakescan.ps1 remove          # or: Remove-FakescanScanner -WhatIf
    # Sticky 0x80210005 / PnP OK / no SOAP after fakescan restart:
    .\scripts\fakescan.ps1 rebind -BaseUrl http://192.168.1.10:3920 -WaitSeconds 120
    ```
 
-## `remove` / `rebind` (PnP cleanup + sticky recovery)
+## `helper` / `elevated` / `remove` / `rebind`
 
-`Remove-FakescanScanner` collects fakescan **Image** and parent **SoftwareDevice** `SWD\DAFWSDPROVIDER\urn:uuid:…` nodes (`Get-FakescanPnpRemoveTargets`), then `Disable-PnpDevice` and **`pnputil /remove-device`** (preferred: `Remove-PnpDevice` is missing on some builds). Matching uses `Test-FakescanLooksLike` (name `fakescan` / `Fake WSD scanner`, or `:3920`) — never a generic Brother entry. `-WhatIf` lists both node kinds. Run elevated.
+| When | Use | Notes |
+|------|-----|-------|
+| SOAP / local matrix / control plane | Nothing elevated | `pytest`, `lab`, `/v1`, `soap` — no Imaging remove |
+| Repeated Fake Imaging remove while lab stays unelevated | **`helper`** | One UAC → `helper remove` / `whatif` / `unpair` / `bounce-fd` / `stop`. Request file accepts only those cmds (never instance ids). Session field is `process_id`. Idle default 1800s. IPC under `%TEMP%\fakescan-elev-helper`; Watch drops stale request/reply on start and exit. Self-check (no UAC): `.\scripts\check-elev-helper.ps1` |
+| One-off remove, `associate`, or poking `pnputil` | **`elevated`** | Interactive UAC shell with module imported |
+| Tear down Fake Image + SoftwareDevice | **`remove`** / `Remove-FakescanScanner` | Needs elevation in-process, or ask the helper. Never Brother |
+| Sticky offline (`0x80210005`, PnP OK, no SOAP) | **`rebind`** | Remove (+ Unpair AEP) → Printers & scanners → person **re-Add**. Remove step still needs elevation or a running helper. `stisvc` / DAS restart does **not** clear this |
+| Ghost AEP / empty Add / Unpair AccessDenied | **`bounce-fd`** / `rebind` | After remove, pairing store ≠ PnP. Bounce **fdPHost** (WSD FD cache, [KB 973560](https://support.microsoft.com/kb/973560)). DAS: **Start only if Stopped** — never `Restart-Service -Force` (lab 2026-10-12: StopPending wedged Add/AEP until lone DAS svchost killed). Ghost cleared after fdPHost alone then Unpair. Never **dasHost**. `PairTool /disassociate` if Unpair still denied. Last resort: new `--device-uuid` |
 
-**Sticky presence:** after a fakescan process restart, WIA Connect can return `0x80210005` with **zero** local SOAP to `/ScannerService` while PnP Status=OK. Restarting `stisvc` alone does not clear it. Use `rebind` / `Repair-FakescanScanner`: elevated remove → open Printers & scanners only → wait for `FakescanInWia`.
+`Remove-FakescanScanner` collects fakescan **Image** and parent **SoftwareDevice** `SWD\DAFWSDPROVIDER\urn:uuid:…` nodes (`Get-FakescanPnpRemoveTargets`), then `Disable-PnpDevice` and **`pnputil /remove-device`** (preferred: `Remove-PnpDevice` is missing on some builds). Matching uses `Test-FakescanLooksLike` (name `fakescan` / `Fake WSD scanner`, or `:3920`) — never a generic Brother entry. `-WhatIf` lists both node kinds.
+
+**Add device stays a person.** Helper and elevated remove only clear Fake PnP; they do not install. **Do not run `fakescan.exe` elevated.**
+
+**Two stuck states — do not mix the service bounces:**
+
+| State | What you see | Service bounce tried? | Correct recovery |
+|-------|----------------|----------------------|------------------|
+| **Sticky WIA offline** | PnP Image `Status=OK`, Connect `0x80210005`, **no** `/ScannerService` SOAP | **Yes:** `stisvc` and DeviceAssociationService — **did not clear it** | `pnputil` remove (helper) → Unpair → person **re-Add** while fakescan stays up (`rebind`) |
+| **Ghost AEP** | PnP Image **gone**, AEP `IsPaired=True`, Settings Add list empty, `UnpairAsync` **AccessDenied** (even elevated) | **fdPHost was never bounced** for this. DAS bounce alone was the sticky-offline experiment, not this | Unpair (WinRT or `PairTool /disassociate`) → if still denied, bounce **fdPHost** then **DeviceAssociationService** (`bounce-fd` / `rebind` auto on AccessDenied). **Never** bounce **dasHost** (UDP 3702 — fakescan and fakeprint Hellos). **FDResPub** publishes *this* PC; it is not the WSD-scan cache. Last resort: new `--device-uuid` so Windows is not pairing the stuck AEP id |
+
+`rebind` / `Repair-FakescanScanner`: elevated or helper remove → Unpair → on AccessDenied (or `-RestartDiscovery`) bounce fdPHost then DAS → open Printers & scanners only → wait for `FakescanInWia`. AccessDenied on Unpair is [DeviceUnpairingResultStatus](https://learn.microsoft.com/uwp/api/windows.devices.enumeration.deviceunpairingresultstatus): the caller lacks pairing permission, not “needs more UAC.” PairTool is the protocol-device unpair; WinRT Unpair is the same store.
 
 ## `e2e` (WIA end-to-end)
 

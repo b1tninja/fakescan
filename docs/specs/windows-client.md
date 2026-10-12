@@ -67,25 +67,44 @@ Often correlated with SOAP faults on **Subscribe**, empty-feeder misuse of `Atte
 
 ### Presence sticky offline — open questions
 
-After **fakescan restart**, Windows may keep the Imaging node (`Status=OK IsPresent=True`) while WIA Connect returns **`0x80210005`** and sends **no** POST to `/ScannerService`. Peers often keep WS-Transfer Get on `/WebServices/Device` (~5s). `stisvc` / DeviceAssociationService restart has not cleared it in lab; elevated `pnputil` remove + person **re-Add** recovers. Checklist: [runbook-fake-scanner.md](../runbook-fake-scanner.md). Lab notes: [e2e-wia-status.md](../e2e-wia-status.md).
+After **fakescan restart**, Windows may keep the Imaging node (`Status=OK IsPresent=True`) while WIA Connect returns **`0x80210005`** and sends **no** POST to `/ScannerService`. Peers often keep WS-Transfer Get on `/WebServices/Device` (~5s). **`stisvc` / DeviceAssociationService restart has not cleared it in lab**; elevated `pnputil` remove + person **re-Add** recovers. That bounce was the experiment for *this* state, not for a ghost AEP. Checklist: [runbook-fake-scanner.md](../runbook-fake-scanner.md). Lab notes: [e2e-wia-status.md](../e2e-wia-status.md).
+
+### Ghost AEP after PnP remove
+
+`pnputil /remove-device` clears the Imaging / `SWD\DAFWSDPROVIDER` node. It does **not** unpair the WinRT WSD AssociationEndpoint. Then:
+
+- AEP stays `IsPaired=True`
+- Settings **Add a printer or scanner** lists nothing for Fake (paired devices are not “addable”)
+- `UnpairAsync` returns **AccessDenied** even from an elevated helper ([DeviceUnpairingResultStatus.AccessDenied](https://learn.microsoft.com/uwp/api/windows.devices.enumeration.deviceunpairingresultstatus) = missing pairing permission, not missing UAC)
+
+**fdPHost was never bounced for this in lab.** Layered recovery (`rebind` / `bounce-fd`):
+
+1. `pnputil` remove (already done)
+2. WinRT `UnpairAsync` (or WDK/Win11 [`PairTool /disassociate`](https://learn.microsoft.com/windows-hardware/drivers/devtest/pairtool-command-syntax) if present)
+3. If still AccessDenied: restart **fdPHost** (WSD Function Discovery cache — [KB 973560](https://support.microsoft.com/kb/973560)). For **DeviceAssociationService**, only **Start** if it is Stopped — never `Restart-Service -Force` (lab 2026-10-12: that left DAS in **StopPending**, hung WinRT AEP, and hid Add until the lone DAS svchost was killed). Lab cleared a ghost AEP after **fdPHost alone**, then WinRT Unpair succeeded. Restore **FDResPub** only if the fdPHost `-Force` stop knocked it; FDResPub publishes *this* PC, it is not the scan-discovery cache.
+4. **Never** restart **dasHost** — it owns UDP 3702; bouncing it drops Hellos/Probes for fakescan and fakeprint.
+5. Last resort: new `--device-uuid` so Windows is pairing a different AEP id (lab `…f6` unstuck Add when Unpair stayed denied).
+
+`stisvc` is WIA enum only; bounce it only after a successful re-Add if Connect still sees a stale Imaging item.
 
 **Transfer Get does not need `MetadataVersion` in the XML.** DPWS puts version only on Hello / ProbeMatch / ResolveMatch; clients refresh Get when that rises ([dpws.md](dpws.md) R2001). Lab dumps omitting it from Get are correct.
 
 **Mitigation shipped (needs live proof — do not claim fixed):** discovery bumps `AppSequence/@InstanceId` and `MetadataVersion` from boot time each process start, plus a short Hello burst ([ws-discovery.md](ws-discovery.md)). Fixed `InstanceId="1"` with MessageNumber reset after a long prior run matches WSDAPI’s [stale MessageNumber / XAddrs rules](https://learn.microsoft.com/en-us/windows/win32/wsdapi/appsequence-validation-rules).
 
-**Still open (not changed — risk to aep-pairable shapes):**
+**Subscribe / Transfer (code-locked; live residual separate):**
 
 | Question | Notes |
 |----------|--------|
-| Subscribe Filter dialects | Stub accepts; may not echo Action-filter / dialect the USD expects |
-| SubscriptionManager EPR | Stub returns **ScannerService** Address. Some devices use Device — compare Brother |
-| Expires format | Stub echoes request / duration; confirm against WSDScan |
-| Hosted-service GetMetadata | DPWS R5008; Windows may not need it if Device Get is enough |
-| Transport “online” bit | PnP present + Device Get OK yet WIA never opens Scan — may be association / WSDScan state outside fakescan |
+| Subscribe Filter dialects | **done** — accept; `@Dialect` logged; filter body not evaluated (ignore unknown) |
+| SubscriptionManager EPR | **done** — ScannerService Address + Identifier (flow-tested) |
+| Expires format | **done** — PT / `P1D` / `P1DT…` / UTC `Z`/`+00:00` (flow-tested) |
+| Hosted-service GetMetadata | **done** — same WS-Transfer Get dispatcher on `/ScannerService` and `/WebServices/Device` (Device MEX). Windows lab only polls Device today |
+| Transport “online” bit | **open (live)** — PnP + Device Get OK yet WIA never opens Scan after restart; association / WSDScan outside fakescan ([e2e-wia-status.md](../e2e-wia-status.md)) |
+| Gray Create → no Retrieve | **code-locked** — JFIF FinalParams ColorProcessing → RGB24 + BPL width×3; live re-proof still open without touching `:3920` |
 
 **Suggested live experiments**
 
-1. Capture Hello before/after restart: `InstanceId` and `MetadataVersion` must increase; dasHost should still Transfer-Get.
+1. Capture Hello before/after restart: `InstanceId` and `MetadataVersion` must increase; dasHost should still Transfer-Get. Without Wireshark, `GET /v1/status` exposes `wsd_instance_id` and `wsd_metadata_version` (same values as AppSequence / Hello) for A/B across restarts.
 2. After restart, WIA Connect / `pdfcraft-cli scan --device "Fake WSD scanner"` **without** remove+Add; watch for any `/ScannerService` POST.
 3. A/B old binary (`InstanceId=1`) vs new; same UUID/`--advertise`.
 4. If still sticky: Wireshark Resolve after Hello; optionally omit Hello XAddrs temporarily (dev only) to force Resolve.

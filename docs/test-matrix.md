@@ -14,25 +14,54 @@ pdfcraft’s WIA path is hard to CI without hardware. fakescan’s job is to rep
 
 | # | Behavior under test | Needs | fakescan knobs | Status |
 |---|---------------------|-------|----------------|--------|
-| 1 | List shows `usb` vs `wsd` | Windows install / USD | dual profiles | profiles ready; Windows TBD |
-| 2 | Optical null on WSD, non-null on USB | caps publish | `optical` in profile | ready |
-| 3 | Refuse dpi/format not in lists | ValidateScanTicket + CreateScanJob | profile + `refuse_unknown` | **enabled** (`refuse_unknown: true` on brother-wsd/usb; CreateScanJob refuses) |
-| 4 | Glass with sticky feeder ready must not pull ADF | FEED_READY + empty stack | `sticky_ready` + `pages=0` | ready |
-| 5 | Auto + empty ADF → glass fallback | sticky ready + empty error | scenario `sticky_empty` | ready |
-| 6 | Feeder `--pages N` stops after N | ImagesToTransfer / job pages | `/v1/pages` + job limit | ready |
-| 7 | Cancel mid-feeder (STOP_FEEDER) | slow page transfer + CancelJob | `slow_retrieve_ms` | **enabled** (`POST /v1/slow`, `/v1/faults` `{ms}`) |
-| 8 | Manual duplex / `--reverse` | two stacks of known images | `/v1/pages` `{side,order}` + pattern `duplex_pair` | **enabled** (synthetic front/back stacks; see below) |
-| 9 | Multi-page ADF order | page index in bitmaps | synthetic page markers | **enabled** (JPEG COM `fakescan-page:N` + visual bars; see [patterns.md](patterns.md)) |
-| 9c | Hard loopback (byte-identical echo) | uploaded JFIF store | `POST /v1/loopback` + Python client | **enabled** ([lab-harness.md](lab-harness.md)) |
-| 9b | Brightness / color / orientation / crop cues | known pixel layouts | `POST /v1/pattern` (`wedges`, `patches`, `slant_f`, `corners`) | **enabled** ([patterns.md](patterns.md)) |
-| 10 | Jam / cover open | ScannerStatus reasons | `jam` / `cover_open` faults | **enabled** (`POST /v1/fault` `/v1/condition`; Status JSON; ScannerStatus reads World) |
-| 10b | Mid-job jam / empty | RetrieveImage fault after N pages | `jam_after_n` / `empty_mid_job` | **enabled** (`POST /v1/fault`; see [defects.md](defects.md)) |
-| 11 | Capability-aware UI (hide missing controls) | published lists differ | `brother-usb` vs `brother-wsd` | ready |
-| 12 | Dump must not crash on WSD props | live WSD device | install fakescan as WSD | Windows TBD |
+| 1 | List shows `usb` vs `wsd` | Windows install / USD | dual profiles | SOAP profiles automated; WIA Connect still fails (see below) |
+| 2 | Optical null on WSD, non-null on USB | caps publish | `optical` in profile | **automated** (`test_local_matrix.py`) |
+| 3 | Refuse dpi/format not in lists | ValidateScanTicket + CreateScanJob | profile + `refuse_unknown` | **automated** |
+| 4 | Glass with sticky feeder ready must not pull ADF | FEED_READY + empty stack | `sticky_ready` + `pages=0` | **automated** (platen job leaves the tray) |
+| 5 | Auto + empty ADF → glass fallback | sticky ready + empty error | `sticky_empty` scenario + pdfcraft `acquire` retries glass | **automated** (`sticky_empty` on `brother-usb`: ADF Create faults; Platen OK; tray stays sticky) |
+| 6 | Feeder `--pages N` stops after N | ImagesToTransfer / job pages | `/v1/pages` + job limit | **automated** |
+| 7 | Cancel mid-feeder (STOP_FEEDER) | slow page transfer + CancelJob | `slow_retrieve_ms` | **automated** (delay + CancelJob drops the job) |
+| 8 | Manual duplex / `--reverse` | two stacks of known images | `/v1/pages` `{side,order}` + pattern `duplex_pair` | **automated** on SOAP; pdfcraft-cli still blocked on WIA Connect |
+| 8b | Hardware ADF duplex | `ADFSupportsDuplex` + `ADFBack`; `InputSource` ADFDuplex | `feeder.duplex` in profile | **automated** (front then back per sheet; glass-only profiles refuse ADFDuplex) |
+| 9 | Multi-page ADF order | page index in bitmaps | synthetic page markers | **automated** (COM `fakescan-page:N`) |
+| 9c | Hard loopback (byte-identical echo) | uploaded JFIF store | `POST /v1/loopback` + Python client | **automated** |
+| 9b | Brightness / color / orientation / crop cues | known pixel layouts | `POST /v1/pattern` (`wedges`, `patches`, `slant_f`, `corners`) | **automated** (four layouts differ; Gray8 drops chroma) |
+| 10 | Jam / cover open | ScannerStatus reasons | `jam` / `cover_open` faults | **automated** on SOAP; WIA `handling_status` blocked on Connect |
+| 10b | Mid-job jam / empty | RetrieveImage SOAP subcode `wscn:ClientErrorMediaJam` / `wscn:ClientErrorNoImagesAvailable` after N pages | `jam_after_n` / `empty_mid_job` | **automated** on SOAP; pdfcraft keeps the jam sentence after pages (`after_transfer`) |
+| 10c | Offline / mid-scan drop | Status `AttentionRequired`; Subscribe/Create/Retrieve `ServerErrorNotAcceptingJobs` | `offline` / `offline_after_n` | **automated** on SOAP + local matrix; sticky offline until `reset`; pdfcraft mid-scan → stayed-online / offline sentences; ignored WIA labs |
+| 10d | Multi-feed / double-pick | Status `MultipleFeedError`; mid-job RetrieveImage `ClientErrorMultipleFeed` | `multi_feed` / `multi_feed_after_n` | **automated** on SOAP + unit; pdfcraft preflight / `after_transfer` → “more than one sheet”; ignored WIA lab |
+| 10e | Mid-MTOM abort | RetrieveImage HTTP body stream errors after N bytes (`Content-Length` still full) | `abort_retrieve` / `abort_retrieve_after_n` / `abort_retrieve_bytes` | **automated** on SOAP + unit; pdfcraft → interrupted / stayed-online; ignored WIA lab |
+| 10f | Lamp error / busy | Status `LampError` / `Processing`; Subscribe+Create refuse | `lamp_error` / `busy` | **automated** on unit + SOAP + local matrix; pdfcraft lamp preflight / busy sentence; ignored WIA labs |
+| 11 | Capability-aware UI (hide missing controls) | published lists differ | `brother-usb` vs `brother-wsd` | **automated** (connection, optical, formats) |
+| 12 | Dump must not crash on WSD props | live WSD device | install fakescan as WSD | blocked: WIA Connect fails before dump |
+
+## Sources, trays, and duplex (rows 4 / 8 / 8b)
+
+Scanners do **not** have printer-style input trays. fakescan models the usual two **sources** (and glass-only profiles for one):
+
+| Source | Profile | How to arm |
+|--------|---------|------------|
+| Glass (platen) | `sources` includes `glass` | CreateScanJob `InputSource` Platen; `glass-wsd` / `glass-jfif` are glass-only |
+| ADF feeder | `sources` includes `feeder` | `/v1/pages` + `InputSource` ADF / Feeder |
+| Hardware duplex | `feeder.duplex: true` | `ADFSupportsDuplex=1` + `ADFBack`; `InputSource` **ADFDuplex** → 2 faces per sheet (front then back) |
+| Manual duplex | any feeder profile | two loads with `side`/`order` (below) — pdfcraft `--reverse` |
+
+Printer multi-tray labs live in **fakeprint** (`InputBins` / Tray1), not here ([siblings.md](siblings.md)).
+
+### Hardware duplex (row 8b)
+
+```bash
+# brother-wsd / brother-usb / wia-rich advertise duplex
+curl -X POST http://127.0.0.1:3920/v1/pages -H "content-type: application/json" -d '{"count":2}'
+# CreateScanJob with <wscn:InputSource>ADFDuplex</wscn:InputSource>
+# RetrieveImage ×4 → front, back, front, back (COM fakescan-side + duplex_pair art)
+```
+
+`ImagesToTransfer` counts **faces**. Sheets in the feeder × 2 = faces available.
 
 ## Manual duplex / pdfcraft `--reverse` (row 8)
 
-pdfcraft’s `--reverse` is **manual duplex** when the feeder has no hardware duplex bit: scan fronts first, flip the whole stack (last sheet on top), scan backs (they arrive last-sheet-first), then interleave. fakescan models that with two feeder loads — no real `fronts/` / `backs/` dirs required.
+pdfcraft’s `--reverse` is **manual duplex** when the feeder has no hardware duplex bit (or the app chooses two-pass): scan fronts first, flip the whole stack (last sheet on top), scan backs (they arrive last-sheet-first), then interleave. fakescan models that with two feeder loads — no real `fronts/` / `backs/` dirs required.
 
 ### Control plane
 
@@ -67,9 +96,11 @@ pdfcraft-cli scan --device fakescan --out DIR --reverse --yes
 
 Expect interleaved pages F0,B0,F1,B1,F2,B2 (verify with COM markers or blue/red faces). Blocked today on Windows Imaging install of fakescan ([e2e-wia-status.md](e2e-wia-status.md)).
 
-## Human smoke path (patterns)
+## Local matrix (no Imaging install)
 
-Without a full matrix run, walk `GET /v1/scenarios` → `POST /v1/scenario` for `order` → `qr` → `tone` → `color` → `orient` → `crop` → `duplex`. Banner + QR + `scenario_check` on status tell the tester what to look for. Details: [patterns.md](patterns.md).
+`pytest python/tests/test_local_matrix.py` builds fakescan if needed (honors `CARGO_TARGET_DIR`), starts it on `127.0.0.1` with probe listen off, and walks the rows above that do not need a Windows Imaging node: profiles and optical resolution, ticket refusal, sticky feeder plus a platen job that leaves the tray alone, `sticky_empty` (ADF Create empty fault + Platen OK), empty-ADF refusal, `ImagesToTransfer`, slow retrieve and CancelJob, the seven smoke scenarios (`order` through `duplex`) with `fakescan-page:` markers, manual-duplex reverse backs, hardware ADFDuplex (front/back + glass-only refusal), hard loopback, jam / cover / mid-job empty, offline / lamp_error / busy (reset clears), lamp warmup, a dirty-ADF effect page, and `wia-rich` Format Create+Retrieve (magic + multi-page consume).
+
+Rows 1 and 12 still need WIA Connect. The SOAP / local matrix above stays **unelevated**. `.\scripts\fakescan.ps1 wia-trace` prints the COM HRESULT, the elapsed time, and any WSD calls `GET /v1/trace` recorded during that Connect. Zero calls and `0x80210001` in about 26 ms means Windows failed before ScannerService (sticky offline). Rechecked with Fake installed as "Fake WSD scanner (lite caps)" and fakescan answering `http://192.168.1.70:3920`: Connect failed that way and did not open ScannerService. `GET /v1/activity` and `GET /v1/log` are how you see whether Connect produced WSD lines. `GET /v1/jobs` is the scan-task list. Imaging recovery: `helper remove` (or elevated `remove` / `rebind`), Unpair, and a person re-Add while fakescan stays up unelevated — [windows.md](windows.md#helper--elevated--remove--rebind). A banner walk by eye is in [patterns.md](patterns.md).
 
 Optional defect stress (any pattern):
 

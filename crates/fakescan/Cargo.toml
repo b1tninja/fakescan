@@ -3,22 +3,45 @@ name = "fakescan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Fake scanner control plane and (planned) WSD Scan Service for WIA testing"
+repository.workspace = true
+homepage.workspace = true
+description = "Fake WSD scanner for Windows WIA and scan-path testing"
 readme = "../../README.md"
+keywords = ["scanner", "wsd", "wia", "testing", "windows"]
+categories = ["command-line-utilities", "development-tools::testing"]
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-clap = { version = "4", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+base64 = "0.22"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive", "env"] }
+fax = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "tiff"] }
+jpeg-encoder = "0.7"
+openjpeg2-pure-rs = "0.1"
+qrcode = { version = "0.14.1", features = ["image"] }
+quick-xml = "0.37"
+tiff = "0.11"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[build-dependencies]
+# Windows .ico + VERSIONINFO for fakescan.exe (build.rs is a no-op elsewhere).
+winresource = "0.1"
+
 [dev-dependencies]
 http-body-util = "0.1"
+rqrr = "0.11.0"
 tower = { version = "0.5", features = ["util"] }

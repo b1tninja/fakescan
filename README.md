@@ -1,27 +1,35 @@
 # fakescan
 
 <p align="center">
-  <img src="docs/assets/fakescan-logo.svg" alt="fakescan" width="220" />
+  <img src="docs/assets/fakescan-logo.svg" alt="fakescan" width="640" />
 </p>
 
-A **fake scanner** for testing acquire paths: scriptable glass/feeder, synthetic page patterns, image defects, and capability profiles that look like real WIA / WSD devices â€” without a physical MFP.
+<p align="center">
+  <a href="https://github.com/b1tninja/fakescan/actions/workflows/ci.yml"><img src="https://github.com/b1tninja/fakescan/actions/workflows/ci.yml/badge.svg" alt="ci" /></a>
+</p>
 
-Built for [pdfcraft](https://github.com/) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). Companion **[fakeprint](https://github.com/b1tninja/fakeprint)** covers WSD Print on `:3921` â€” [docs/siblings.md](docs/siblings.md).
+A **fake scanner** for testing acquire paths: scriptable glass/feeder, synthetic page patterns, image defects, and capability profiles that look like real WIA / WSD devices — without a physical MFP.
+
+Built for [pdfcraft](https://github.com/storytold/pdfcraft) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). Companion **[fakeprint](https://github.com/b1tninja/fakeprint)** covers WSD Print on `:3921`. How the two labs differ: [docs/siblings.md](docs/siblings.md).
 
 ## Docs
 
-| Doc | Start here forâ€¦ |
+| Doc | Start here for… |
 |-----|-----------------|
 | [docs/README.md](docs/README.md) | Full index |
-| [docs/siblings.md](docs/siblings.md) | vs fakeprint (ports, loopback â‰  capture) |
-| [docs/lab-harness.md](docs/lab-harness.md) | Python client + hard loopback (optional) |
-| [docs/deploy.md](docs/deploy.md) | Docker / LAN |
+| [docs/siblings.md](docs/siblings.md) | vs fakeprint (ports, loopback ≠ capture) |
+| [docs/lab-harness.md](docs/lab-harness.md) | Python client + hard loopback; `GET /v1/jobs`, `/v1/activity`, `/v1/log` |
 | [docs/windows.md](docs/windows.md) | WIA install assist (person clicks Add device) |
+| [docs/architecture.md](docs/architecture.md) | Layout, ports, control API |
+| [docs/reference/](docs/reference/README.md) | Official WSD/WS-Scan rules (Format fallback, MustHonor, faults) + XSD/WSDL |
+| [docs/coverage.md](docs/coverage.md) | Spec → feature completion map |
+| [docs/roadmap.md](docs/roadmap.md) | Backlog (test pages, ANAC, more effects, …) |
+| [docs/e2e-wia-status.md](docs/e2e-wia-status.md) | Live Windows gate |
+| [docs/prior-art.md](docs/prior-art.md) | Why not WIA samples alone |
+| [docs/deploy.md](docs/deploy.md) | Docker / LAN |
 | [docs/linux-client.md](docs/linux-client.md) | sane-airscan |
 | [docs/patterns.md](docs/patterns.md) | Page layouts + tester progression |
 | [docs/defects.md](docs/defects.md) | Skew, speckles, streaks, hole punches, Gray8 |
-| [docs/roadmap.md](docs/roadmap.md) | Backlog (test pages, ANAC, more effects, â€¦) |
-| [docs/prior-art.md](docs/prior-art.md) | Why not WIA samples alone |
 
 ## Quick start (Docker)
 
@@ -38,15 +46,26 @@ Published image: `ghcr.io/b1tninja/fakescan:latest`
 ```bash
 cargo run -p fakescan -- --profiles profiles --profile brother-wsd
 # LAN: --listen 0.0.0.0:3920 --advertise 192.168.1.10
-# Stable Windows identity: --device-uuid 00000000-0000-4000-8000-000000000001
+# Stable Windows identity: --device-uuid 00000000-0000-4000-8000-0000000000f2
 ```
+
+Default port **3920** (fakeprint uses **3921**). Both can run on the same host with distinct UUIDs.
 
 ## Profiles
 
-- `profiles/brother-usb.json` â€” high dpi, bmp â†’ wire `dib`, optical, sticky feeder  
-- `profiles/brother-wsd.json` â€” 100/200/300 dpi, jpeg + tiff â†’ wire `jfif` + `tiff-single-uncompressed`  
-- `profiles/wia-rich.json` â€” all encodable WIA/WSD formats (see [docs/formats.md](docs/formats.md))  
+- `profiles/brother-usb.json` — high dpi, bmp → wire `dib`, optical, sticky feeder
+- `profiles/brother-wsd.json` — 100/200/300 dpi, jpeg + tiff → wire `jfif` + `tiff-single-uncompressed` (Brother-shaped)
+- `profiles/wia-lossless.json` — no jfif; WIA glass can ticket wire `dib` via FormatNotSupported fallback ([reference/format.md](docs/reference/format.md), [formats.md](docs/formats.md))
+- `profiles/accept-dib.json` — `dib` only (SOAP lossless / `fakescan-lab acquire-dib`)
+- `profiles/wia-rich.json` — all encodable WIA/WSD formats (see [docs/formats.md](docs/formats.md))
 - Formats matrix: [docs/formats.md](docs/formats.md)
+
+```bash
+# lossless WIA BMP (restart or hot-switch; Imaging node already Added):
+fakescan-lab --base-url http://127.0.0.1:3920 profile wia-lossless
+# Brother-shaped JFIF wire again:
+fakescan-lab --base-url http://127.0.0.1:3920 profile brother-wsd
+```
 
 Mirrored from a Brother MFC-9330CDW dump, not product UI strings.
 
@@ -63,26 +82,28 @@ curl -X POST http://127.0.0.1:3920/v1/scenario \
   -H "content-type: application/json" -d '{"id":"order"}'
 ```
 
+Read-only, in this tree (they show up after the next start): `GET /v1/jobs` (scan-task list), `GET /v1/activity?after=SEQ`, and `GET /v1/log?after=SEQ` (last 64 calls; `after` returns only newer events). `GET /v1/trace` is the activity JSON. `POST /v1/ctl` takes `jobs` and `activity`. An older binary still on `:3920` answers 404 for `/v1/jobs`, `/v1/activity`, and `/v1/log`. Shapes and `.\scripts\fakescan.ps1 jobs`, `activity`, `log`, `wia-trace`: [docs/lab-harness.md](docs/lab-harness.md).
+
 ## Status
 
 | Piece | State |
 |-------|--------|
 | Control API `/v1/*` (pages, pattern, effects, scenario, fault, slow, **loopback**) | working |
-| Python lab client (`python/`, optional) | working â€” [lab-harness.md](docs/lab-harness.md) |
+| Python lab client (`python/`, optional) | working — [lab-harness.md](docs/lab-harness.md) |
 | Profiles `brother-usb` / `brother-wsd` | working |
 | WS-Discovery Hello (+ ProbeMatch when port free) | working |
-| WS-Scan SOAP + MTOM RetrieveImage (common WIA formats + multi-page) | wire OK â€” WIA accept still CancelJob ~30s / `0x80004005` ([e2e-wia-status.md](docs/e2e-wia-status.md), [mtom-retrieveimage.md](docs/specs/mtom-retrieveimage.md)) |
+| WS-Scan SOAP + MTOM RetrieveImage (common WIA formats + multi-page) | wire OK — WIA accept still CancelJob ~30s / `0x80004005` ([e2e-wia-status.md](docs/e2e-wia-status.md), [mtom-retrieveimage.md](docs/specs/mtom-retrieveimage.md)) |
 | WS-Transfer Get (ThisModel / ThisDevice / Host+Hosted + PnP-X) | working |
-| Image effects (skew, speckles, streaks, hole punch) | working â€” [defects.md](docs/defects.md) |
+| Image effects (skew, speckles, streaks, hole punch) | working — [defects.md](docs/defects.md) |
 | ColorProcessing RGB24 / Grayscale8 | working |
-| Windows Imaging install + WIA Connect | **live** (person Add once); glass acquire **partial** â€” [e2e-wia-status.md](docs/e2e-wia-status.md) |
-| Docker + GHCR | yes |
+| Windows Imaging install + WIA Connect | **live** (person Add once); glass acquire **partial** — [e2e-wia-status.md](docs/e2e-wia-status.md) |
+| Docker + GHCR | yes (`ghcr.io/b1tninja/fakescan:latest`) |
 | WIA USD (USB-like local) | not yet |
 | Extra test-page patterns / ANAC / more effects | [roadmap.md](docs/roadmap.md) |
 
 ## Lab harness (Python, optional)
 
-For WIA / pdfcraft developers only â€” not a default app dependency:
+For WIA / pdfcraft developers only — not a default app dependency:
 
 ```bash
 pip install -e "./python[dev]"
@@ -96,6 +117,10 @@ See [docs/lab-harness.md](docs/lab-harness.md).
 
 ```powershell
 .\scripts\fakescan.ps1 status
+.\scripts\fakescan.ps1 jobs
+.\scripts\fakescan.ps1 activity
+.\scripts\fakescan.ps1 log
+.\scripts\fakescan.ps1 wia-trace
 .\scripts\fakescan.ps1 discoverable
 .\scripts\fakescan.ps1 scenarios
 .\scripts\fakescan.ps1 scenario order
@@ -104,11 +129,25 @@ See [docs/lab-harness.md](docs/lab-harness.md).
 
 See [docs/windows.md](docs/windows.md) for soap-only vs on-wire-discoverable vs fd-installable vs installed.
 
+## Develop
+
+```bash
+cargo fmt --all -- --check
+cargo clippy -p fakescan --all-targets -- -D warnings
+cargo test -p fakescan
+pip install -e "./python[dev]"
+pytest python/tests -m "not live and not local"
+```
+
 ## CI
 
-- `.github/workflows/ci.yml` â€” fmt / clippy / test; Docker smoke; optional linux-sane  
-- `.github/workflows/docker.yml` â€” GHCR push  
+- `.github/workflows/ci.yml` — fmt / clippy / test on Ubuntu and Windows; Docker smoke; sane-airscan; Python lab
+- `.github/workflows/docker.yml` — GHCR push
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT OR Apache-2.0 (project-original). Anything derived from Microsoft WIA samples must keep **MS-PL** notices.
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). Anything derived from Microsoft WIA samples must keep **MS-PL** notices.

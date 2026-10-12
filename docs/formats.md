@@ -1,5 +1,7 @@
 # Image formats (WSD / WIA)
 
+Authoritative Format tokens, WIA fallback order, and fault names: **[reference/format.md](reference/format.md)** (from MS Learn + ScanService.zip XSD). This page is the **fakescan encode matrix**.
+
 fakescan encodes RetrieveImage payloads for the WSD Scan `Format` / `FormatValue` tokens that map to common WIA transfer formats. Profile JSON may use short names (`jpeg`, `tiff`, `bmp`, `pdf`); the wire uses WSD tokens.
 
 ## Shipped
@@ -32,12 +34,33 @@ For `tiff-multi-*`, `pdf-a`, and `xps`, a single RetrieveImage consumes **all** 
 
 | Profile | Formats |
 |---------|---------|
-| `brother-wsd` | `jfif`, `tiff-single-uncompressed`, `dib` |
+| `brother-wsd` | `jfif`, `tiff-single-uncompressed` (lite WSD caps; no DIB) |
+| `accept-dib` | `dib` only — SOAP lossless BMP |
+| `wia-lossless` | `png`, `tiff-single-uncompressed`, `dib` (no jfif) — **WIA wire lossless** via FormatNotSupported fallback |
 | `brother-usb` | `bmp` → `dib` |
 | `wia-rich` | all shipped tokens |
 
+### Raw BMP without JFIF (lossless)
+
+fakescan encodes wire `dib` / `png` / `tiff-single-uncompressed` (optical crop).
+
+**Documented inbox path** ([MS Format](https://learn.microsoft.com/en-us/windows-hardware/drivers/image/format)): if the scanner returns **`ClientErrorDocumentFormatNotSupported`**, wsdscdrv retries **PNG → EXIF → G4 TIFF → `tiff-single-uncompressed`**. Format is *not* in the CreateScanJob MustHonor allow-list (WIA still stamps MustHonor on it).
+
+Lab (2026-10-12): profile **`wia-lossless`** (`png`, `tiff-single-uncompressed`, `dib`; **no jfif**; `refuse_unknown`) + proper FormatNotSupported fault → WIA CreateScanJob tickets **`Format=dib`**, RetrieveImage ~11 MB `image/bmp`, Automation/pdfcraft Transfer OK (BM…). Earlier miss: generic “invalid ticket” fault (no DocumentFormatNotSupported) so the driver never retried; also `extract_tag` ignored MustHonor attributes. ValidateScanTicket soft-accepts a format miss (`ValidTicket=true`) so the driver still reaches CreateScanJob; only Create faults. pdfcraft `--format bmp` sets WIA to DIB (wire `dib`); `--format jpeg` sets JFIF. On `brother-wsd`, use jpeg — bmp tickets `dib` and faults (MS fallback does not go back to jfif).
+
+| Client | Wire lossless |
+|--------|----------------|
+| SOAP `Format=dib` | **yes** (`fakescan-lab acquire-dib` / `accept-dib`) |
+| WIA / pdfcraft + `wia-lossless` | **yes** — ticket `dib`, RetrieveImage BMP |
+| WIA + `brother-wsd` (jfif advertised) | wire **jfif**; app BMP = JPEG decode |
+| Brother USB (`brother-usb`) | native `dib` |
+
+`extract_tag` must read `<sca:Format sca:MustHonor="true">…</sca:Format>`.
+
 ```bash
 cargo run -p fakescan -- --profiles profiles --profile wia-rich
+# SOAP CI (no Imaging): pytest …::test_wia_rich_formats_retrieve_with_expected_magic
+#                       pytest …::test_wia_rich_multipage_formats_consume_the_stack
 ```
 
 ## WSD / WIA catalog (reference)

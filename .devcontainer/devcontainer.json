@@ -6,7 +6,10 @@
   },
   "runArgs": ["--network=host"],
   "forwardPorts": [3920],
-  "postCreateCommand": "cargo build -p fakescan",
+  "features": {
+    "ghcr.io/devcontainers/features/powershell:1": {}
+  },
+  "postCreateCommand": "pwsh -File scripts/Get-WsdSpecs.ps1 || echo 'WSD specs were not downloaded. The Microsoft license notice needs ACCEPT in a terminal: pwsh -File scripts/Get-WsdSpecs.ps1'; cargo build -p fakescan",
   "customizations": {
     "vscode": {
       "extensions": [
