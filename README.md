@@ -1,1 +1,114 @@
-﻿# fakescanA **fake scanner** for Windows testing: configurable glass/feeder, page images from disk, and capability profiles that look like real WIA devices (USB Brother-style vs inbox WSD-style).Built so [pdfcraft](https://github.com/) (and similar apps) can exercise acquire, Auto, sticky `FEED_READY`, page counts, and format refusals **without** a physical MFP.## Research (what already exists)| Option | What it is | Gap for us ||--------|------------|------------|| [Microsoft WIA driver samples](https://github.com/microsoft/Windows-driver-samples/tree/main/wia) (`wiadriverex`, `ProdScan`) | Real WIA 2.0 minidrivers; emit a test pattern; install via Scanners and Cameras + Have Disk | WDK/C++, MS-PL, not profile-driven, awkward for CI, no Brother-like USB vs WSD split || [twain/twain-samples](https://github.com/twain/twain-samples) + [wia-on-twain](https://github.com/twain/wia-on-twain) | Software TWAIN DS + WIA adapter | Aged, TWAIN-centric, hard to script FEED_READY / capability matrices || App-level mocks (e.g. NAPS2 `MockScanBridge`) | Unit-test doubles inside the app | Never hits real WIA / WSD || [bobi/WsdScanService](https://github.com/bobi/WsdScanService) | .NET CoreWCF **WSD Scan Service** + WS-Discovery | Closest ΓÇ£serverΓÇ¥; not aimed at pdfcraft profiles / sticky feeder / dual USB┬╖WSD surfaces |**Conclusion:** there is no maintained, scriptable ΓÇ£fake scannerΓÇ¥ that:1. shows up under WIA the way a Brother USB + WSD pair does, and  2. lets tests set feeder empty/ready, page stacks, dpi/format lists, and optical-res omission.So this repo exists.## Design (two surfaces)Windows never talks ΓÇ£HTTP status page ΓåÆ WIAΓÇ¥. Paths that matter:```App (pdfcraft) ΓöÇΓöÇWIA COMΓöÇΓöÇΓû║ USB minidriver     (rich caps, high dpi)App (pdfcraft) ΓöÇΓöÇWIA COMΓöÇΓöÇΓû║ WSDScan.sys ΓöÇΓöÇSOAPΓöÇΓöÇΓû║ network Scan Service```**fakescan** targets both eventually:| Surface | How Windows sees it | Priority ||---------|---------------------|----------|| **WSD Scan Service** (user-mode) | `BrotherΓÇª [uuid]`-style network scanner via inbox WSDScan | **P0** ΓÇö no kernel driver, matches network testing || **WIA USD minidriver** (user-mode DLL + INF) | Local ΓÇ£USB-likeΓÇ¥ device with full property lists | **P1** ΓÇö fork/extend `wiadriverex` ideas under MS-PL attribution || **Control plane** | HTTP/named-pipe: load pages, set FEED_READY, switch profile | **P0** ΓÇö required for CI |Capability **profiles** (JSON) describe what each surface publishes ΓÇö see `profiles/`.## Profiles- `profiles/brother-usb.json` ΓÇö high dpi, bmp-only, optical 1200├ù2400, pages 0ΓÇô30  - `profiles/brother-wsd.json` ΓÇö 100/200/300 dpi, jpeg/tiff, no optical, richer page sizes  These mirror live dumps from a Brother MFC-9330CDW (USB + WSD), not product UI strings.## Quick start (Docker)Docker is the supported deploy path. See [docs/deploy.md](docs/deploy.md).```bashdocker compose up --build -dcurl http://127.0.0.1:3920/healthcurl http://127.0.0.1:3920/v1/status# SOAP: POST http://127.0.0.1:3920/ScannerService```Published image (after CI): `ghcr.io/b1tninja/fakescan:latest````bashdocker run --rm -p 3920:3920 ghcr.io/b1tninja/fakescan:latest```### From source```bashcargo run -p fakescan -- --profiles profiles --profile brother-wsd# LAN advertise: --listen 0.0.0.0:3920 --advertise 192.168.1.10```## Status| Piece | State ||-------|--------|| Control API (`/v1/*`, including `/v1/pages`) | working || Capability profiles (`brother-usb`, `brother-wsd`) | working || WS-Discovery Hello / ProbeMatch | stub (multicast) || WS-Scan SOAP (`GetScannerElements`, `ValidateScanTicket`, `CreateScanJob`, `RetrieveImage` MTOM, `CancelJob`) | working (unit-tested) || WS-Transfer Get (ThisDevice / ThisModel) | minimal stub || Windows WSDScan install ΓåÆ WIA list | **unverified live** (needs LAN advertise + firewall) || Docker image + compose | yes (`Dockerfile`, `docker-compose.yml`) || GHCR publish | `.github/workflows/docker.yml` || WIA USD (USB-like local device) | not yet |```bashcurl -X POST http://127.0.0.1:3920/v1/pages \  -H "content-type: application/json" -d "{\"count\":2}"```## CI- `.github/workflows/ci.yml` ΓÇö `cargo fmt` / clippy / test on Ubuntu + Windows; Docker compose smoke  - `.github/workflows/docker.yml` ΓÇö build/push `ghcr.io/<owner>/fakescan`  - `.devcontainer/` ΓÇö Rust tooling for Codespaces / VS Code## LicenseMIT OR Apache-2.0 (project-original code). Any file derived from Microsoft WIA samples must keep **MS-PL** notices.
+﻿# fakescan
+
+<p align="center">
+  <img src="docs/assets/fakescan-logo.svg" alt="fakescan" width="220" />
+</p>
+
+A **fake scanner** for testing acquire paths: scriptable glass/feeder, synthetic page patterns, image defects, and capability profiles that look like real WIA / WSD devices â€” without a physical MFP.
+
+Built for [pdfcraft](https://github.com/) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). Companion **[fakeprint](../fakeprint)** covers WSD Print on `:3921` â€” [docs/siblings.md](docs/siblings.md).
+
+## Docs
+
+| Doc | Start here forâ€¦ |
+|-----|-----------------|
+| [docs/README.md](docs/README.md) | Full index |
+| [docs/siblings.md](docs/siblings.md) | vs fakeprint (ports, loopback â‰  capture) |
+| [docs/lab-harness.md](docs/lab-harness.md) | Python client + hard loopback (optional) |
+| [docs/deploy.md](docs/deploy.md) | Docker / LAN |
+| [docs/windows.md](docs/windows.md) | WIA install assist (person clicks Add device) |
+| [docs/linux-client.md](docs/linux-client.md) | sane-airscan |
+| [docs/patterns.md](docs/patterns.md) | Page layouts + tester progression |
+| [docs/defects.md](docs/defects.md) | Skew, speckles, streaks, hole punches, Gray8 |
+| [docs/roadmap.md](docs/roadmap.md) | Backlog (test pages, ANAC, more effects, â€¦) |
+| [docs/prior-art.md](docs/prior-art.md) | Why not WIA samples alone |
+
+## Quick start (Docker)
+
+```bash
+docker compose up --build -d
+curl http://127.0.0.1:3920/health
+curl http://127.0.0.1:3920/v1/status
+```
+
+Published image: `ghcr.io/b1tninja/fakescan:latest`
+
+### From source
+
+```bash
+cargo run -p fakescan -- --profiles profiles --profile brother-wsd
+# LAN: --listen 0.0.0.0:3920 --advertise 192.168.1.10
+# Stable Windows identity: --device-uuid 00000000-0000-4000-8000-000000000001
+```
+
+## Profiles
+
+- `profiles/brother-usb.json` â€” high dpi, bmp â†’ wire `dib`, optical, sticky feeder  
+- `profiles/brother-wsd.json` â€” 100/200/300 dpi, jpeg + tiff â†’ wire `jfif` + `tiff-single-uncompressed`  
+- `profiles/wia-rich.json` â€” all encodable WIA/WSD formats (see [docs/formats.md](docs/formats.md))  
+- Formats matrix: [docs/formats.md](docs/formats.md)
+
+Mirrored from a Brother MFC-9330CDW dump, not product UI strings.
+
+## Control plane (examples)
+
+```bash
+curl -X POST http://127.0.0.1:3920/v1/pages \
+  -H "content-type: application/json" -d '{"count":2}'
+curl -X POST http://127.0.0.1:3920/v1/pattern \
+  -H "content-type: application/json" -d '{"id":"page_id"}'
+curl -X POST http://127.0.0.1:3920/v1/effects \
+  -H "content-type: application/json" -d '{"preset":"dirty_adf","seed":1}'
+curl -X POST http://127.0.0.1:3920/v1/scenario \
+  -H "content-type: application/json" -d '{"id":"order"}'
+```
+
+## Status
+
+| Piece | State |
+|-------|--------|
+| Control API `/v1/*` (pages, pattern, effects, scenario, fault, slow, **loopback**) | working |
+| Python lab client (`python/`, optional) | working â€” [lab-harness.md](docs/lab-harness.md) |
+| Profiles `brother-usb` / `brother-wsd` | working |
+| WS-Discovery Hello (+ ProbeMatch when port free) | working |
+| WS-Scan SOAP + MTOM RetrieveImage (common WIA formats + multi-page) | wire OK â€” WIA accept still CancelJob ~30s / `0x80004005` ([e2e-wia-status.md](docs/e2e-wia-status.md), [mtom-retrieveimage.md](docs/specs/mtom-retrieveimage.md)) |
+| WS-Transfer Get (ThisModel / ThisDevice / Host+Hosted + PnP-X) | working |
+| Image effects (skew, speckles, streaks, hole punch) | working â€” [defects.md](docs/defects.md) |
+| ColorProcessing RGB24 / Grayscale8 | working |
+| Windows Imaging install + WIA Connect | **live** (person Add once); glass acquire **partial** â€” [e2e-wia-status.md](docs/e2e-wia-status.md) |
+| Docker + GHCR | yes |
+| WIA USD (USB-like local) | not yet |
+| Extra test-page patterns / ANAC / more effects | [roadmap.md](docs/roadmap.md) |
+
+## Lab harness (Python, optional)
+
+For WIA / pdfcraft developers only â€” not a default app dependency:
+
+```bash
+pip install -e "./python[dev]"
+fakescan-lab loopback-soap page0.jpg page1.jpg   # SOAP exact-echo (no WIA)
+pytest python/tests -m live                      # needs fakescan running
+```
+
+See [docs/lab-harness.md](docs/lab-harness.md).
+
+## Windows helpers
+
+```powershell
+.\scripts\fakescan.ps1 status
+.\scripts\fakescan.ps1 discoverable
+.\scripts\fakescan.ps1 scenarios
+.\scripts\fakescan.ps1 scenario order
+.\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.10:3920 -ProbeDiscovery -WaitSeconds 120
+```
+
+See [docs/windows.md](docs/windows.md) for soap-only vs on-wire-discoverable vs fd-installable vs installed.
+
+## CI
+
+- `.github/workflows/ci.yml` â€” fmt / clippy / test; Docker smoke; optional linux-sane  
+- `.github/workflows/docker.yml` â€” GHCR push  
+
+## License
+
+MIT OR Apache-2.0 (project-original). Anything derived from Microsoft WIA samples must keep **MS-PL** notices.
