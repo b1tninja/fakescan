@@ -68,7 +68,9 @@ function Invoke-LabAttention {
         # Add flashy taskbar flashing via FlashWindowEx.
         [switch]$Loud,
         # Suppress beep and balloon; banner still prints.
-        [switch]$Quiet
+        [switch]$Quiet,
+        # How long the clickable tray icon / notification stays alive (seconds).
+        [int]$HoldSeconds = 120
     )
 
     # ── 1. Mark + yellow person-required banner (always) ─────────────────
@@ -80,7 +82,7 @@ $line
   !!  fakescan — PERSON REQUIRED — Add device
       $Detail
       Settings -> Printers & scanners is opening now.
-      Click  Add device  next to Fake WSD scanner (lite caps).
+      Click the notification (or the tray icon) to open it; then click  Add device  next to the fakescan entry.
       Verify when done:  .\scripts\fakescan.ps1 wia
 $line
 
@@ -100,22 +102,41 @@ $line
         # ── 4. BEL character alongside beep ──────────────────────────────
         try { [Console]::Write([char]0x7) } catch { }
 
-        # ── 3. WinForms NotifyIcon balloon ───────────────────────────────
+        # ── 3. Clickable notification ────────────────────────────────────
+        # A detached, hidden STA PowerShell owns the NotifyIcon so this call returns at once and
+        # the notification outlives it. Clicking the balloon/toast, or the tray icon, opens
+        # Settings -> Printers & scanners; the helper exits after the click or $HoldSeconds.
         try {
-            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-            $ni          = New-Object System.Windows.Forms.NotifyIcon
-            $ni.Icon     = [System.Drawing.SystemIcons]::Warning
-            $ni.Visible  = $true
-            $ni.ShowBalloonTip(
-                3000,
-                'fakescan — Add device required',
-                $Detail,
-                [System.Windows.Forms.ToolTipIcon]::Warning
-            )
-            Start-Sleep -Milliseconds 3000
-            $ni.Dispose()
+            $helper = @'
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+$script:clicked = $false
+$ni = New-Object System.Windows.Forms.NotifyIcon
+$ni.Icon = [System.Drawing.SystemIcons]::Warning
+$ni.Text = 'fakescan: Add device required (click to open Settings)'
+$ni.Visible = $true
+# Windows 11 raises a spurious click shortly after the balloon appears; ignore the first 2.5 s.
+$script:shownAt = [datetime]::UtcNow
+$open = { if (([datetime]::UtcNow - $script:shownAt).TotalSeconds -lt 2.5) { return }; Start-Process 'ms-settings:printers'; $script:clicked = $true }
+$ni.add_BalloonTipClicked($open)
+$ni.add_Click($open)
+$script:shownAt = [datetime]::UtcNow
+$ni.ShowBalloonTip(15000, 'fakescan - Add device required', '__DETAIL__ Click to open Settings.', [System.Windows.Forms.ToolTipIcon]::Warning)
+$end = (Get-Date).AddSeconds(__HOLD__)
+while (-not $script:clicked -and (Get-Date) -lt $end) {
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 100
+}
+Start-Sleep -Milliseconds 300
+$ni.Visible = $false
+$ni.Dispose()
+'@
+            $safe = ($Detail -replace "'", "''" -replace '[\r\n]+', ' ')
+            $helper = $helper.Replace('__DETAIL__', $safe).Replace('__HOLD__', [string][Math]::Max(5, $HoldSeconds))
+            $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($helper))
+            Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden `
+                -ArgumentList '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc
         } catch {
-            Write-Verbose "Invoke-LabAttention balloon: $_"
+            Write-Verbose "Invoke-LabAttention notification: $_"
         }
     }
 
@@ -1205,7 +1226,15 @@ function Watch-FakescanElevatedHelper {
                 }
                 @{ id = $id; cmd = $cmd; ok = $true; error = $null; result = $result } |
                     ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $replyPath -Encoding utf8
-                if ($cmd -eq 'stop') { break }
+                if ($cmd -eq 'stop') {
+                    # Handshake: the reply is on disk; give the caller a moment to read and remove it
+                    # before the cleanup below deletes the session. Bounded so we never hang here.
+                    $ackBy = [datetime]::UtcNow.AddSeconds(5)
+                    while ((Test-Path -LiteralPath $replyPath) -and [datetime]::UtcNow -lt $ackBy) {
+                        Start-Sleep -Milliseconds 100
+                    }
+                    break
+                }
             } catch {
                 @{ id = $id; cmd = $cmd; ok = $false; error = "$_"; result = $null } |
                     ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $replyPath -Encoding utf8
@@ -1306,6 +1335,12 @@ function Invoke-FakescanElevatedHelper {
                 return $reply
             }
             if (-not (Get-FakescanElevatedHelperSession)) {
+                # The reply may have landed between the check above and the helper exiting.
+                if (Test-Path -LiteralPath $replyPath) { continue }
+                if ($Cmd -eq 'stop') {
+                    # The request was consumed and the helper is gone: that is a successful stop.
+                    return [pscustomobject]@{ id = $id; cmd = 'stop'; ok = $true; error = $null; result = 'helper exited' }
+                }
                 throw 'elevated helper exited before answering'
             }
             Start-Sleep -Milliseconds 200
@@ -1930,6 +1965,102 @@ function Get-FakescanPnpRemoveTargets {
         @($rows.ToArray() | Where-Object { $_.Kind -eq 'Image' }) +
         @($rows.ToArray() | Where-Object { $_.Kind -ne 'Image' })
     )
+}
+
+function Get-FakescanGhostNodes {
+    <#
+    .SYNOPSIS
+      Fakescan PnP nodes that are ghosts: not OK in Windows AND unknown to the daemon. Read-only.
+
+    .DESCRIPTION
+      Groups the nodes from Get-FakescanPnpRemoveTargets by uuid. A uuid is a ghost only when
+      (a) every leaf node for it has a Status other than OK, (b) it is in the fakescan family
+      (00000000-0000-4000-8000-*), and (c) the daemon at -DaemonUrl does NOT list it. The daemon
+      list is required: when it cannot be read, nothing is reported (fail closed). Parent nodes
+      carry no status and follow their uuid. The real Brother can never match.
+
+    .PARAMETER DaemonUrl
+      Fakescan control plane. Default http://127.0.0.1:3920.
+    #>
+    [CmdletBinding()]
+    param([string]$DaemonUrl = 'http://127.0.0.1:3920')
+
+    $family = '00000000-0000-4000-8000-'
+    try {
+        $devs = Invoke-RestMethod -Uri ($DaemonUrl.TrimEnd('/') + '/v1/devices') -TimeoutSec 5
+    } catch {
+        Write-Warning "Cannot read the daemon device list at ${DaemonUrl}: $_ (refusing to guess what is a ghost)"
+        return @()
+    }
+    $known = @($devs | ForEach-Object { "$($_.uuid)".ToLowerInvariant() })
+
+    $rows = @(Get-FakescanPnpRemoveTargets | ForEach-Object {
+        $m = [regex]::Match($_.InstanceId, 'URN:UUID:([0-9A-Fa-f-]{36})')
+        if ($m.Success) {
+            [pscustomobject]@{ Uuid = $m.Groups[1].Value.ToLowerInvariant(); Kind = $_.Kind; Name = $_.Name
+                               InstanceId = $_.InstanceId; Status = $_.Status; IsParent = ($_.Name -like '(parent*') }
+        }
+    })
+    $ghosts = foreach ($group in ($rows | Group-Object Uuid)) {
+        $u = $group.Name
+        if (-not $u.StartsWith($family) -or ($known -contains $u)) { continue }
+        $leaves = @($group.Group | Where-Object { -not $_.IsParent })
+        if ($leaves.Count -eq 0 -or @($leaves | Where-Object { $_.Status -eq 'OK' }).Count -gt 0) { continue }
+        $group.Group
+    }
+    # Children first: Image leaf, then the SoftwareDevice leaf, then the parent node.
+    $rank = @{ 'Image' = 0 }
+    return @($ghosts | Sort-Object @{ e = { if ($_.IsParent) { 2 } elseif ($rank.ContainsKey($_.Kind)) { 0 } else { 1 } } }, Uuid)
+}
+
+function Remove-FakescanGhost {
+    <#
+    .SYNOPSIS
+      Remove ghost fakescan PnP nodes (see Get-FakescanGhostNodes). Dry run unless -Apply.
+
+    .DESCRIPTION
+      Without -Apply this only lists what would be removed. With -Apply it needs an elevated
+      shell (it does not elevate itself, and fakescan.exe is never elevated) and removes each
+      ghost node with `pnputil /remove-device`. Only uuids the daemon does not know and Windows
+      does not report OK are touched; the installed fake devices and the Brother are never matched.
+
+    .PARAMETER Uuid
+      Limit to these uuids (must still qualify as ghosts).
+
+    .EXAMPLE
+      Remove-FakescanGhost                 # lists, changes nothing
+      Remove-FakescanGhost -Apply          # elevated shell: removes them
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([string[]]$Uuid, [string]$DaemonUrl = 'http://127.0.0.1:3920', [switch]$Apply)
+
+    $nodes = @(Get-FakescanGhostNodes -DaemonUrl $DaemonUrl)
+    if ($Uuid) {
+        $want = @($Uuid | ForEach-Object { $_.ToLowerInvariant() })
+        $nodes = @($nodes | Where-Object { $want -contains $_.Uuid })
+    }
+    if ($nodes.Count -eq 0) {
+        Write-Host 'No ghost fakescan PnP nodes (every fake node is OK or known to the daemon).'
+        return [pscustomobject]@{ Matched = @(); Removed = @(); Failed = @() }
+    }
+    foreach ($n in $nodes) { Write-Host ("Ghost [{0}] {1} {2}" -f $n.Kind, $n.Name, $n.InstanceId) }
+    if (-not $Apply) {
+        Write-Host 'Dry run: nothing changed. Re-run with -Apply in an elevated shell to remove these nodes.'
+        return [pscustomobject]@{ Matched = $nodes; Removed = @(); Failed = @() }
+    }
+    if (-not (Test-FakescanProcessElevated)) {
+        Write-Warning 'Not elevated: pnputil cannot remove devices. Open an elevated PowerShell (Start-FakescanElevatedShell) and re-run with -Apply.'
+        return [pscustomobject]@{ Matched = $nodes; Removed = @(); Failed = @() }
+    }
+    $removed = New-Object System.Collections.Generic.List[string]
+    $failed = New-Object System.Collections.Generic.List[object]
+    foreach ($n in $nodes) {
+        if (-not $PSCmdlet.ShouldProcess("$($n.Name) ($($n.InstanceId))", 'pnputil /remove-device')) { continue }
+        $out = & pnputil.exe /remove-device $n.InstanceId 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) { [void]$removed.Add($n.InstanceId); Write-Host "  Removed $($n.InstanceId)" }
+        else { [void]$failed.Add([pscustomobject]@{ InstanceId = $n.InstanceId; Error = $out.Trim() }); Write-Warning "  Failed $($n.InstanceId): $($out.Trim())" }
+    }
+    return [pscustomobject]@{ Matched = $nodes; Removed = @($removed); Failed = @($failed) }
 }
 
 function Remove-FakescanScanner {
@@ -2706,7 +2837,9 @@ function Test-FakescanDiscoverable {
 
 # ── Registry (devices.json) ──────────────────────────────────────────────────
 
-$script:RegistryPath = Join-Path $env:LOCALAPPDATA 'fakescan\devices.json'
+# FAKESCAN_REGISTRY overrides the registry file (tests and sandboxes); same rule as fakescan.exe.
+$script:RegistryPath = if ($env:FAKESCAN_REGISTRY) { $env:FAKESCAN_REGISTRY } `
+    else { Join-Path $env:LOCALAPPDATA 'fakescan\devices.json' }
 
 function Get-FakescanRegistry {
     <#
@@ -2732,21 +2865,83 @@ function Get-FakescanRegistry {
     return $r
 }
 
+$script:RegistryLockHeld = $false
+
+function Invoke-FakescanRegistryLocked {
+    <#
+    .SYNOPSIS
+      Run a script block holding the cross-process registry lock (devices.json.lock).
+    .DESCRIPTION
+      Compatible with the Rust store (registry.rs RegistryStore::update), which takes std
+      File::lock() = LockFileEx exclusive over the whole range of `<registry>.lock`. Here the lock
+      file is opened with FileShare ReadWrite|Delete (NOT FileShare.None: that would make the
+      daemon's own open of the lock file fail with a sharing violation instead of waiting) and the
+      whole range is locked with FileStream.Lock, retried with backoff for ~5s. Re-entrant within
+      this process.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][scriptblock]$ScriptBlock, [int]$TimeoutMs = 5000)
+    if ($script:RegistryLockHeld) { return & $ScriptBlock }
+    $dir = Split-Path -Parent $script:RegistryPath
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $lockPath = "$($script:RegistryPath).lock"
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $delay = 15
+    $fs = $null
+    while ($true) {
+        try {
+            $fs = [System.IO.FileStream]::new($lockPath, [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try {
+                $fs.Lock(0, [long]::MaxValue)
+                break
+            } catch {
+                $fs.Dispose(); $fs = $null
+                throw
+            }
+        } catch [System.IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "registry lock busy for ${TimeoutMs}ms: $lockPath ($($_.Exception.Message))"
+            }
+            Start-Sleep -Milliseconds $delay
+            $delay = [Math]::Min($delay * 2, 250)
+        }
+    }
+    $script:RegistryLockHeld = $true
+    try {
+        return & $ScriptBlock
+    } finally {
+        $script:RegistryLockHeld = $false
+        try { $fs.Unlock(0, [long]::MaxValue) } catch { }
+        $fs.Dispose()
+    }
+}
+
 function Save-FakescanRegistry {
     <#
     .SYNOPSIS
-      Write a registry object back to %LOCALAPPDATA%\fakescan\devices.json.
+      Write a registry object back to the registry file (atomic temp+rename, under the lock).
+    .NOTES
+      Callers doing read-modify-write must hold Invoke-FakescanRegistryLocked around the read too
+      (Add/Remove/Set-FakescanDevice* do); a bare Save only serializes the write itself.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [pscustomobject]$Registry
     )
-    $dir = Split-Path -Parent $script:RegistryPath
-    if (-not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    }
-    $Registry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $script:RegistryPath -Encoding UTF8
+    Invoke-FakescanRegistryLocked -ScriptBlock {
+        $dir = Split-Path -Parent $script:RegistryPath
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        $tmp = "$($script:RegistryPath).tmp.$PID"
+        $Registry | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $script:RegistryPath -Force
+    } | Out-Null
 }
 
 function Get-FakescanDeviceList {
@@ -2778,54 +2973,56 @@ function Add-FakescanDevice {
         [switch]$Autostart
     )
 
-    $reg = Get-FakescanRegistry
-    $devices = [System.Collections.Generic.List[object]]::new()
-    foreach ($d in @($reg.devices)) { [void]$devices.Add($d) }
-
-    if ([string]::IsNullOrWhiteSpace($Listen)) {
-        $used = @($devices | ForEach-Object {
-            if ($_.listen -match ':(\d+)$') { [int]$Matches[1] }
-        })
-        $base = if ($reg.port_policy -and $reg.port_policy.base) { [int]$reg.port_policy.base } else { 3920 }
-        $step = if ($reg.port_policy -and $reg.port_policy.step) { [int]$reg.port_policy.step } else { 2 }
-        $port = $base
-        while ($used -contains $port) { $port += $step }
-        $Listen = "0.0.0.0:$port"
-    }
-
-    # Validate even port.
-    if ($Listen -match ':(\d+)$') {
-        $p = [int]$Matches[1]
-        if ($p % 2 -ne 0) {
-            throw "fakescan uses even ports (3920, 3922, …); $p is odd — odd ports are fakeprint"
+    return Invoke-FakescanRegistryLocked -ScriptBlock {
+        $reg = Get-FakescanRegistry
+        $devices = [System.Collections.Generic.List[object]]::new()
+        foreach ($d in @($reg.devices)) { [void]$devices.Add($d) }
+    
+        if ([string]::IsNullOrWhiteSpace($Listen)) {
+            $used = @($devices | ForEach-Object {
+                if ($_.listen -match ':(\d+)$') { [int]$Matches[1] }
+            })
+            $base = if ($reg.port_policy -and $reg.port_policy.base) { [int]$reg.port_policy.base } else { 3920 }
+            $step = if ($reg.port_policy -and $reg.port_policy.step) { [int]$reg.port_policy.step } else { 2 }
+            $port = $base
+            while ($used -contains $port) { $port += $step }
+            $Listen = "0.0.0.0:$port"
         }
-    }
-
-    $row = [pscustomobject]@{
-        name        = $Name
-        listen      = $Listen
-        advertise   = $Advertise
-        device_uuid = $DeviceUuid
-        profile     = $Profile
-        autostart   = [bool]$Autostart
-        added       = [pscustomobject]@{ pnp = $false }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($Exe)) {
-        $row | Add-Member -NotePropertyName exe -NotePropertyValue $Exe
-    }
-
-    $replaced = $false
-    for ($i = 0; $i -lt $devices.Count; $i++) {
-        if ($devices[$i].name -eq $Name) {
-            $devices[$i] = $row
-            $replaced = $true
-            break
+    
+        # Validate even port.
+        if ($Listen -match ':(\d+)$') {
+            $p = [int]$Matches[1]
+            if ($p % 2 -ne 0) {
+                throw "fakescan uses even ports (3920, 3922, …); $p is odd — odd ports are fakeprint"
+            }
         }
+    
+        $row = [pscustomobject]@{
+            name        = $Name
+            listen      = $Listen
+            advertise   = $Advertise
+            device_uuid = $DeviceUuid
+            profile     = $Profile
+            autostart   = [bool]$Autostart
+            added       = [pscustomobject]@{ pnp = $false }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Exe)) {
+            $row | Add-Member -NotePropertyName exe -NotePropertyValue $Exe
+        }
+    
+        $replaced = $false
+        for ($i = 0; $i -lt $devices.Count; $i++) {
+            if ($devices[$i].name -eq $Name) {
+                $devices[$i] = $row
+                $replaced = $true
+                break
+            }
+        }
+        if (-not $replaced) { [void]$devices.Add($row) }
+        $reg | Add-Member -NotePropertyName devices -NotePropertyValue $devices.ToArray() -Force
+        Save-FakescanRegistry -Registry $reg
+        [pscustomobject]@{ Action = if ($replaced) { 'updated' } else { 'added' }; Name = $Name; Listen = $Listen }
     }
-    if (-not $replaced) { [void]$devices.Add($row) }
-    $reg | Add-Member -NotePropertyName devices -NotePropertyValue $devices.ToArray() -Force
-    Save-FakescanRegistry -Registry $reg
-    [pscustomobject]@{ Action = if ($replaced) { 'updated' } else { 'added' }; Name = $Name; Listen = $Listen }
 }
 
 function Remove-FakescanDevice {
@@ -2837,18 +3034,21 @@ function Remove-FakescanDevice {
     param(
         [Parameter(Mandatory)][string]$Name
     )
-    $reg = Get-FakescanRegistry
-    $before = @($reg.devices).Count
-    $reg | Add-Member -NotePropertyName devices `
-        -NotePropertyValue @($reg.devices | Where-Object { $_.name -ne $Name }) `
-        -Force
-    if (@($reg.devices).Count -lt $before) {
-        Save-FakescanRegistry -Registry $reg
-        Write-Host "removed: $Name"
-        return $true
+
+    return Invoke-FakescanRegistryLocked -ScriptBlock {
+        $reg = Get-FakescanRegistry
+        $before = @($reg.devices).Count
+        $reg | Add-Member -NotePropertyName devices `
+            -NotePropertyValue @($reg.devices | Where-Object { $_.name -ne $Name }) `
+            -Force
+        if (@($reg.devices).Count -lt $before) {
+            Save-FakescanRegistry -Registry $reg
+            Write-Host "removed: $Name"
+            return $true
+        }
+        Write-Host "not found: $Name"
+        return $false
     }
-    Write-Host "not found: $Name"
-    return $false
 }
 
 function Set-FakescanDeviceAdded {
@@ -2861,24 +3061,39 @@ function Set-FakescanDeviceAdded {
         [string]$Name = 'default',
         [bool]$Pnp = $true
     )
-    $reg = Get-FakescanRegistry
-    $found = $false
-    foreach ($d in @($reg.devices)) {
-        if ($d.name -eq $Name) {
-            if ($null -eq $d.added) {
-                $d | Add-Member -NotePropertyName added -NotePropertyValue ([pscustomobject]@{ pnp = $Pnp })
-            } else {
-                $d.added | Add-Member -NotePropertyName pnp -NotePropertyValue $Pnp -Force
+
+    return Invoke-FakescanRegistryLocked -ScriptBlock {
+        $reg = Get-FakescanRegistry
+        $found = $false
+        foreach ($d in @($reg.devices)) {
+            if ($d.name -eq $Name) {
+                # Keep the install lifecycle in sync (legacy mark-added claims no WIA details).
+                if ($null -eq $d.install) {
+                    $d | Add-Member -NotePropertyName install -NotePropertyValue ([pscustomobject]@{ state = 'new' })
+                }
+                if ($Pnp) {
+                    $d.install | Add-Member -NotePropertyName state -NotePropertyValue 'installed' -Force
+                    $d.install | Add-Member -NotePropertyName note -NotePropertyValue 'legacy mark-added' -Force
+                    $d.install | Add-Member -NotePropertyName installed_at -NotePropertyValue ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Force
+                } else {
+                    $d.install | Add-Member -NotePropertyName state -NotePropertyValue 'stale' -Force
+                    $d.install | Add-Member -NotePropertyName reason -NotePropertyValue 'marked not added' -Force
+                }
+                if ($null -eq $d.added) {
+                    $d | Add-Member -NotePropertyName added -NotePropertyValue ([pscustomobject]@{ pnp = $Pnp })
+                } else {
+                    $d.added | Add-Member -NotePropertyName pnp -NotePropertyValue $Pnp -Force
+                }
+                $found = $true
+                break
             }
-            $found = $true
-            break
         }
+        if (-not $found) {
+            throw "registry row not found: $Name"
+        }
+        Save-FakescanRegistry -Registry $reg
+        [pscustomobject]@{ Name = $Name; Pnp = $Pnp }
     }
-    if (-not $found) {
-        throw "registry row not found: $Name"
-    }
-    Save-FakescanRegistry -Registry $reg
-    [pscustomobject]@{ Name = $Name; Pnp = $Pnp }
 }
 
 # ── Unified ctl endpoint ──────────────────────────────────────────────────────
@@ -2920,120 +3135,158 @@ function Invoke-FakescanCtl {
 
 # ── ensure ────────────────────────────────────────────────────────────────────
 
+function Get-FakescanRowValue {
+    # Strict-mode-safe property read (registry rows omit optional fields).
+    param($Row, [string]$Prop)
+    if ($null -eq $Row) { return $null }
+    $pr = $Row.PSObject.Properties[$Prop]
+    if ($null -eq $pr) { return $null }
+    return $pr.Value
+}
+
+function Get-FakescanEnsurePlan {
+    <#
+    .SYNOPSIS
+      Pure planner for ensure: one process per distinct `listen` in the registry.
+
+    .DESCRIPTION
+      Registry rows are one per emulated device; rows sharing a `listen` belong to ONE
+      `fakescan --manage` process (docs/multi-device.md section 8). Returns one plan object per
+      distinct listen: Listen, Port, Names (every row on that listen), Exe, Args, Skip (reason or $null).
+      With -All only listens that have at least one autostart row are planned; otherwise the
+      listen of row -Name is planned. Starts nothing and touches no network.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Name = 'default',
+        [switch]$All
+    )
+    $reg = Get-FakescanRegistry
+    $rows = @($reg.devices)
+    [object[]]$seedRows = @()
+    if ($All) {
+        $seedRows = @($rows | Where-Object { Get-FakescanRowValue $_ 'autostart' })
+    } else {
+        $seedRows = @($rows | Where-Object { $_.name -eq $Name } | Select-Object -First 1)
+    }
+    $plans = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    foreach ($seed in $seedRows) {
+        if (-not $seed) { continue }
+        $sl = Get-FakescanRowValue $seed 'listen'
+        $listen = if ($sl) { ([string]$sl).Trim() } else { '0.0.0.0:3920' }
+        $key = $listen.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $group = @($rows | Where-Object {
+            $gl = Get-FakescanRowValue $_ 'listen'
+            $l = if ($gl) { ([string]$gl).Trim().ToLowerInvariant() } else { '0.0.0.0:3920' }
+            $l -eq $key
+        })
+        $port = if ($listen -match ':(\d+)$') { [int]$Matches[1] } else { 3920 }
+        $exe = $null; $adv = $null; $profilesDir = $null
+        foreach ($g in $group) {
+            if (-not $exe) { $exe = Get-FakescanRowValue $g 'exe' }
+            if (-not $adv) { $adv = Get-FakescanRowValue $g 'advertise' }
+            if (-not $profilesDir) { $profilesDir = Get-FakescanRowValue $g 'profiles' }
+        }
+        if (-not $profilesDir) {
+            $cand = Join-Path (Split-Path -Parent $PSScriptRoot) 'profiles'
+            if (Test-Path -LiteralPath $cand) { $profilesDir = $cand }
+        }
+        $procArgs = @('--manage', '--listen', $listen)
+        if ($adv) { $procArgs += '--advertise', $adv }
+        if ($profilesDir) { $procArgs += '--profiles', $profilesDir }
+        # Windows default is Hello-only (dasHost owns :3702); --probe-listen unless a row opts out.
+        $wantProbe = $true
+        foreach ($g in $group) {
+            $pl = Get-FakescanRowValue $g 'probe_listen'
+            if ($null -ne $pl -and -not [bool]$pl) { $wantProbe = $false }
+        }
+        if ($wantProbe) { $procArgs += '--probe-listen' }
+        $skip = $null
+        if ([string]::IsNullOrWhiteSpace($exe)) {
+            $skip = "no exe in registry for listen $listen; add with: fakescan.ps1 add -Name <row> -Exe PATH"
+        } elseif (-not (Test-Path -LiteralPath $exe)) {
+            $skip = "exe not found: $exe"
+        }
+        [void]$plans.Add([pscustomobject]@{
+            Listen = $listen
+            Port   = $port
+            Names  = @($group | ForEach-Object { $_.name })
+            Exe    = $exe
+            Args   = $procArgs
+            Skip   = $skip
+        })
+    }
+    return $plans.ToArray()
+}
+
 function Start-FakescanEnsure {
     <#
     .SYNOPSIS
-      Check if a named fakescan instance is running; start it from the registry if not.
+      Make sure the fakescan daemon is running for the registry (one process per distinct listen).
 
     .DESCRIPTION
-      Attach-first: if the instance already answers /health, return its ctl info.
-      Otherwise, read the registry row, validate the exe path, and Start-Process
-      with --lab-name, --listen, --device-uuid, --profile, and optionally --advertise.
-
-      Never kills or restarts a running instance (that would break Windows PnP / WIA).
-      Never touches the fakeprint registry or processes.
-
-      No stdout redirect for the long-running server process.
-
-    .EXAMPLE
-      Start-FakescanEnsure -Name default
-      Start-FakescanEnsure -Name bpl0
+      Attach-first: if /health on a listen already answers, do nothing for that listen. Otherwise
+      start `exe --manage --listen L [--advertise A] --profiles P` once for ALL rows sharing L (the
+      process brings every row up with its stored UUID). Never kills or restarts a running
+      instance (that would break Windows PnP / WIA). Never touches fakeprint.
+      -WhatIf prints the planned command lines and starts nothing.
     #>
     [CmdletBinding()]
     param(
         [string]$Name = 'default',
         [switch]$All,
-        # Passed through to Open-FakescanAddDevice / Invoke-LabAttention when
-        # the process is running but added.pnp is still false.
+        [switch]$WhatIf,
         [switch]$Loud,
         [switch]$Quiet
     )
 
-    $reg = Get-FakescanRegistry
-
-    # Force array: a one-element if/else unwraps under StrictMode and loses .Count.
-    [object[]]$names = @()
-    if ($All) {
-        [object[]]$names = @(@($reg.devices) | Where-Object { $_.autostart } | Select-Object -ExpandProperty name)
-    } else {
-        [object[]]$names = @($Name)
-    }
-
-    if ($names.Count -eq 0) {
-        Write-Host 'ensure: no autostart rows in registry (--all) or name not given'
+    [object[]]$plans = @(Get-FakescanEnsurePlan -Name $Name -All:$All)
+    if ($plans.Count -eq 0) {
+        if ($All) { Write-Host 'ensure: no autostart rows in registry' }
+        else { Write-Warning "ensure: no registry row for $Name" }
         return
     }
 
-    foreach ($n in $names) {
-        [object[]]$rowHits = @(@($reg.devices) | Where-Object { $_.name -eq $n } | Select-Object -First 1)
-        if ($rowHits.Count -eq 0 -or -not $rowHits[0]) {
-            Write-Warning "ensure: no registry row for $n"
-            continue
-        }
-        $row = $rowHits[0]
-
-        $listen = if ($row.listen) { $row.listen } else { '0.0.0.0:3920' }
-        $port = if ($listen -match ':(\d+)$') { [int]$Matches[1] } else { 3920 }
-        $baseUrl = "http://127.0.0.1:$port"
+    foreach ($p in $plans) {
+        $baseUrl = "http://127.0.0.1:$($p.Port)"
+        $label = "listen $($p.Listen) [$($p.Names -join ', ')]"
 
         $health = $null
         try {
             $health = Invoke-WebRequest -Uri "$baseUrl/health" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
         } catch { }
+        $running = ($health -and $health.StatusCode -eq 200 -and $health.Content.Trim() -eq 'ok')
 
-        if ($health -and $health.StatusCode -eq 200 -and $health.Content.Trim() -eq 'ok') {
-            Write-Host "fakescan/$n already running on :$port - attaching"
+        if ($running) {
+            Write-Host "fakescan $label already running - attaching (nothing started)"
+            if ($WhatIf) { continue }
             try {
                 Get-FakescanCtlInfo -BaseUrl $baseUrl | ConvertTo-Json -Depth 4 | Write-Host
             } catch {
-                # Older binaries lack GET /v1/ctl; status is enough to attach.
                 try {
-                    Invoke-RestMethod -Uri "$baseUrl/v1/status" -TimeoutSec 5 |
-                        ConvertTo-Json -Depth 4 | Write-Host
+                    Invoke-RestMethod -Uri "$baseUrl/v1/status" -TimeoutSec 5 | ConvertTo-Json -Depth 4 | Write-Host
                 } catch {
-                    Write-Warning "fakescan/${n}: attached via /health but status/ctl failed: $_"
+                    Write-Warning "fakescan ${label}: attached via /health but status/ctl failed: $_"
                 }
             }
-            Complete-FakescanPnpIfNeeded -Name $n -Loud:$Loud -Quiet:$Quiet
+            foreach ($n in $p.Names) { Complete-FakescanPnpIfNeeded -Name $n -Loud:$Loud -Quiet:$Quiet }
             continue
         }
 
-        $exe = $row.exe
-        if ([string]::IsNullOrWhiteSpace($exe)) {
-            Write-Warning "ensure/${n}: no exe in registry; add with: fakescan.ps1 add -Name $n -Exe PATH"
+        if ($p.Skip) {
+            Write-Warning "ensure/${label}: $($p.Skip)"
             continue
         }
-        if (-not (Test-Path -LiteralPath $exe)) {
-            Write-Warning "ensure/${n}: exe not found: $exe"
+        if ($WhatIf) {
+            Write-Host ("WhatIf: would start fakescan {0}: {1} {2}" -f $label, $p.Exe, ($p.Args -join ' '))
             continue
         }
 
-        $procArgs = @(
-            '--listen', $listen,
-            '--device-uuid', $row.device_uuid,
-            '--lab-name', $n,
-            '--profile', $(if ($row.profile) { $row.profile } else { 'brother-wsd' })
-        )
-        if (-not [string]::IsNullOrWhiteSpace($row.advertise)) {
-            $procArgs += '--advertise', $row.advertise
-        }
-        # Windows default is Hello-only (dasHost owns :3702). Lab rows with a LAN
-        # advertise still benefit from --probe-listen: shared bind sometimes sees
-        # Probes, and prove-associate / FD Installable need Discovery on the wire.
-        # Opt out: registry probe_listen=false or --no-probe-listen via extra_args.
-        $wantProbe = $true
-        if ($null -ne $row.probe_listen) {
-            $wantProbe = [bool]$row.probe_listen
-        }
-        if ($wantProbe) {
-            $procArgs += '--probe-listen'
-        }
-
-        # Start without stdout redirect (long-running server).
-        Write-Host "starting fakescan/$n → $exe $procArgs"
-        Start-Process -FilePath $exe -ArgumentList $procArgs -WindowStyle Hidden
-        Write-Host "fakescan/$n started on :$port"
-
+        Write-Host "starting fakescan $label -> $($p.Exe) $($p.Args -join ' ')"
+        Start-Process -FilePath $p.Exe -ArgumentList $p.Args -WindowStyle Hidden
         $deadline = (Get-Date).AddSeconds(8)
         $up = $false
         while ((Get-Date) -lt $deadline) {
@@ -3044,9 +3297,10 @@ function Start-FakescanEnsure {
             } catch { }
         }
         if ($up) {
-            Complete-FakescanPnpIfNeeded -Name $n -Loud:$Loud -Quiet:$Quiet
+            Write-Host "fakescan $label started"
+            foreach ($n in $p.Names) { Complete-FakescanPnpIfNeeded -Name $n -Loud:$Loud -Quiet:$Quiet }
         } else {
-            Write-Warning "fakescan/${n}: started but /health did not answer in 8s"
+            Write-Warning "fakescan ${label}: started but /health did not answer in 8s"
         }
     }
 }
@@ -3245,6 +3499,8 @@ Export-ModuleMember -Function @(
     'Test-FakescanProcessElevated',
     'Install-FakescanScanner',
     'Remove-FakescanScanner',
+    'Remove-FakescanGhost',
+    'Get-FakescanGhostNodes',
     'Get-FakescanPnpRemoveTargets',
     'Repair-FakescanScanner',
     # Lab instance control (new)
@@ -3256,5 +3512,7 @@ Export-ModuleMember -Function @(
     'Set-FakescanDeviceAdded',
     'Get-FakescanCtlInfo',
     'Invoke-FakescanCtl',
+    'Get-FakescanEnsurePlan',
+    'Invoke-FakescanRegistryLocked',
     'Start-FakescanEnsure'
 )

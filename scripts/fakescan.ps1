@@ -20,12 +20,12 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet(
-        'status', 'health', 'jobs', 'activity', 'log', 'soap', 'discover', 'discoverable', 'wia', 'wia-trace', 'fd', 'aep', 'pair', 'swd',
+        'status', 'health', 'jobs', 'activity', 'tickets', 'log', 'soap', 'discover', 'discoverable', 'wia', 'wia-trace', 'fd', 'aep', 'pair', 'swd',
         'install', 'remove', 'rebind', 'unpair', 'bounce-fd', 'elevated', 'helper', 'e2e', 'add-device',
         'pages', 'feeder', 'scenarios', 'scenario', 'profile', 'reset', 'stop',
         'fault', 'lab',
         # Lab instance control
-        'ensure', 'ctl', 'list', 'add', 'save', 'mark-added',
+        'ensure', 'ctl', 'list', 'add', 'save', 'mark-added', 'daemon',
         'help'
     )]
     [string]$Command = 'help',
@@ -36,6 +36,12 @@ param(
     [string]$Arg1,
 
     [int]$WaitSeconds = 0,
+
+    # tickets: only entries with seq greater than this; -Op ValidateScanTicket|CreateScanJob; -Limit N; -Clear empties the ring
+    [int]$Since = 0,
+    [string]$Op,
+    [int]$Limit = 0,
+    [switch]$Clear,
 
     [switch]$ProbeDiscovery,
 
@@ -78,6 +84,9 @@ param(
     # ensure: start all autostart rows
     [switch]$All,
 
+    # ensure: print the planned command lines (one per distinct listen) and start nothing
+    [switch]$WhatIf,
+
     # Extra args for `lab` (passed to `python -m fakescan.lab`).
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Rest
@@ -97,21 +106,27 @@ Attention flags (for install / ensure / rebind / add-device):
   Default  Banner + [Console]::Beep(1000,300) + BEL char + NotifyIcon balloon.
 
 Lab instance control (new — see docs/lab-instance.md):
-  list                               List %LOCALAPPDATA%\fakescan\devices.json
+  list                               List devices.json rows: id, uuid, profile, install state
+                                     (%LOCALAPPDATA%\fakescan\devices.json or $env:FAKESCAN_REGISTRY)
+  daemon install|uninstall|status    Per-user logon task running `fakescan --manage` (not a service)
   add  [-Name NAME] [-Listen H:PORT] [-Advertise IP] [-DeviceUuid UUID]
        [-Profile ID] [-Exe PATH] [-Autostart]
                                      Add or update a registry row (even ports only)
-  ensure [-Name default] [-All]      Check if running; start from registry if not
+  ensure [-Name default] [-All] [-WhatIf]
+                                     Attach-first; else start ONE `fakescan --manage` per distinct
+                                     listen (all rows on that listen). -WhatIf prints the plan only
                                      Attach-first: never kills a running instance
   ctl  <cmd> [argsJson]              POST /v1/ctl {cmd, args}  e.g. ctl pages '{"count":3}'
   save [-Name NAME]                  POST /v1/ctl save (write running state to registry)
-  mark-added [-Name default]         Mark registry row added.pnp=true
+  mark-added [-Name default]         Legacy: install state installed (note 'legacy mark-added', no WIA details)
 
 Control plane:
   status [-BaseUrl URL]              GET /v1/status
   jobs [-BaseUrl URL]                GET /v1/jobs (Pending / Processing / Completed)
   activity [-BaseUrl URL]            GET /v1/activity (recent WSD, job, and control calls)
   log [-BaseUrl URL]                 GET /v1/log (the same activity as plain text)
+  tickets [-Since SEQ] [-Op ValidateScanTicket|CreateScanJob] [-Limit N] [-Clear]
+                                     GET /v1/tickets (scan tickets the driver offered, in order)
   health [-BaseUrl URL]              GET /health
   soap [-BaseUrl URL]                GetScannerElements smoke test
   discover                           WS-Discovery Probe (UDP 3702)
@@ -179,12 +194,20 @@ switch ($Command) {
 
     'list' {
         $reg = Get-FakescanRegistry
-        Write-Host ("Registry: {0}" -f $script:RegistryPath)
+        Write-Host ("Registry: {0}" -f $(if ($env:FAKESCAN_REGISTRY) { $env:FAKESCAN_REGISTRY } else { Join-Path $env:LOCALAPPDATA 'fakescan\devices.json' }))
         $devs = @($reg.devices)
         if ($devs.Count -eq 0) {
             Write-Host '  (no devices)'
         } else {
-            $devs | Format-Table name, listen, device_uuid, profile, autostart, added -AutoSize
+            $devs | Select-Object `
+                @{ n = 'id';      e = { $_.name } },
+                @{ n = 'uuid';    e = { $_.device_uuid } },
+                profile, listen,
+                @{ n = 'install'; e = {
+                    if ($_.install -and $_.install.state) { $_.install.state }
+                    elseif ($_.added -and $_.added.pnp) { 'installed' } else { 'new' } } },
+                @{ n = 'reason';  e = { if ($_.install) { $_.install.reason } } },
+                autostart | Format-Table -AutoSize
         }
     }
 
@@ -201,9 +224,9 @@ switch ($Command) {
 
     'ensure' {
         if ($All) {
-            Start-FakescanEnsure -All -Loud:$Loud -Quiet:$Quiet
+            Start-FakescanEnsure -All -WhatIf:$WhatIf -Loud:$Loud -Quiet:$Quiet
         } else {
-            Start-FakescanEnsure -Name $Name -Loud:$Loud -Quiet:$Quiet
+            Start-FakescanEnsure -Name $Name -WhatIf:$WhatIf -Loud:$Loud -Quiet:$Quiet
         }
     }
 
@@ -229,6 +252,28 @@ switch ($Command) {
         Invoke-FakescanCtl -Cmd save -BaseUrl $BaseUrl | ConvertTo-Json -Depth 6
     }
 
+    'daemon' {
+        # fakescan.ps1 daemon install|uninstall|status [-Exe PATH] [-Listen H:P] [-Advertise IP]
+        $sub = $Arg1
+        if ($sub -notin 'install', 'uninstall', 'status') { throw 'usage: daemon install|uninstall|status' }
+        $exeRes = $Exe
+        if ([string]::IsNullOrWhiteSpace($exeRes)) {
+            $row = @((Get-FakescanRegistry).devices) | Where-Object { $_.exe } | Select-Object -First 1
+            if ($row) { $exeRes = $row.exe }
+        }
+        if ([string]::IsNullOrWhiteSpace($exeRes)) {
+            $cmd = Get-Command fakescan.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $exeRes = $cmd.Source }
+        }
+        if ([string]::IsNullOrWhiteSpace($exeRes) -or -not (Test-Path -LiteralPath $exeRes)) {
+            throw 'fakescan.exe not found; pass -Exe PATH'
+        }
+        $dargs = @()
+        if (-not [string]::IsNullOrWhiteSpace($Listen))    { $dargs += '--listen', $Listen }
+        if (-not [string]::IsNullOrWhiteSpace($Advertise)) { $dargs += '--advertise', $Advertise }
+        & $exeRes @dargs daemon $sub
+    }
+
     'mark-added' {
         Set-FakescanDeviceAdded -Name $Name | Format-List
     }
@@ -251,6 +296,22 @@ switch ($Command) {
         Write-Host "seq=$($view.seq)"
         @($view.events) | ForEach-Object {
             Write-Host ("{0} {1} {2} {3} {4}ms {5}" -f $_.seq, $_.kind, $_.action, $_.outcome, $_.ms, $_.detail)
+        }
+    }
+    'tickets' {
+        if ($Clear) {
+            Invoke-RestMethod -Method Delete -Uri ($BaseUrl.TrimEnd('/') + '/v1/tickets') -TimeoutSec 5 | Out-Null
+            Write-Host 'tickets cleared'
+            return
+        }
+        $q = @("since=$Since")
+        if ($Op) { $q += "op=$Op" }
+        if ($Limit -gt 0) { $q += "limit=$Limit" }
+        $view = Invoke-RestMethod -Uri ($BaseUrl.TrimEnd('/') + '/v1/tickets?' + ($q -join '&')) -TimeoutSec 5
+        Write-Host "count=$($view.count) next_seq=$($view.next_seq)"
+        @($view.tickets) | ForEach-Object {
+            $p = $_.parsed
+            Write-Host ("{0} {1} {2} {3} {4} fmt={5} color={6} dpi={7}x{8} n={9}" -f $_.seq, $_.ts, $_.device_id, $_.operation, $_.outcome, $p.format, $p.color_processing, $p.resolution_x, $p.resolution_y, $p.images_to_transfer)
         }
     }
     'log' {
