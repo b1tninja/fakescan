@@ -61,7 +61,7 @@ Full table: [e2e-wia-status.md](../e2e-wia-status.md). **Do not reopen MIME A/B*
 
 | Item | Why live-only |
 |------|----------------|
-| Gray `CreateScanJob` → Pending, no RetrieveImage | **Code:** JFIF FinalParams + ValidScanTicket ColorProcessing coerced to RGB24; ImageInformation BPL = width×3 (flow-tested). **Live re-proof** still open (do not restart `:3920` casually) |
+| Gray `CreateScanJob` → Pending, no RetrieveImage | **Fixed, live-proven 2026-10-12:** the old RGB24 coercion of a gray JFIF ticket was the cause. Default now answers consistent gray (FinalParams/ValidScanTicket Grayscale8, BPL = width, 1-component JPEG); legacy coercion is opt-in `jfif_gray=rgb24`. |
 | Sticky offline after fakescan restart | PnP / AEP; no SOAP reaches packager |
 | Associate without person Add | FD + elevation; not RetrieveImage |
 

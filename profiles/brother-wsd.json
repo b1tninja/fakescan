@@ -7,7 +7,7 @@
     "sticky_ready": false,
     "pages_min": 0,
     "pages_max": 30,
-    "duplex": true
+    "duplex": false
   },
   "dpi": [100, 200, 300],
   "formats": ["jfif", "tiff-single-uncompressed"],

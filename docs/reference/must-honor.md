@@ -50,4 +50,4 @@ On CreateScanJobResponse, FinalParameters may differ from the ticket ([DocumentF
 
 Elements that may carry those attributes (Learn): Brightness, ColorProcessing, CompressionQualityFactor, ContentType, Contrast, FilmScanMode, **Format**, Height, ImagesToTransfer, InputSource, Rotation, ScalingHeight, ScalingWidth, ScanRegion*, Sharpness, Width.
 
-fakescan emits FinalParameters with Override on substituted Format/Resolution (and ColorProcessing when JFIF coerces RGB24), and UsedDefault when Format/Resolution were omitted — see [coverage.md](../coverage.md).
+fakescan emits FinalParameters with Override on substituted Format/Resolution (and ColorProcessing only under the legacy `jfif_gray=rgb24` coercion or for non-gray JFIF tickets coerced to RGB24), and UsedDefault when Format/Resolution were omitted — see [coverage.md](../coverage.md).

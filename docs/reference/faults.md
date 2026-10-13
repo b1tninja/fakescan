@@ -33,6 +33,8 @@ fakescan: `soap::fault_with_code` + HTTP 500.
 | `ClientErrorDocumentFormatNotSupported` | Format element remarks (WIA fallback) | **yes** (inbound alias only; outbound is XSD FormatNotSupported) |
 | `ClientErrorMediaJam` | Lab / status `MediaJam` | **yes** |
 | `ClientErrorMultipleFeed` | Lab / status `MultipleFeedError` | **yes** |
+| `ClientErrorCoverOpen` | Lab / status `CoverOpen` (no cover/door value exists in the XSD enum; same family as MediaJam). Pre-flight (`cover_open`), `cover_open_after_n`, fault plan `cover_open` | **yes** |
+| `ClientErrorInterlockOpen` | Lab / status `InterlockOpen` | **yes** |
 | `wsa:ActionNotSupported` | Common codes | via “action not implemented” |
 | `wprt:ServerErrorTemporaryError` | Common codes (print NS typo in Learn) | no |
 

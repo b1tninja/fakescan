@@ -38,7 +38,7 @@ fakescan.exe --listen 0.0.0.0:3920 --advertise 192.168.1.70 \
 | `pdfcraft-cli scan devices` | **fail / hang** | Opens **every** WIA device; offline Brother USB (`0x80210005` / hang) aborts before fakescan. |
 | WIA Connect Fake (live) | **pass** (2026-10-12, re-Add after ghost-aep clear) | COM Connect OK ~20ms; SOAP ValidateScanTicket ×3. Item `Scan` **props=32**, bed 2550×3510 @300 (empty-item gate cleared). |
 | Glass acquire (live) | **pass @ accept** (2026-10-12 optical) | Gate was **full-letter SOF/ImageInformation** (1700×2340 @200). Brother deliverable is **1648×2289 @200** / **2480×3440 @300**. With `job_page_pixels` = optical crop: WIA `Transfer()` OK (~11MB BMP @200 / ~25MB @300), **no CancelJob**. Loopback of `D:\temp\wia-variants` BMPs (re-encoded to optical JFIF) and live Brother wire JPEG all accept. |
-| pdfcraft glass acquire | **pass** (2026-10-12 night, RGB) | `pdfcraft-cli scan --source glass --dpi 200 --color rgb --format jpeg\|bmp` → CreateScanJob → RetrieveImage → file (JPEG loopback 316180 B / BMP 1648×2289). pdfcraft skips `TYMED_CALLBACK` on WSD ports (`com.rs`). **`--color gray`:** Create FinalParams/ValidScanTicket now coerce JFIF ColorProcessing→RGB24 + BPL×3 (flow-tested); **live re-proof** still open (leave `:3920` alone). |
+| pdfcraft glass acquire | **pass** (2026-10-12 night, RGB) | `pdfcraft-cli scan --source glass --dpi 200 --color rgb --format jpeg\|bmp` → CreateScanJob → RetrieveImage → file (JPEG loopback 316180 B / BMP 1648×2289). pdfcraft skips `TYMED_CALLBACK` on WSD ports (`com.rs`). **`--color gray`:** **pass** (2026-10-12, live proof, see "Gray live proof" below). |
 | Progress / slow fill | **pass** (bps throttle) | `POST /v1/slow` `{ "bps": 32000 }` paces MTOM with `Content-Length` (~10 s vs ~130 ms). WIA STATUS callbacks climb (`PDFCRAFT_SCAN_STATUS_LOG=1`). `ms` alone = pre-retrieve sleep only. See [lab-harness.md](lab-harness.md). |
 | Wire `dib` / raw BMP | **pass (WIA + SOAP)** | MS: `ClientErrorDocumentFormatNotSupported` → driver retries PNG…→uncompressed TIFF. Profile `wia-lossless` (no jfif) + that fault → WIA tickets `dib`, RetrieveImage 11 MB BM @200; pdfcraft `--format bmp` OK. SOAP: `fakescan-lab acquire-dib`. See [formats.md](formats.md). |
 | `Remove-FakescanScanner` | **pass** (elevated) | Non-elevated: Access denied. Elevated pnputil cleared Image + parent. Brother untouched. |
@@ -51,6 +51,19 @@ fakescan.exe --listen 0.0.0.0:3920 --advertise 192.168.1.70 \
 - SOAP acquire path (airscan / integration tests)
 - Discovery Hello + Bye on shutdown
 - Scripts: `discoverable`, `fd`, `aep`, `swd`, `e2e`, `remove`, `install` assist
+
+## Gray live proof (2026-10-12, Windows 11)
+
+Closes the open item "gray Create live re-proof". pdfcraft `--color gray`, feeder, 2 sheets, 100 dpi through the real WIA stack, switching the `jfif_gray` effect live (`POST /v1/effects`) on one daemon build:
+
+| `jfif_gray` | Result |
+|-------------|--------|
+| `rgb24` (old coercion: FinalParams RGB24, BPL width×3, 3-component JPEG) | **fail**: "The feeder has no paper"; daemon sees CreateScanJob, one more GetScannerElements, no RetrieveImage |
+| `gray8` | **pass**: 2 pages, 8-bpp BMP 816x1144, RetrieveImage ×2 |
+| `gray8_rgb_stride` | **pass**: 8 bpp, ×2 |
+| `gray8_tiff` | **fail**, like `rgb24` |
+
+Root cause: Create answered a Grayscale8 ticket with ColorProcessing RGB24 (Override); wsdscdrv rejects the mismatch and gives up. Fix: `gray8` is now the default (Grayscale8, BytesPerLine = width, genuine 1-component JPEG); `rgb24` stays as an opt-in legacy mode. Published capabilities unchanged. Details: [defects.md](defects.md).
 
 ## Live Connect SOAP (2026-10-12)
 

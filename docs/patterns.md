@@ -60,6 +60,37 @@ curl -X POST http://127.0.0.1:3920/v1/pattern \
 | `align` | Alignment / registration crosses — centre accent crosshair, corner registration crosses with open-square surrounds, mid-edge marks, and tick marks at regular intervals along all four edges |
 | `grid` | Margin frames + scale rules — inner 0.5-inch margin frame, light inch-grid, and ruler ticks (inch + quarter-inch) along all four edges; page is letter (8.5 × 11 in) so tick spacing scales with DPI |
 | `lines` | Resolution line ladder — six coarse-to-fine horizontal line groups (left half) and the same six frequencies as vertical lines (right half); half-periods 32, 16, 8, 4, 3, 2 px so effective lpi scales with DPI |
+| `diag` | **Self-describing diagnostic page** for blind analysis of image-handling mistakes (flip / mirror / rotate / invert / BGR / bit order / stride shear / scale / crop / threshold); laid out in millimetres — see "diag layout" below |
+
+## diag layout
+
+`diag` is a byte-order-mark for pixels: any plausible handling mistake leaves a signature a blind
+analyzer can read from the image alone (analyzer: `pdfcraft_fakescan.pattern_analyzer`, see
+pdfcraft-fakescan `docs/pattern-analyzer.md`). The layout is in **millimetres, top-left anchored**
+(`px = round(mm * dpi / 25.4)`, dpi is capped to 150 when the 4 MP limit applies, i.e. a 300 dpi
+request renders a 150 dpi page). Layout box 206 x 288 mm; constants live in `image_gen::diag`.
+Everything is deterministic: the same page index gives identical bytes (the page index only changes the QR).
+Nothing the device publishes (ScannerConfiguration, formats, dpi, colours) is affected.
+
+| Feature | Position (mm) | Answers |
+|---------|---------------|---------|
+| Banner (tester banner, stamped as usual) | y 0-12 | - |
+| Corner fiducials: comb with 1 / 2 / 3 / 4 teeth at TL / TR / BL / BR, 16 mm, spine on the left | (4,14) (186,14) (4,268) (186,268) | rotation 0/90/180/270, mirror-x, flip-y (distinct under all 8 symmetries) |
+| Barker-13 x3, chip 4 mm, horizontal (8 mm tall) and vertical (8 mm wide) | h (24,14); v (4,34) | shift/crop (peak position), scale (peak spacing 52 mm), polarity (peak sign), mirror (reversed template) |
+| m-sequence 63 (h: x^6+x+1, v: x^6+x^5+x^2+x+1), chip 2.5 mm | h (24,24); v (13,34) | same as above, more robust to blur/JPEG |
+| Polarity wedge: 1 mm black outline, black ref 13 mm, 16 gray steps (17*k) x 7 mm, paper-white ref 13 mm | (26,34)-(166,50) | polarity, gamma/threshold, bit depth |
+| Colour patches R,G,B,C,M,Y 20x12 mm | (26,52) | RGB<->BGR (R<->B swap), colour loss |
+| Bit-order comb: motif 0xD0 (ink at pixels 0,1,3 of every byte), 8 rows, byte-aligned start, length 8n+5 px | y 67 | reversed bit order in packed bytes (pixel-exact: lost by scaling) |
+| 1-px vertical bars, Golomb-ruler positions x 4 px (+ 1-px border at the page edge) | (26,76)-(96) | stride/shear px per row (pixel-exact) |
+| Raw bit strip: 128 x 1 mm chips (Barker-13 preamble + xorshift32 PRBS seed 0xD1A60001, MSB) | (26,98) | raw bit error rate, no ECC |
+| 2-D position array: 36 x 36 cells of 2 mm, every 4x4 window unique (xorshift32 seed 0xA55A1234, DFS) | (26,108) | absolute position, crop, scale, rotation, flip |
+| Zone plate: 40 mm square, f(r)=1.2*r/20 cycles/mm | centre (128,128) | resampling, aliasing/moire, x/y scale |
+| QR (payload contract unchanged; bottom-right corner anchored at) | (184,264), ~44-52 mm | page identity; ECC hides small corruption, hence the raw strip |
+
+Features are >= 3 px at 100 dpi except the deliberately pixel-exact ones (comb, 1-px bars, border), which
+are 1 px by design and do not survive resampling; use the Barker / m-sequence strips, position array and
+zone plate for scale. At 100 dpi a 1-bit threshold keeps fiducials, wedge ends, strips, position array
+and QR; mid-gray wedge steps collapse and the zone plate becomes a binary chirp.
 
 ## testpage composition
 

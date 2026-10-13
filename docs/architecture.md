@@ -53,7 +53,8 @@
 | `GET` | `/v1/scenarios` | ordered tester progression |
 | `POST` | `/v1/scenario` | `{ "id":"order" }` — apply one progression step |
 | `POST` | `/v1/slow` | `{ "ms" }` pre-RetrieveImage sleep; optional `{ "bps" }` throttles MTOM TCP send (bytes/sec, Content-Length kept) for mid-page progress labs |
-| `POST` | `/v1/fault` | jam / cover_open / multi_feed / lamp_error / busy / temporary / internal / offline / ms / `*_after_n` / abort_retrieve* / `lamp_warmup_ms` — see [lab-harness.md](lab-harness.md) |
+| `POST` | `/v1/fault` | jam / cover_open / multi_feed / lamp_error / busy / temporary / internal / offline / ms / `*_after_n` / abort_retrieve* / `cover_open_after_n` / `lamp_warmup_ms` — see [lab-harness.md](lab-harness.md) |
+| `GET` `POST` `DELETE` | `/v1/faults/plan` | scheduled faults (between pages / mid page / timed / now) — see [defects.md](defects.md#fault-plan-interrupt-a-scan-mid-scan-or-between-pages) |
 | `GET`/`POST`/`DELETE` | `/v1/loopback` | hard page store (upload JFIF → exact RetrieveImage echo) |
 | `POST` | `/v1/reset` | clear jobs, effects, pattern, loopback, feeder defaults |
 
@@ -76,6 +77,8 @@ Protocol layering and authoritative links: **[specs/](specs/README.md)** (WS-Sca
 | Windows Add → WIA Connect → acquire | person Add + Connect **live**; RetrieveImage accept gap — [e2e-wia-status.md](e2e-wia-status.md) |
 
 Reference prior art: [bobi/WsdScanService](https://github.com/bobi/WsdScanService) (CoreWCF). This service stays a thin Rust SOAP layer. GetScannerElements is driven by the active profile.
+
+WSD SOAP is parsed and built through one `wsd::xml::Element` tree (`parse` / `to_xml`); dispatch uses `soap::Request` once per POST, and schema validation walks the same tree.
 
 Published capabilities come from the active JSON profile (dpi lists, formats, page sizes, presence/absence of optical dpi).
 
@@ -104,3 +107,17 @@ so Auto→glass fallback and empty-feeder races can be tested without hardware.
 - Print / fax / copy simulation — use sibling **[fakeprint](../../fakeprint)** (WSD Print first).
 - Evading security software or spoofing a vendor’s signed driver.
 - Shipping vendor firmware or copyrighted UI strings.
+
+## Multi-device and the device manager
+
+One process hosts N emulated scanners. `manager.rs` (`DeviceManager`) owns the live device set: each
+device is its own `World`, prebuilt control/WSD router and WS-Discovery announcer, and can be added or
+removed at runtime (`POST /v1/devices`, `DELETE /v1/devices/{id}`) without a restart. HTTP routing is
+dynamic: `server::dispatch` resolves `/d/{id}/...` per request (404 JSON if absent) and sends the legacy
+`/v1/*`, `/ScannerService`, `/WebServices/Device` paths to the default (first) device, which keeps the
+legacy WSD endpoints and XAddr. See `multi-device.md` for the contract.
+
+The manager also owns install tracking: `registry.rs` (`RegistryStore`, atomic locked writes, one row per
+device with `install` state and two fingerprints) backs `mark_probed` / `mark_installed` / `reconfigure` /
+`reconcile_with_windows`. Daemon runs (`--manage`, `--lab-name`) attach `devices.json` (or `$FAKESCAN_REGISTRY`);
+embedded servers keep the same state in memory only. See `lab-instance.md` for the row format and states.

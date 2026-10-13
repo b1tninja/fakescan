@@ -12,7 +12,7 @@ Update this when closing a reference item; keep [roadmap.md](roadmap.md) for pro
 | ValidateScanTicket | **done** | ImageInformation + ValidTicket; format miss soft-accepted (lab, inbox fallback); ValidScanTicket rewrite when ValidTicket=false; ConflictingRequiredParameters → SOAP fault |
 | CreateScanJob (client-pull) | **done** | JobId/Token, ImageInformation, DocumentFinalParameters |
 | CreateScanJob (device-push) | **done** | Validates ScanIdentifier + DestinationToken; consumes one-shot id |
-| RetrieveImage + MTOM | **done** | WIA JPEG/dib Transfer OK (XOP `2004/08`, Brother optical crop); mid-MTOM abort + `retrieve_bps` throttle; accept-gate cleared 2026-10-12 ([e2e-wia-status.md](e2e-wia-status.md)). Packaging + SOF↔ImageInformation locked by unit tests (`build_mtom`, airscan flow). Gray+JFIF FinalParams RGB24 + BPL×3 **code-locked** (flow tests); live gray re-proof + sticky offline remain live-only ([mtom-retrieveimage.md](specs/mtom-retrieveimage.md)) |
+| RetrieveImage + MTOM | **done** | WIA JPEG/dib Transfer OK (XOP `2004/08`, Brother optical crop); mid-MTOM abort + `retrieve_bps` throttle; accept-gate cleared 2026-10-12 ([e2e-wia-status.md](e2e-wia-status.md)). Packaging + SOF↔ImageInformation locked by unit tests (`build_mtom`, airscan flow). Gray+JFIF answers consistent gray (FinalParams/ValidScanTicket Grayscale8, BPL = width, 1-component JPEG; **live-proven 2026-10-12**, legacy RGB24 coercion opt-in `jfif_gray=rgb24`, see [defects.md](defects.md)); sticky offline remain live-only ([mtom-retrieveimage.md](specs/mtom-retrieveimage.md)) |
 | CancelJob | **done** | |
 | GetActiveJobs | **done** | JobSummary: StateReasons + ScansCompleted |
 | GetJobElements | **done** | JobStatus (Reasons, ScansCompleted, Images*); Documents/DocumentFinalParameters (Format, dpi, pages_left) |
@@ -29,9 +29,9 @@ Update this when closing a reference item; keep [roadmap.md](roadmap.md) for pro
 | Encode jfif / dib / png / tiff-* / jpeg2k / pdf-a / xps | **done** | See formats.md; jbig **n/a** |
 | CreateScanJob format fault → WIA fallback | **done** | Documented + proven (`wia-lossless`) |
 | Emit `ClientErrorFormatNotSupported` (XSD name) | **done** | XSD outbound; Document* + "format … not in profile" still matched inbound |
-| BytesPerLine=0 for compressed (MS rule) | **done** | Default Brother JFIF `width×3`; profile `bytes_per_line_ms=true` → MS 0 for compressed (both intentional) |
+| BytesPerLine=0 for compressed (MS rule) | **done** | Default Brother JFIF `width×3` (RGB; gray JFIF = `width`); profile `bytes_per_line_ms=true` → MS 0 for compressed (both intentional) |
 | Multi-page Format one-shot Retrieve | **done** | tiff-multi / pdf-a / xps |
-| FinalParameters Override/UsedDefault | **done** | Format/Resolution Override on MustHonor=false substitute; UsedDefault when omitted; ColorProcessing Override when JFIF coerces RGB24; other UsedDefaults unchanged |
+| FinalParameters Override/UsedDefault | **done** | Format/Resolution Override on MustHonor=false substitute; UsedDefault when omitted; ColorProcessing Override only when JFIF coerces a non-gray/BW ticket to RGB24 (gray stays Grayscale8); other UsedDefaults unchanged |
 
 ## MustHonor ([reference/must-honor.md](reference/must-honor.md))
 
@@ -155,9 +155,9 @@ Honest snapshot of `FaultBody` / `scanner_state_reasons` / `job_state` / ActiveC
 
 ## Highest-value gaps (roadmap input)
 
-Matrix and ops coverage rows are **done** or intentional **n/a**. Live-only leftovers (gray Create live re-proof, sticky offline after restart, Associate without person Add) stay in [e2e-wia-status.md](e2e-wia-status.md) / [windows-client.md](specs/windows-client.md), not schema gaps.
+Matrix and ops coverage rows are **done** or intentional **n/a**. Live-only leftovers (sticky offline after restart, Associate without person Add) stay in [e2e-wia-status.md](e2e-wia-status.md) / [windows-client.md](specs/windows-client.md), not schema gaps.
 
-Done this round: Subscribe → **done**; gray+JFIF FinalParams/ValidScanTicket RGB24 coerce + Validate BPL×3 flow test; Hosted Get = Device Get (same dispatcher); `scan_schema` lab allowances; RetrieveImage+MTOM; job-reason + Condition fanout.
+Done this round: Subscribe → **done**; gray+JFIF consistent gray FinalParams/ValidScanTicket + Validate BPL=width flow tests (the earlier RGB24 coercion was live-rejected; now opt-in `jfif_gray=rgb24`); Hosted Get = Device Get (same dispatcher); `scan_schema` lab allowances; RetrieveImage+MTOM; job-reason + Condition fanout.
 
 ## How to extend this map
 

@@ -1,0 +1,43 @@
+{
+  "id": "feeder-a4only",
+  "label": "Fake WSD scanner (ADF tray 20, A4 only)",
+  "connection": "wsd",
+  "optical": null,
+  "feeder": {
+    "sticky_ready": false,
+    "pages_min": 0,
+    "pages_max": 20,
+    "duplex": false,
+    "capacity": 20,
+    "media_sizes": [
+      "a4"
+    ]
+  },
+  "dpi": [
+    100,
+    200,
+    300
+  ],
+  "formats": [
+    "jfif",
+    "tiff-single-uncompressed"
+  ],
+  "jpeg_com": true,
+  "page_sizes": [
+    "letter",
+    "a4",
+    "legal",
+    "photo",
+    "business_card"
+  ],
+  "sources": [
+    "feeder",
+    "glass"
+  ],
+  "colors": [
+    "RGB24",
+    "Grayscale8",
+    "BlackAndWhite1"
+  ],
+  "refuse_unknown": true
+}

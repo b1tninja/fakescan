@@ -5,7 +5,7 @@ The WIA / pdfcraft scan harness lives **in fakescan**, not in pdfcraft. Print la
 | Layer | Where | Role |
 |-------|--------|------|
 | Server | Rust `fakescan` binary | WSD + control plane + hard loopback store |
-| Harness | `python/` package (`pip install -e ./python`) | Arm `/v1/*`, SOAP acquire, digest/byte expect |
+| Harness | `fakescan-python` package (sibling repo) (`pip install -e ../fakescan-python`) | Arm `/v1/*`, SOAP acquire, digest/byte expect |
 | Windows install | `scripts/Fakescan.psm1` | Discovery, Add device, helper/elevated Imaging remove, rebind (person required; SOAP matrix unelevated) |
 | App under test | pdfcraft-cli (optional) | Real WIA path — **not** a fakescan dependency |
 
@@ -27,7 +27,7 @@ Modes are mutually exclusive: `POST /v1/loopback` clears pattern/side/scenario; 
 cargo run -p fakescan -- --profiles profiles --profile brother-wsd
 
 # terminal 2
-pip install -e "./python[dev]"
+pip install -e "../fakescan-python[dev]"
 # any local JFIGs — CLI resets before arming
 fakescan-lab loopback-soap python/fixtures/a.jpg python/fixtures/b.jpg
 # or via PowerShell CLI:
@@ -60,6 +60,25 @@ Read-only views of the same process. These routes are in this tree and show up a
 
 `POST /v1/ctl` accepts cmds `jobs` and `activity` (`activity` args `after` optional).
 
+
+### Scan-ticket log
+
+Every ScanService request that carries a ticket (`ValidateScanTicket`, `CreateScanJob`) is kept in a per-device in-memory ring (200 entries, oldest dropped), recorded after the handler decides. Windows offers ~5 Validates per Create; this shows the sequence, which the single `%TEMP%\fakescan-last-create-body.xml` dump (still written, unchanged) cannot.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/v1/tickets` | `?since=SEQ&op=ValidateScanTicket\|CreateScanJob&limit=N`, all optional. `{count, next_seq, tickets:[{seq, ts, device_id, operation, outcome, reason?, parsed, final_params?, body}]}`, oldest first. Pass `next_seq` as `since` to poll. Per device: `/d/{id}/v1/tickets`. |
+| `DELETE` | `/v1/tickets` | Empties the ring. `POST /v1/reset` empties it too. `seq` keeps counting. |
+
+`outcome`: Validate is `valid` (also a soft-accepted format miss), `invalid` (answered `ValidTicket=false` with a corrected ticket), or `fault:<subcode>` (e.g. `jfif_bw=reject`: `fault:wscn:ClientErrorFormatNotSupported`). Create is `accepted` or `refused:<subcode>` (jfif_bw reject, busy, empty-feeder Brother refusal, ticket validation failure, offline). `reason` is the internal refusal text. `parsed` holds only the ticket fields present: `input_source, format, color_processing, resolution_x, resolution_y, images_to_transfer, content_type, compression_quality, width, height` (InputMediaSize), `scan_region_width, scan_region_height`. `final_params` is what the response carried: `{color_processing, bits, bytes_per_line, format}` (an `invalid` Validate carries the corrected `{format, resolution}`). `body` is the request XML, capped at 32 KB.
+
+`POST /v1/ctl` cmd `tickets` takes args `since`, `op`, `limit`, and `clear: true` (empty after reading).
+
+```powershell
+.\scripts\fakescan.ps1 tickets
+.\scripts\fakescan.ps1 tickets -Op CreateScanJob -Since 12
+.\scripts\fakescan.ps1 tickets -Clear
+```
 ```powershell
 .\scripts\fakescan.ps1 jobs
 .\scripts\fakescan.ps1 activity
@@ -91,7 +110,7 @@ SOAP-only (CI, no WIA): `from fakescan.soap import acquire_jfif_pages` or `fakes
 
 ### Faults (jam / cover / empty / offline)
 
-The SOAP column is what `pytest python/tests/test_live_faults.py -m live` checks. The pdfcraft / WIA column is what that app is written to show; a live Imaging pass is still open ([test-matrix.md](test-matrix.md) rows 10, 10b, and 10c).
+The SOAP column is what `pytest ../fakescan-python/tests/test_live_faults.py -m live` checks. The pdfcraft / WIA column is what that app is written to show; a live Imaging pass is still open ([test-matrix.md](test-matrix.md) rows 10, 10b, and 10c).
 
 | Knob | SOAP | pdfcraft / WIA (app expect) |
 |------|------|------------------------------|
@@ -103,6 +122,7 @@ The SOAP column is what `pytest python/tests/test_live_faults.py -m live` checks
 | `internal` | Create/Retrieve/Subscribe refuse `wscn:ServerErrorInternalError` | permanent internal failure (WIA mapping varies) |
 | `offline` | Status `AttentionRequired` + Subscribe/Create/Retrieve refuse `ServerErrorNotAcceptingJobs` | Connect / acquire → offline-style sentence (often `0x80210005`) |
 | `jam_after_n=N` | N pages OK, then RetrieveImage SOAP subcode `wscn:ClientErrorMediaJam` | acquire fails: “The scanner has a paper jam.” (pages already streamed stay in progress) |
+| `cover_open_after_n=N` / `inject_fault("cover_open", ...)` | N pages OK, then RetrieveImage `wscn:ClientErrorCoverOpen` + sticky `CoverOpen`; `mid_page(P, fraction=F)` cuts page P's stream instead | acquire fails: cover sentence (`A cover on the scanner is open.` or the interrupted fallback that names an open cover); a cut page is not kept |
 | `multi_feed_after_n=N` | N pages OK, then RetrieveImage `wscn:ClientErrorMultipleFeed` + sticky `multi_feed` | mid-job double-feed sentence (pages already streamed stay in progress) |
 | `offline_after_n=N` | N pages OK, then RetrieveImage `ServerErrorNotAcceptingJobs` and sticky `offline` | mid-scan drop → “stopped… stayed online” / offline; later Connect stays offline until `reset` |
 | `empty_mid_job=N` | N pages OK, then SOAP subcode `wscn:ClientErrorNoImagesAvailable` | feeder empty / short stack |
@@ -132,7 +152,7 @@ Live: throttled Transfer ~10 s vs ~130 ms unthrottled; `IWiaTransfer` STATUS fir
 ```bash
 fakescan-lab fault --jam-after-n 2
 # live SOAP (no WIA):
-pytest python/tests/test_live_faults.py -m live
+pytest ../fakescan-python/tests/test_live_faults.py -m live
 ```
 
 ## Raw BMP / lossless (no JFIF)
@@ -157,6 +177,8 @@ fakescan-lab --base-url http://127.0.0.1:3920 acquire-dib --out D:/temp/platen-d
 Python: `from fakescan.soap import acquire_dib_platen`.
 
 ## Optional pdfcraft (WIA)
+
+Full parametrized WIA E2E matrix (expect/detect outcomes, fault arms): [pdfcraft-e2e.md](pdfcraft-e2e.md) — `pytest -m pdfcraft_wia` from `python/`.
 
 Needs Fake listed in Imaging / `pdfcraft-cli scan devices`. WIA usually **re-encodes** JPEG, so compare defaults to `auto` (exact, else Pillow pixels). Use `loopback-soap` for hard byte identity.
 

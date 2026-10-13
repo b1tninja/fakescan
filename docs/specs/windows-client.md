@@ -100,7 +100,7 @@ After **fakescan restart**, Windows may keep the Imaging node (`Status=OK IsPres
 | Expires format | **done** — PT / `P1D` / `P1DT…` / UTC `Z`/`+00:00` (flow-tested) |
 | Hosted-service GetMetadata | **done** — same WS-Transfer Get dispatcher on `/ScannerService` and `/WebServices/Device` (Device MEX). Windows lab only polls Device today |
 | Transport “online” bit | **open (live)** — PnP + Device Get OK yet WIA never opens Scan after restart; association / WSDScan outside fakescan ([e2e-wia-status.md](../e2e-wia-status.md)) |
-| Gray Create → no Retrieve | **code-locked** — JFIF FinalParams ColorProcessing → RGB24 + BPL width×3; live re-proof still open without touching `:3920` |
+| Gray Create → no Retrieve | **fixed, live-proven 2026-10-12** — cause was the RGB24 FinalParams coercion; default `jfif_gray=gray8` answers Grayscale8 + BPL width + 1-component JPEG (`rgb24` is a legacy opt-in) |
 
 **Suggested live experiments**
 
