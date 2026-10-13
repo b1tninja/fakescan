@@ -1,7 +1,6 @@
 //! SOAP 1.2 envelope. Header fields are parsed; the body markup is kept as it arrived.
 
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use super::xml::{self, Element};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Envelope {
@@ -21,6 +20,8 @@ pub struct Envelope {
     pub xmlns: Vec<String>,
     /// Direct children of `soap:Header`.
     pub headers: Vec<HeaderBlock>,
+    /// Parsed tree when the input was XML.
+    pub tree: Option<Element>,
 }
 
 /// One header block. `must_understand` is the SOAP 1.2 attribute (`true` or `1`).
@@ -64,117 +65,50 @@ const UNDERSTOOD: &[&str] = &[
     "FaultTo",
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Capture {
-    Action,
-    MessageId,
-    RelatesTo,
-    To,
-    Identifier,
-}
-
 impl Envelope {
     /// Parse `input`, or the first SOAP envelope inside it (an MTOM part).
     /// A truncated or non-XML tail is ignored once the header fields are read.
     pub fn parse(input: &str) -> Self {
-        let xml = envelope_slice(input);
-        let mut reader = Reader::from_str(xml);
-        reader.config_mut().trim_text(false);
-        let mut buf = Vec::new();
-        let mut out = Envelope::default();
-        let mut stack: Vec<String> = Vec::new();
-        let mut capture: Option<Capture> = None;
-        let mut text = String::new();
-        let mut in_body = false;
-        let mut body_at: Option<u64> = None;
-
-        while let Ok(event) = reader.read_event_into(&mut buf) {
-            match event {
-                Event::Start(ref el) => {
-                    let local = local_name(el.local_name().as_ref());
-                    note_xmlns(&mut out, el);
-                    if stack.is_empty() {
-                        out.root = Some(local.clone());
-                    }
-                    if stack.len() == 2 && stack[0] == "Envelope" && stack[1] == "Header" {
-                        out.headers.push(HeaderBlock {
-                            name: local.clone(),
-                            must_understand: must_understand(el),
-                        });
-                    }
-                    if local == "Body" && stack.iter().any(|n| n == "Envelope") {
-                        in_body = true;
-                        body_at = Some(reader.buffer_position());
-                    } else if in_body && out.body_name.is_none() {
-                        out.body_name = Some(local.clone());
-                    }
-                    capture = begin_capture(&stack, in_body, &local, &mut text);
-                    stack.push(local);
-                }
-                Event::Empty(ref el) => {
-                    let local = local_name(el.local_name().as_ref());
-                    note_xmlns(&mut out, el);
-                    if stack.len() == 2 && stack[0] == "Envelope" && stack[1] == "Header" {
-                        out.headers.push(HeaderBlock {
-                            name: local.clone(),
-                            must_understand: must_understand(el),
-                        });
-                    }
-                    if local == "Body" && stack.iter().any(|n| n == "Envelope") {
-                        in_body = false;
-                        out.body.clear();
-                    } else if in_body && out.body_name.is_none() {
-                        out.body_name = Some(local);
-                    }
-                }
-                Event::Text(ref el) => {
-                    if capture.is_some() {
-                        if let Ok(value) = el.unescape() {
-                            text.push_str(&value);
-                        }
-                    }
-                }
-                Event::CData(ref el) => {
-                    if capture.is_some() {
-                        text.push_str(&String::from_utf8_lossy(el));
-                    }
-                }
-                Event::End(ref el) => {
-                    let local = local_name(el.local_name().as_ref());
-                    if let Some(kind) = capture {
-                        if stack.last().is_some_and(|top| top == &local) {
-                            store(&mut out, kind, &text);
-                            capture = None;
-                            text.clear();
-                        }
-                    }
-                    if local == "Body" {
-                        if let Some(start) = body_at {
-                            let end_pos = reader.buffer_position() as usize;
-                            let start = start as usize;
-                            let bytes = xml.as_bytes();
-                            let tag = bytes[..end_pos.min(bytes.len())]
-                                .iter()
-                                .rposition(|b| *b == b'<')
-                                .unwrap_or(end_pos);
-                            if start <= tag && tag <= xml.len() {
-                                out.body = xml[start..tag].to_string();
-                            }
-                        }
-                        in_body = false;
-                        body_at = None;
-                    }
-                    if stack.last().is_some_and(|top| top == &local) {
-                        stack.pop();
-                    }
-                    if local == "Envelope" {
-                        break;
-                    }
-                }
-                Event::Eof => break,
-                _ => {}
+        let slice = envelope_slice(input);
+        let Some(root) = xml::parse(slice) else {
+            return Self::default();
+        };
+        let mut out = Envelope {
+            tree: Some(root.clone()),
+            root: Some(root.local.clone()),
+            ..Self::default()
+        };
+        let env = find_envelope(&root).unwrap_or(&root);
+        if env.local == "Envelope" {
+            out.root = Some("Envelope".into());
+        }
+        collect_xmlns(env, &mut out.xmlns);
+        if let Some(header) = env.child("Header") {
+            for child in &header.children {
+                out.headers.push(HeaderBlock {
+                    name: child.local.clone(),
+                    must_understand: must_understand_el(child),
+                });
             }
-            buf.clear();
+            out.action = header_text(header, "Action");
+            out.message_id =
+                header_text(header, "MessageID").or_else(|| header_text(header, "MessageId"));
+            out.relates_to = header_text(header, "RelatesTo");
+            out.to = header_text(header, "To");
+            out.identifier = header_identifier(header);
+        }
+        if let Some(body) = env.child("Body") {
+            out.body = body.children.iter().map(|c| c.to_xml()).collect::<String>();
+            out.body_name = body.children.first().map(|c| c.local.clone());
+        } else if env.local != "Envelope" {
+            out.body = env.to_xml();
+            out.body_name = Some(env.local.clone());
+            if env.local == "Action" {
+                out.action = text_or_child(env, "Action");
+            }
+            out.message_id =
+                text_or_child(env, "MessageID").or_else(|| text_or_child(env, "MessageId"));
+            out.identifier = header_identifier(env);
         }
         out.action = out.action.filter(|s| !s.is_empty());
         out.message_id = out.message_id.filter(|s| !s.is_empty());
@@ -186,7 +120,6 @@ impl Envelope {
 
     /// Header `Action`, or the body element's operation when the header omitted it.
     pub fn action_uri(&self, ops: &[&str], event_ns: &str, default_ns: &str) -> Option<String> {
-        // Action is an absolute IRI. A short name is not one, so the body element names the operation.
         if let Some(action) = &self.action {
             if absolute_iri(action) {
                 return Some(action.clone());
@@ -322,6 +255,78 @@ impl Envelope {
         }
         problems
     }
+
+    /// Body element tree (first child of `soap:Body`), when present.
+    pub fn body_tree(&self) -> Option<&Element> {
+        let Some(tree) = &self.tree else {
+            return None;
+        };
+        let env = find_envelope(tree).unwrap_or(tree);
+        env.child("Body")?.children.first()
+    }
+}
+
+fn find_envelope(el: &Element) -> Option<&Element> {
+    if el.local == "Envelope" {
+        return Some(el);
+    }
+    for child in &el.children {
+        if let Some(found) = find_envelope(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn collect_xmlns(el: &Element, out: &mut Vec<String>) {
+    for uri in &el.xmlns {
+        if !out.iter().any(|v| v == uri) {
+            out.push(uri.clone());
+        }
+    }
+    for child in &el.children {
+        collect_xmlns(child, out);
+    }
+}
+
+fn header_text(header: &Element, local: &str) -> Option<String> {
+    text_or_child(header, local)
+}
+
+fn text_or_child(el: &Element, local: &str) -> Option<String> {
+    if el.local == local {
+        let t = el.text.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    el.find_text(local)
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn header_identifier(header: &Element) -> Option<String> {
+    fn walk(el: &Element, in_ref: bool) -> Option<String> {
+        let in_ref = in_ref || el.local == "ReferenceParameters";
+        if in_ref && el.local == "Identifier" {
+            let t = el.text.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        for child in &el.children {
+            if let Some(v) = walk(child, in_ref) {
+                return Some(v);
+            }
+        }
+        None
+    }
+    walk(header, false)
+}
+
+fn must_understand_el(el: &Element) -> bool {
+    el.attr("mustUnderstand")
+        .is_some_and(|v| v == "true" || v == "1")
 }
 
 /// `xs:anyURI` that is an absolute IRI: a scheme, no whitespace.
@@ -359,65 +364,6 @@ fn is_uuid(value: &str) -> bool {
             .iter()
             .zip(parts)
             .all(|(n, part)| part.len() == *n && part.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-fn must_understand(el: &quick_xml::events::BytesStart<'_>) -> bool {
-    el.attributes().flatten().any(|attr| {
-        if attr.key.local_name().as_ref() != b"mustUnderstand" {
-            return false;
-        }
-        matches!(attr.unescape_value().as_deref(), Ok("true") | Ok("1"))
-    })
-}
-
-fn begin_capture(
-    stack: &[String],
-    in_body: bool,
-    local: &str,
-    text: &mut String,
-) -> Option<Capture> {
-    if in_body {
-        return None;
-    }
-    let kind = match local {
-        "Action" => Capture::Action,
-        "MessageID" | "MessageId" => Capture::MessageId,
-        "RelatesTo" => Capture::RelatesTo,
-        "To" => Capture::To,
-        "Identifier" if stack.iter().any(|n| n == "ReferenceParameters") => Capture::Identifier,
-        _ => return None,
-    };
-    text.clear();
-    Some(kind)
-}
-
-fn store(out: &mut Envelope, kind: Capture, text: &str) {
-    let value = text.trim().to_string();
-    match kind {
-        Capture::Action => out.action = Some(value),
-        Capture::MessageId => out.message_id = Some(value),
-        Capture::RelatesTo => out.relates_to = Some(value),
-        Capture::To => out.to = Some(value),
-        Capture::Identifier => out.identifier = Some(value),
-    }
-}
-
-fn note_xmlns(out: &mut Envelope, el: &quick_xml::events::BytesStart<'_>) {
-    for attr in el.attributes().flatten() {
-        if !attr.key.as_ref().starts_with(b"xmlns") {
-            continue;
-        }
-        if let Ok(value) = attr.unescape_value() {
-            let value = value.into_owned();
-            if !out.xmlns.iter().any(|v| v == &value) {
-                out.xmlns.push(value);
-            }
-        }
-    }
-}
-
-fn local_name(raw: &[u8]) -> String {
-    String::from_utf8_lossy(raw).into_owned()
 }
 
 /// Byte offset of the first `<*Envelope` start tag, if one exists.

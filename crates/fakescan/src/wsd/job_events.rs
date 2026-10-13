@@ -8,7 +8,8 @@ use tracing::{info, warn};
 use crate::profile::Profile;
 use crate::state::{ConditionChange, ScanJob, World};
 use crate::wsd::notify;
-use crate::wsd::soap::{self, SOAP_NS, WSA_NS, WSE_NS};
+use crate::wsd::soap;
+use crate::wsd::xml::Element;
 
 /// Snapshot carried into the async NotifyTo POST (no World lock held).
 #[derive(Debug, Clone)]
@@ -114,30 +115,24 @@ pub fn condition_event_body(
     severity: &str,
     raised: bool,
 ) -> String {
-    let name = soap::esc(name);
-    let component = soap::esc(component);
-    let severity = soap::esc(severity);
     let time = crate::timeutil::utc_now_iso();
     if raised {
-        format!(
-            r#"    <wscn:ScannerStatusConditionEvent>
-      <wscn:DeviceCondition Id="{id}">
-        <wscn:Time>{time}</wscn:Time>
-        <wscn:Name>{name}</wscn:Name>
-        <wscn:Component>{component}</wscn:Component>
-        <wscn:Severity>{severity}</wscn:Severity>
-      </wscn:DeviceCondition>
-    </wscn:ScannerStatusConditionEvent>"#
-        )
+        let cond = Element::new("wscn:DeviceCondition")
+            .with_attr("Id", id.to_string())
+            .with(Element::text_el("wscn:Time", time))
+            .with(Element::text_el("wscn:Name", name))
+            .with(Element::text_el("wscn:Component", component))
+            .with(Element::text_el("wscn:Severity", severity));
+        Element::new("wscn:ScannerStatusConditionEvent")
+            .with(cond)
+            .to_xml()
     } else {
-        format!(
-            r#"    <wscn:ScannerStatusConditionClearedEvent>
-      <wscn:DeviceConditionCleared>
-        <wscn:ConditionId>{id}</wscn:ConditionId>
-        <wscn:ConditionClearTime>{time}</wscn:ConditionClearTime>
-      </wscn:DeviceConditionCleared>
-    </wscn:ScannerStatusConditionClearedEvent>"#
-        )
+        let cleared = Element::new("wscn:DeviceConditionCleared")
+            .with(Element::text_el("wscn:ConditionId", id.to_string()))
+            .with(Element::text_el("wscn:ConditionClearTime", time));
+        Element::new("wscn:ScannerStatusConditionClearedEvent")
+            .with(cleared)
+            .to_xml()
     }
 }
 
@@ -153,14 +148,13 @@ pub fn maybe_emit_elements_change(world: &World, scan_ns: &str, profile: &Profil
 
 /// `wscn:ScannerElementsChangeEvent` with full ScannerConfiguration + DefaultScanTicket.
 pub fn elements_change_event_body(profile: &Profile) -> String {
-    let changes = super::elements::element_changes_xml(profile);
-    format!(
-        r#"    <wscn:ScannerElementsChangeEvent>
-      <wscn:ElementChanges>
-{changes}
-      </wscn:ElementChanges>
-    </wscn:ScannerElementsChangeEvent>"#
-    )
+    let mut changes = Element::new("wscn:ElementChanges");
+    for child in super::elements::element_changes_elements(profile) {
+        changes = changes.with(child);
+    }
+    Element::new("wscn:ScannerElementsChangeEvent")
+        .with(changes)
+        .to_xml()
 }
 
 /// Fire-and-forget ScannerStatusSummaryEvent from current World fault/busy/scan flags.
@@ -234,28 +228,18 @@ pub fn status_summary_state(
 
 /// SOAP body for `wscn:ScannerStatusSummaryEvent` (StatusSummary + optional reasons).
 pub fn status_summary_event_body(state: &str, reasons: &[&str]) -> String {
-    let state = soap::esc(state);
-    let reasons_block = if reasons.is_empty() {
-        String::new()
-    } else {
-        let inner: String = reasons
-            .iter()
-            .map(|r| {
-                format!(
-                    "          <wscn:ScannerStateReason>{}</wscn:ScannerStateReason>\n",
-                    soap::esc(r)
-                )
-            })
-            .collect();
-        format!("        <wscn:ScannerStateReasons>\n{inner}        </wscn:ScannerStateReasons>\n")
-    };
-    format!(
-        r#"    <wscn:ScannerStatusSummaryEvent>
-      <wscn:StatusSummary>
-        <wscn:ScannerState>{state}</wscn:ScannerState>
-{reasons_block}      </wscn:StatusSummary>
-    </wscn:ScannerStatusSummaryEvent>"#
-    )
+    let mut summary =
+        Element::new("wscn:StatusSummary").with(Element::text_el("wscn:ScannerState", state));
+    if !reasons.is_empty() {
+        let mut block = Element::new("wscn:ScannerStateReasons");
+        for r in reasons {
+            block = block.with(Element::text_el("wscn:ScannerStateReason", *r));
+        }
+        summary = summary.with(block);
+    }
+    Element::new("wscn:ScannerStatusSummaryEvent")
+        .with(summary)
+        .to_xml()
 }
 
 fn maybe_emit(world: &World, scan_ns: &str, short_action: &str, body_inner: &str) {
@@ -280,47 +264,44 @@ fn maybe_emit(world: &World, scan_ns: &str, short_action: &str, body_inner: &str
 
 /// Build `wscn:JobStatusEvent` body (schema JobStatus + lab Images* counters).
 pub fn job_status_event_body(job: &JobEventSnap) -> String {
-    format!(
-        r#"    <wscn:JobStatusEvent>
-      <wscn:JobStatus>
-        <wscn:JobId>{id}</wscn:JobId>
-        <wscn:JobState>{state}</wscn:JobState>
-        <wscn:JobStateReasons>
-          <wscn:JobStateReason>{reason}</wscn:JobStateReason>
-        </wscn:JobStateReasons>
-        <wscn:ScansCompleted>{done}</wscn:ScansCompleted>
-        <wscn:ImagesCompleted>{done}</wscn:ImagesCompleted>
-        <wscn:ImagesToTransfer>{left}</wscn:ImagesToTransfer>
-      </wscn:JobStatus>
-    </wscn:JobStatusEvent>"#,
-        id = job.job_id,
-        state = soap::esc(&job.state),
-        reason = soap::esc(&job.reason),
-        done = job.images_completed,
-        left = job.images_to_transfer,
-    )
+    let status = Element::new("wscn:JobStatus")
+        .with(Element::text_el("wscn:JobId", job.job_id.to_string()))
+        .with(Element::text_el("wscn:JobState", &job.state))
+        .with(
+            Element::new("wscn:JobStateReasons")
+                .with(Element::text_el("wscn:JobStateReason", &job.reason)),
+        )
+        .with(Element::text_el(
+            "wscn:ScansCompleted",
+            job.images_completed.to_string(),
+        ))
+        .with(Element::text_el(
+            "wscn:ImagesCompleted",
+            job.images_completed.to_string(),
+        ))
+        .with(Element::text_el(
+            "wscn:ImagesToTransfer",
+            job.images_to_transfer.to_string(),
+        ));
+    Element::new("wscn:JobStatusEvent").with(status).to_xml()
 }
 
 /// Build `wscn:JobEndStateEvent` body (WDPScan.xsd JobEndStateType).
 pub fn job_end_state_event_body(job: &JobEventSnap) -> String {
-    format!(
-        r#"    <wscn:JobEndStateEvent>
-      <wscn:JobEndState>
-        <wscn:JobId>{id}</wscn:JobId>
-        <wscn:JobCompletedState>{state}</wscn:JobCompletedState>
-        <wscn:JobCompletedStateReasons>
-          <wscn:JobStateReason>{reason}</wscn:JobStateReason>
-        </wscn:JobCompletedStateReasons>
-        <wscn:JobName>fakescan</wscn:JobName>
-        <wscn:JobOriginatingUserName>fakescan</wscn:JobOriginatingUserName>
-        <wscn:ScansCompleted>{done}</wscn:ScansCompleted>
-      </wscn:JobEndState>
-    </wscn:JobEndStateEvent>"#,
-        id = job.job_id,
-        state = soap::esc(&job.state),
-        reason = soap::esc(&job.reason),
-        done = job.images_completed,
-    )
+    let end = Element::new("wscn:JobEndState")
+        .with(Element::text_el("wscn:JobId", job.job_id.to_string()))
+        .with(Element::text_el("wscn:JobCompletedState", &job.state))
+        .with(
+            Element::new("wscn:JobCompletedStateReasons")
+                .with(Element::text_el("wscn:JobStateReason", &job.reason)),
+        )
+        .with(Element::text_el("wscn:JobName", "fakescan"))
+        .with(Element::text_el("wscn:JobOriginatingUserName", "fakescan"))
+        .with(Element::text_el(
+            "wscn:ScansCompleted",
+            job.images_completed.to_string(),
+        ));
+    Element::new("wscn:JobEndStateEvent").with(end).to_xml()
 }
 
 fn event_envelope(
@@ -330,25 +311,17 @@ fn event_envelope(
     service_ep: &str,
     body_xml: &str,
 ) -> String {
-    let msg = uuid::Uuid::new_v4();
-    let to = soap::esc(notify_to.trim());
-    let from = soap::esc(service_ep);
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="{SOAP_NS}" xmlns:wsa="{WSA_NS}" xmlns:wscn="{scan_ns}" xmlns:wse="{WSE_NS}">
-  <soap:Header>
-    <wsa:To>{to}</wsa:To>
-    <wsa:Action>{action_uri}</wsa:Action>
-    <wsa:MessageID>urn:uuid:{msg}</wsa:MessageID>
-    <wsa:From>
-      <wsa:Address>{from}</wsa:Address>
-    </wsa:From>
-  </soap:Header>
-  <soap:Body>
-{body_xml}
-  </soap:Body>
-</soap:Envelope>"#
-    )
+    let mut resp = soap::Response::new()
+        .scan_ns(scan_ns)
+        .action(action_uri)
+        .to(notify_to.trim())
+        .from_address(service_ep)
+        .eventing_xmlns(true)
+        .message_id(format!("urn:uuid:{}", uuid::Uuid::new_v4()));
+    for el in soap::parse_body_children(body_xml) {
+        resp = resp.body(el);
+    }
+    resp.to_xml()
 }
 
 #[cfg(test)]
@@ -664,6 +637,8 @@ mod tests {
             height_px: 100,
             pages_left: 0,
             page_index: 1,
+            sheet_base: 0,
+            stack_total: 0,
             duplex: false,
             created_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),

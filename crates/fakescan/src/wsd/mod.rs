@@ -4,9 +4,11 @@ mod elements;
 mod envelope;
 pub mod job_events;
 pub mod notify;
+mod responses;
 mod scan_schema;
 pub mod soap;
 pub mod status_matrix;
+pub(crate) mod xml;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,48 +23,62 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::state::World;
-use crate::wsd::soap::{SCAN_NS, SCAN_NS_AIRSCAN};
+use crate::wsd::responses::jfif_wire_color;
+use crate::wsd::soap::SCAN_NS;
+use crate::wsd::xml::Element;
+
+/// See `elements::published_capability_xml`.
+pub fn published_capability_xml(profile: &crate::profile::Profile) -> String {
+    elements::published_capability_xml(profile)
+}
 
 pub async fn scanner_service(
     State(world): State<Arc<RwLock<World>>>,
     // `Option<ConnectInfo<_>>` does not implement the axum 0.8 extractor.
     // `Extension<ConnectInfo<_>>` does, and the connect-info service inserts that.
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    ctx: Option<Extension<crate::manager::DeviceCtx>>,
     uri: Uri,
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
+    // Record the peer's first/last contact in the device registry (throttled, off-thread).
+    if let (Some(Extension(ConnectInfo(addr))), Some(Extension(ctx))) = (&peer, &ctx) {
+        ctx.probe(addr.ip());
+    }
     let peer = peer
         .map(|Extension(ConnectInfo(addr))| addr.to_string())
         .unwrap_or_else(|| "-".into());
     let path = uri.path();
     let text = String::from_utf8_lossy(&body);
-    let action = soap::action(&text).unwrap_or_else(|| "(unknown)".into());
-    let short = soap::short_action(&action);
-    let relates = soap::message_id(&text);
-    if let Some(finding) = soap::Envelope::parse(&text)
-        .request_findings()
-        .into_iter()
-        .find(|finding| finding.reject)
-    {
+    let req = soap::Request::parse(&text);
+    let action = &req.action;
+    let short = &req.short_action;
+    let relates = req.relates.as_deref();
+    if let Some(finding) = &req.rejected {
         warn!(field = finding.field, "WSD header rejected");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
-            soap::fault_with_code(
-                Some("soap:MustUnderstand"),
-                finding.note,
-                relates.as_deref(),
-            ),
+            soap::fault_with_code(Some("soap:MustUnderstand"), finding.note, relates),
         )
             .into_response();
     }
-    let scan_ns = soap::scan_ns_from_body(&text);
+    let scan_ns = req.scan_ns;
     info!(%path, %short, %peer, scan_ns, bytes = body.len(), "WSD request");
     debug!(%path, %action, "WSD Action URI");
 
     let seq_before = world.read().await.trace_seq();
-    let result = dispatch(&world, &action, scan_ns, &text, relates.as_deref(), &peer).await;
+    let device_id = match &ctx {
+        Some(Extension(c)) => c.id.clone(),
+        None => world
+            .read()
+            .await
+            .lab_name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "default".into()),
+    };
+    let result = dispatch(&world, &req, &text, &peer, &device_id).await;
     let ms = started.elapsed().as_millis();
     let (outcome, detail) = match &result {
         Ok(SoapOut::Xml(_)) => ("ok".to_string(), "soap".to_string()),
@@ -73,6 +89,14 @@ pub async fn scanner_service(
         }) => (
             "abort".to_string(),
             format!("mtom abort bytes={}", image.len()),
+        ),
+        Ok(SoapOut::Mtom {
+            image,
+            cut: Some(_),
+            ..
+        }) => (
+            "abort".to_string(),
+            format!("mtom cut mid page bytes={}", image.len()),
         ),
         Ok(SoapOut::Mtom { image, .. }) => {
             ("ok".to_string(), format!("mtom bytes={}", image.len()))
@@ -101,6 +125,8 @@ pub async fn scanner_service(
             content_type,
             retrieve_bps,
             abort_after,
+            cut,
+            live,
         }) => {
             info!(
                 %path,
@@ -113,7 +139,15 @@ pub async fn scanner_service(
                 kind = "mtom",
                 "WSD ok"
             );
-            mtom_response(&soap_xml, &image, &content_type, retrieve_bps, abort_after)
+            mtom_response(
+                &soap_xml,
+                &image,
+                &content_type,
+                retrieve_bps,
+                abort_after,
+                cut,
+                live,
+            )
         }
         Err(FaultOut { subcode, reason }) => {
             warn!(%path, %short, ms, %reason, "WSD fault");
@@ -138,6 +172,10 @@ enum SoapOut {
         retrieve_bps: u64,
         /// When set, send this many body bytes then error the stream (mid-MTOM abort).
         abort_after: Option<usize>,
+        /// Fault-plan mid-page cut (wins over `abort_after`).
+        cut: Option<crate::state::Cut>,
+        /// Live-fault / timed-deadline handle checked between stream chunks.
+        live: Option<crate::state::LiveCut>,
     },
 }
 
@@ -168,6 +206,36 @@ const ALL_FAULT_SUBCODES: &[&str] = &[
     "wse:InvalidMessage",
 ];
 
+fn final_params_json(color: &str, bytes_per_line: u32, format: &str) -> serde_json::Value {
+    serde_json::json!({
+        "color_processing": color,
+        "bits": crate::tickets::bits_for_token(color),
+        "bytes_per_line": bytes_per_line,
+        "format": format,
+    })
+}
+
+/// Record a faulted/refused ticket request: outcome `<prefix>:<subcode>`.
+fn record_ticket(
+    w: &World,
+    device_id: &str,
+    op: &str,
+    body: &str,
+    f: &FaultOut,
+    prefix: &str,
+    final_p: Option<serde_json::Value>,
+) {
+    w.tickets().record(
+        device_id,
+        op,
+        format!("{prefix}:{}", f.subcode.as_deref().unwrap_or("none")),
+        Some(f.reason.clone()),
+        crate::state::ticket_parsed(body),
+        final_p,
+        body,
+    );
+}
+
 #[derive(Debug)]
 struct FaultOut {
     subcode: Option<String>,
@@ -175,16 +243,6 @@ struct FaultOut {
 }
 
 /// `wscn:Override` / `wscn:UsedDefault` attribute fragment for FinalParameters.
-fn final_param_attr(overridden: bool, used_default: bool) -> &'static str {
-    if used_default {
-        r#" wscn:UsedDefault="true""#
-    } else if overridden {
-        r#" wscn:Override="true""#
-    } else {
-        ""
-    }
-}
-
 impl From<String> for FaultOut {
     fn from(reason: String) -> Self {
         // Format refusal: XSD / WSDL subcode is wscn:ClientErrorFormatNotSupported.
@@ -250,13 +308,14 @@ impl From<String> for FaultOut {
 
 async fn dispatch(
     world: &Arc<RwLock<World>>,
-    action: &str,
-    scan_ns: &str,
+    req: &soap::Request,
     body: &str,
-    relates: Option<&str>,
     peer: &str,
+    device_id: &str,
 ) -> Result<SoapOut, FaultOut> {
-    let short = soap::short_action(action);
+    let scan_ns = req.scan_ns;
+    let relates = req.relates.as_deref();
+    let short = req.short_action.as_str();
     // Normalize Action URI short name even when client used 08 vs 01.
     let short = match short {
         "GetResponse" => "Get",
@@ -264,6 +323,16 @@ async fn dispatch(
     };
     match short {
         "GetScannerElements" => {
+            // Timed / now fault-plan entries fire on status polls too.
+            {
+                let mut wm = world.write().await;
+                wm.tick_fault_plan();
+                let changes = wm.drain_pending_condition_changes();
+                job_events::maybe_emit_condition_changes(&wm, scan_ns, &changes);
+                if !changes.is_empty() {
+                    job_events::maybe_emit_status_summary(&wm, scan_ns);
+                }
+            }
             let w = world.read().await;
             let scanning = w.status().active_jobs > 0;
             let inner = elements::get_scanner_elements(
@@ -281,7 +350,8 @@ async fn dispatch(
                     paused: w.paused(),
                     lamp_warning: w.lamp_warning(),
                     lamp_warming: w.lamp_warming(),
-                    feeder_ready: w.feeder_ready(),
+                    // empty_feeder_brother: the real Brother never publishes InputTrayEmpty.
+                    feeder_ready: w.feeder_ready() || w.empty_feeder_brother(),
                     pages_remaining: w.pages_remaining(),
                     scanning,
                     condition_history: w.condition_history(),
@@ -292,26 +362,41 @@ async fn dispatch(
                 names = ?elements::requested_names(body),
                 "GetScannerElements request"
             );
-            Ok(SoapOut::Xml(soap::envelope(
+            let body_el = xml::parse(&inner).expect("GetScannerElementsResponse");
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "GetScannerElementsResponse"),
                 relates,
-                &inner,
+                body_el,
             )))
         }
         "ValidateScanTicket" => {
             let w = world.read().await;
             let check = w.validate_ticket(body);
+            if let Some(reason) = w
+                .refuse_ticket(body, &check)
+                .or_else(|| w.jfif_bw_reject(&check.format, check.color))
+            {
+                let f = FaultOut::from(reason);
+                record_ticket(&w, device_id, "ValidateScanTicket", body, &f, "fault", None);
+                return Err(f);
+            }
             // Named Validate fault (Learn): conflicting MustHonor=true parameters.
             if check
                 .reason
                 .as_deref()
                 .is_some_and(|r| r.contains("ClientErrorConflictingRequiredParameters"))
             {
-                return Err(FaultOut::from(check.reason.clone().unwrap_or_else(|| {
-                    "ClientErrorConflictingRequiredParameters".into()
-                })));
+                let f = FaultOut::from(
+                    check
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "ClientErrorConflictingRequiredParameters".into()),
+                );
+                record_ticket(&w, device_id, "ValidateScanTicket", body, &f, "fault", None);
+                return Err(f);
             }
+            let final_p: Option<serde_json::Value>;
             // WIA Connect requires ImageInformation in ValidationInfo (MS sample);
             // ValidTicket alone → 0x80210001 after Status.
             //
@@ -334,27 +419,48 @@ async fn dispatch(
             }
             // Learn invalid example: zero ImageInformation + corrected ValidScanTicket.
             // Soft-accepted format miss stays ValidTicket=true (no rewrite).
-            let (width_px, height_px, bpl, valid_scan_ticket) = if valid_ticket {
+            let (width_px, height_px, bpl, valid_scan_ticket_el) = if valid_ticket {
                 let (width_px, height_px) = crate::image_gen::job_page_pixels(check.dpi);
                 // Brother live jfif uses RGB stride for BytesPerLine (not MS compressed=0)
                 // unless profile.bytes_per_line_ms is set.
-                let bpl = crate::image_gen::bytes_per_line(
-                    &check.format,
+                let mode = w.effects().jfif_gray;
+                let eff_format = w
+                    .jfif_gray_format(&check.format, check.color)
+                    .unwrap_or_else(|| check.format.clone());
+                let bpl = crate::image_gen::bytes_per_line_fx(
+                    &eff_format,
                     width_px,
                     check.color,
                     w.profile().bytes_per_line_ms,
+                    mode,
+                    w.effects().jfif_bw,
                 );
-                (width_px, height_px, bpl, String::new())
+                let wire = jfif_wire_color(
+                    &eff_format,
+                    check.color.wsd_token(),
+                    w.effects().jfif_gray,
+                    w.effects().jfif_bw,
+                );
+                final_p = Some(final_params_json(wire, bpl, &eff_format));
+                (width_px, height_px, bpl, None)
             } else {
                 let (corr_dpi, corr_format) = w.corrected_ticket_params(&check);
+                final_p = Some(serde_json::json!({
+                    "format": corr_format,
+                    "resolution": corr_dpi,
+                }));
                 (
                     0,
                     0,
                     0,
-                    format!(
-                        "\n{}",
-                        valid_scan_ticket_xml(body, &check, corr_dpi, &corr_format)
-                    ),
+                    Some(responses::valid_scan_ticket_element(
+                        body,
+                        &check,
+                        corr_dpi,
+                        &corr_format,
+                        w.effects().jfif_gray,
+                        w.effects().jfif_bw,
+                    )),
                 )
             };
             info!(
@@ -368,29 +474,27 @@ async fn dispatch(
                 bytes_per_line = bpl,
                 "ValidateScanTicket"
             );
-            let image_info = format!(
-                r#"
-        <wscn:ImageInformation>
-          <wscn:MediaFrontImageInfo>
-            <wscn:PixelsPerLine>{width_px}</wscn:PixelsPerLine>
-            <wscn:NumberOfLines>{height_px}</wscn:NumberOfLines>
-            <wscn:BytesPerLine>{bpl}</wscn:BytesPerLine>
-          </wscn:MediaFrontImageInfo>
-        </wscn:ImageInformation>"#
+            w.tickets().record(
+                device_id,
+                "ValidateScanTicket",
+                if valid_ticket { "valid" } else { "invalid" }.to_string(),
+                check.reason.clone(),
+                crate::state::ticket_parsed(body),
+                final_p,
+                body,
             );
-            let inner = format!(
-                r#"    <wscn:ValidateScanTicketResponse>
-      <wscn:ValidationInfo>
-        <wscn:ValidTicket>{valid}</wscn:ValidTicket>{image_info}{valid_scan_ticket}
-      </wscn:ValidationInfo>
-    </wscn:ValidateScanTicketResponse>"#,
-                valid = valid_ticket,
+            let body_el = responses::validate_scan_ticket_response(
+                valid_ticket,
+                width_px,
+                height_px,
+                bpl,
+                valid_scan_ticket_el,
             );
-            Ok(SoapOut::Xml(soap::envelope(
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "ValidateScanTicketResponse"),
                 relates,
-                &inner,
+                body_el,
             )))
         }
         "CreateScanJob" => {
@@ -403,9 +507,22 @@ async fn dispatch(
                 }
             }
             let mut w = world.write().await;
-            let job = w
-                .create_job(body)
-                .map_err(|e| FaultOut::from(e.to_string()))?;
+            let created = w.create_job(body);
+            // empty_feeder_brother: refuse as busy only after the delay, without holding the
+            // world lock (other requests, incl. status polls, keep answering Idle meanwhile).
+            if let Some(ms) = w.take_empty_feeder_refusal_ms() {
+                drop(w);
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                w = world.write().await;
+            }
+            let job = match created {
+                Ok(j) => j,
+                Err(e) => {
+                    let f = FaultOut::from(e.to_string());
+                    record_ticket(&w, device_id, "CreateScanJob", body, &f, "refused", None);
+                    return Err(f);
+                }
+            };
             info!(
                 job_id = job.id,
                 dpi = job.dpi,
@@ -419,110 +536,52 @@ async fn dispatch(
             );
             // Idle→Processing (active_jobs); NotifyTo no-op when unset.
             job_events::maybe_emit_status_summary(&w, scan_ns);
-            // Brother live jfif: BytesPerLine = width×3 (lab capture 2480→7440)
-            // unless profile.bytes_per_line_ms is set.
-            let bytes_per_line = crate::image_gen::bytes_per_line(
+            // RGB jfif: BytesPerLine = width×3 (Brother capture 2480→7440); gray jfif =
+            // width (default). profile.bytes_per_line_ms overrides both.
+            let jfif_gray = w.effects().jfif_gray;
+            let jfif_bw = w.effects().jfif_bw;
+            let bytes_per_line = crate::image_gen::bytes_per_line_fx(
                 &job.format,
                 job.width_px,
                 job.color,
                 w.profile().bytes_per_line_ms,
+                jfif_gray,
+                jfif_bw,
             );
-            // Lab 2026-10-12: ticket Grayscale8 + FinalParams Grayscale8 → CreateScanJob
-            // Pending then no RetrieveImage. JFIF FinalParams must say RGB24 (wire JPEG
-            // is RGB). Keep job.color for encode/loopback; only the FinalParams token.
-            let final_color = jfif_wire_color(&job.format, job.color.wsd_token());
+            // Live 2026-10-12 (Windows 11): answering a Grayscale8 ticket with RGB24
+            // FinalParams (old coercion) → CreateScanJob then no RetrieveImage. Default
+            // is now consistent gray; `jfif_gray=rgb24` restores the coercion.
+            let final_color =
+                jfif_wire_color(&job.format, job.color.wsd_token(), jfif_gray, jfif_bw);
             // DocumentFinalParameters must fill known params (MS remarks) —
             // bare Format/Resolution alone → WIA CreateScanJob OK then no RetrieveImage.
             // Override / UsedDefault: Learn DocumentFinalParameters — device replaced
             // or filled a default (MustHonor=false substitution sets Override).
-            let fmt_attr = final_param_attr(job.format_overridden, job.format_used_default);
-            let dpi_attr = final_param_attr(job.dpi_overridden, job.dpi_used_default);
-            let color_attr = if final_color != job.color.wsd_token() {
-                r#" wscn:Override="true""#
-            } else {
-                ""
-            };
-            let inner = format!(
-                r#"    <wscn:CreateScanJobResponse>
-      <wscn:JobId>{id}</wscn:JobId>
-      <wscn:JobToken>{token}</wscn:JobToken>
-      <wscn:ImageInformation>
-        <wscn:MediaFrontImageInfo>
-          <wscn:PixelsPerLine>{w}</wscn:PixelsPerLine>
-          <wscn:NumberOfLines>{h}</wscn:NumberOfLines>
-          <wscn:BytesPerLine>{bpl}</wscn:BytesPerLine>
-        </wscn:MediaFrontImageInfo>
-      </wscn:ImageInformation>
-      <wscn:DocumentFinalParameters>
-        <wscn:Format{fmt_attr}>{fmt}</wscn:Format>
-        <wscn:CompressionQualityFactor wscn:UsedDefault="true">100</wscn:CompressionQualityFactor>
-        <wscn:ImagesToTransfer>{pages}</wscn:ImagesToTransfer>
-        <wscn:InputSource>{src}</wscn:InputSource>
-        <wscn:ContentType wscn:UsedDefault="true">Auto</wscn:ContentType>
-        <wscn:InputSize>
-          <wscn:InputMediaSize>
-            <wscn:Width>{media_w}</wscn:Width>
-            <wscn:Height>{media_h}</wscn:Height>
-          </wscn:InputMediaSize>
-        </wscn:InputSize>
-        <wscn:Exposure>
-          <wscn:ExposureSettings>
-            <wscn:Contrast>0</wscn:Contrast>
-            <wscn:Brightness>0</wscn:Brightness>
-            <wscn:Sharpness wscn:UsedDefault="true">0</wscn:Sharpness>
-          </wscn:ExposureSettings>
-        </wscn:Exposure>
-        <wscn:Scaling>
-          <wscn:ScalingWidth>100</wscn:ScalingWidth>
-          <wscn:ScalingHeight>100</wscn:ScalingHeight>
-        </wscn:Scaling>
-        <wscn:Rotation>0</wscn:Rotation>
-        <wscn:MediaSides>
-          <wscn:MediaFront>
-            <wscn:ScanRegion>
-              <wscn:ScanRegionXOffset>0</wscn:ScanRegionXOffset>
-              <wscn:ScanRegionYOffset>0</wscn:ScanRegionYOffset>
-              <wscn:ScanRegionWidth>{media_w}</wscn:ScanRegionWidth>
-              <wscn:ScanRegionHeight>{media_h}</wscn:ScanRegionHeight>
-            </wscn:ScanRegion>
-            <wscn:ColorProcessing{color_attr}>{color}</wscn:ColorProcessing>
-            <wscn:Resolution>
-              <wscn:Width{dpi_attr}>{dpi}</wscn:Width>
-              <wscn:Height{dpi_attr}>{dpi}</wscn:Height>
-            </wscn:Resolution>
-          </wscn:MediaFront>
-        </wscn:MediaSides>
-      </wscn:DocumentFinalParameters>
-    </wscn:CreateScanJobResponse>"#,
-                id = job.id,
-                token = soap::esc(&job.token),
-                w = job.width_px,
-                h = job.height_px,
-                bpl = bytes_per_line,
-                fmt_attr = fmt_attr,
-                fmt = job.format,
-                pages = job.pages_left,
-                src = job.input_source,
-                color_attr = color_attr,
-                color = final_color,
-                dpi_attr = dpi_attr,
-                dpi = job.dpi,
-                media_w = crate::image_gen::LETTER_W_THOU,
-                media_h = crate::image_gen::LETTER_H_THOU,
+            w.tickets().record(
+                device_id,
+                "CreateScanJob",
+                "accepted".to_string(),
+                None,
+                crate::state::ticket_parsed(body),
+                Some(final_params_json(final_color, bytes_per_line, &job.format)),
+                body,
             );
-            Ok(SoapOut::Xml(soap::envelope(
+            let body_el = responses::create_scan_job_response(&job, bytes_per_line, final_color);
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "CreateScanJobResponse"),
                 relates,
-                &inner,
+                body_el,
             )))
         }
         "RetrieveImage" => {
-            let job_id: i32 = soap::extract_tagged(body, "JobId")
+            let job_id: i32 = req
+                .field("JobId")
                 .ok_or_else(|| FaultOut::from("JobId missing".to_string()))?
                 .parse()
                 .map_err(|_| FaultOut::from("JobId invalid".to_string()))?;
-            let token = soap::extract_tagged(body, "JobToken")
+            let token = req
+                .field("JobToken")
                 .ok_or_else(|| FaultOut::from("JobToken missing".to_string()))?;
             let mut w = world.write().await;
             // page_index before this transfer — abort_after_n trips like jam_after_n.
@@ -537,23 +596,38 @@ async fn dispatch(
                     Ok(v) => v,
                     Err(e) => {
                         let err = e.to_string();
+                        let changes = w.drain_pending_condition_changes();
+                        job_events::maybe_emit_condition_changes(&w, scan_ns, &changes);
                         // Idle timeout: job already Aborted + JobTimedOut in World.
                         if err.contains("JobTimedOut") {
                             if let Some(j) = w.get_job(job_id) {
                                 job_events::maybe_emit_job_end(&w, scan_ns, j);
                             }
+                        }
+                        // Mid-job jam/offline and other Retrieve faults: push Stopped +
+                        // MediaJam / AttentionRequired so inbox WIA updates without
+                        // re-polling GetScannerElements (maps to DOCUMENT_HANDLING_STATUS).
+                        if !changes.is_empty() || err.contains("JobTimedOut") {
                             job_events::maybe_emit_status_summary(&w, scan_ns);
                         }
                         return Err(FaultOut::from(err));
                     }
                 };
-            // Optional NotifyTo: every Retrieve → JobStatusEvent; last page → JobEndStateEvent.
-            job_events::maybe_emit_job_status(&w, scan_ns, &job);
-            if job.pages_left == 0 {
-                job_events::maybe_emit_job_end(&w, scan_ns, &job);
+            // Fault-plan mid-page cut: the page is not delivered; push the raised condition.
+            let plan_cut = w.take_pending_cut();
+            if plan_cut.is_some() {
+                let changes = w.drain_pending_condition_changes();
+                job_events::maybe_emit_condition_changes(&w, scan_ns, &changes);
+                job_events::maybe_emit_status_summary(&w, scan_ns);
+            } else {
+                // Optional NotifyTo: every Retrieve → JobStatusEvent; last page → JobEndStateEvent.
+                job_events::maybe_emit_job_status(&w, scan_ns, &job);
+                if job.pages_left == 0 {
+                    job_events::maybe_emit_job_end(&w, scan_ns, &job);
+                }
+                // Often Processing while pages remain; re-emit after JobEnd path too.
+                job_events::maybe_emit_status_summary(&w, scan_ns);
             }
-            // Often Processing while pages remain; re-emit after JobEnd path too.
-            job_events::maybe_emit_status_summary(&w, scan_ns);
             info!(
                 job_id,
                 image_bytes = image.len(),
@@ -587,35 +661,34 @@ async fn dispatch(
             // Content-ID shape matches MS RetrieveImageResponse sample (`…@uuid`).
             // xmlns:xop is added on the Envelope in mtom_response (not on Include).
             let cid = format!("{}@uuid", Uuid::new_v4());
-            let inner = format!(
-                r#"    <wscn:RetrieveImageResponse>
-      <wscn:ScanData>
-        <xop:Include href="cid:{cid}" />
-      </wscn:ScanData>
-    </wscn:RetrieveImageResponse>"#
-            );
+            let body_el = responses::retrieve_image_response(&cid);
             // Action …/RetrieveImageResponse (tried bare …/RetrieveImage per MS
             // sample; same CancelJob-after-~30s outcome).
-            let soap_xml = soap::envelope(
+            let soap_xml = responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "RetrieveImageResponse"),
                 relates,
-                &inner,
+                body_el,
             );
             let content_type = crate::image_gen::mime_for_format(&job.format).to_string();
             let retrieve_bps = w.retrieve_bps();
             // `Some(n)` arms abort: `n == 0` → cut at half the assembled MTOM body.
             let abort_after = abort_planned.then_some(w.abort_retrieve_bytes() as usize);
+            let live = (retrieve_bps > 0 || plan_cut.is_some() || w.plan_has_pending())
+                .then(|| w.live_cut_handle(job_id));
             Ok(SoapOut::Mtom {
                 soap_xml,
                 image,
                 content_type,
                 retrieve_bps,
                 abort_after,
+                cut: plan_cut,
+                live,
             })
         }
         "CancelJob" => {
-            let job_id: i32 = soap::extract_tagged(body, "JobId")
+            let job_id: i32 = req
+                .field("JobId")
                 .ok_or_else(|| FaultOut::from("JobId missing".to_string()))?
                 .parse()
                 .map_err(|_| FaultOut::from("JobId invalid".to_string()))?;
@@ -632,52 +705,27 @@ async fn dispatch(
             }
             // Processing→Idle when the canceled job was the last active one.
             job_events::maybe_emit_status_summary(&w, scan_ns);
-            let inner = r#"    <wscn:CancelJobResponse/>"#;
-            Ok(SoapOut::Xml(soap::envelope(
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "CancelJobResponse"),
                 relates,
-                inner,
+                responses::cancel_job_response(),
             )))
         }
         "GetActiveJobs" => {
             let w = world.read().await;
-            let mut jobs_xml = String::new();
-            for job in w.jobs_snapshot() {
-                // JobSummaryType order: JobId, JobName, User, State, Reasons, ScansCompleted.
-                jobs_xml.push_str(&format!(
-                    r#"
-        <wscn:JobSummary>
-          <wscn:JobId>{id}</wscn:JobId>
-          <wscn:JobName>fakescan</wscn:JobName>
-          <wscn:JobOriginatingUserName>fakescan</wscn:JobOriginatingUserName>
-          <wscn:JobState>{state}</wscn:JobState>
-          <wscn:JobStateReasons>
-            <wscn:JobStateReason>{reason}</wscn:JobStateReason>
-          </wscn:JobStateReasons>
-          <wscn:ScansCompleted>{done}</wscn:ScansCompleted>
-        </wscn:JobSummary>"#,
-                    id = job.id,
-                    state = job.job_state(),
-                    reason = soap::esc(&job.state_reason),
-                    done = job.page_index,
-                ));
-            }
-            let inner = format!(
-                r#"    <wscn:GetActiveJobsResponse>
-      <wscn:ActiveJobs>{jobs_xml}
-      </wscn:ActiveJobs>
-    </wscn:GetActiveJobsResponse>"#
-            );
-            Ok(SoapOut::Xml(soap::envelope(
+            let jobs = w.jobs_snapshot();
+            let body_el = responses::get_active_jobs_response(&jobs);
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "GetActiveJobsResponse"),
                 relates,
-                &inner,
+                body_el,
             )))
         }
         "GetJobElements" => {
-            let job_id: i32 = soap::extract_tagged(body, "JobId")
+            let job_id: i32 = req
+                .field("JobId")
                 .ok_or_else(|| FaultOut::from("JobId missing".to_string()))?
                 .parse()
                 .map_err(|_| FaultOut::from("JobId invalid".to_string()))?;
@@ -689,44 +737,27 @@ async fn dispatch(
                 FaultOut::from(w.missing_job_fault(job_id))
             })?;
             let inner = elements::get_job_elements(job, body);
-            Ok(SoapOut::Xml(soap::envelope(
+            let body_el = xml::parse(&inner).expect("GetJobElementsResponse");
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "GetJobElementsResponse"),
                 relates,
-                &inner,
+                body_el,
             )))
         }
         "GetJobHistory" => {
             let w = world.read().await;
-            let mut jobs_xml = String::new();
-            for entry in w.job_history() {
-                jobs_xml.push_str(&format!(
-                    r#"
-        <wscn:JobSummary>
-          <wscn:JobId>{id}</wscn:JobId>
-          <wscn:JobState>{state}</wscn:JobState>
-          <wscn:JobStateReasons>
-            <wscn:JobStateReason>{reason}</wscn:JobStateReason>
-          </wscn:JobStateReasons>
-          <wscn:JobName>fakescan</wscn:JobName>
-          <wscn:JobOriginatingUserName>fakescan</wscn:JobOriginatingUserName>
-        </wscn:JobSummary>"#,
-                    id = entry.id,
-                    state = soap::esc(&entry.state),
-                    reason = soap::esc(&entry.reason),
-                ));
-            }
-            let inner = format!(
-                r#"    <wscn:GetJobHistoryResponse>
-      <wscn:JobHistory>{jobs_xml}
-      </wscn:JobHistory>
-    </wscn:GetJobHistoryResponse>"#
-            );
-            Ok(SoapOut::Xml(soap::envelope(
+            let summaries = w
+                .job_history()
+                .iter()
+                .map(|entry| responses::job_history_summary(entry.id, &entry.state, &entry.reason))
+                .collect();
+            let body_el = responses::get_job_history_response(summaries);
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::scan_action(scan_ns, "GetJobHistoryResponse"),
                 relates,
-                &inner,
+                body_el,
             )))
         }
         // WS-Eventing: WIA/WSDScan Subscribes before CreateScanJob; a fault here
@@ -736,13 +767,13 @@ async fn dispatch(
             if let Some(reason) = w.not_accepting_reason() {
                 return Err(FaultOut::from(reason.to_string()));
             }
-            let mgr = soap::esc(w.service_endpoint());
+            let mgr = w.service_endpoint().to_string();
             let sub_id = Uuid::new_v4();
             let identifier = format!("uuid:{sub_id}");
-            let expires = soap::eventing_expires(body);
-            let contexts = soap::scan_destination_contexts(body);
-            let notify_url = soap::notify_to_address(body);
-            let filter_dialect = soap::eventing_filter_dialect(body);
+            let expires = req.expires();
+            let contexts = req.destination_contexts();
+            let notify_url = req.notify_to();
+            let filter_dialect = req.filter_dialect();
             w.set_notify_to(notify_url.as_deref());
             w.set_subscription_id(Some(&identifier));
             w.set_subscription_expires(Some(&expires));
@@ -750,29 +781,14 @@ async fn dispatch(
             // Windows Subscribe often carries wscn:ScanDestinations; the service
             // must return matching DestinationResponses / DestinationToken or
             // WIA may leave the device "not online".
-            let dests = if contexts.is_empty() {
-                String::new()
-            } else {
-                let mut blocks = String::new();
-                for ctx in &contexts {
+            let dest_blocks: Vec<Element> = contexts
+                .iter()
+                .map(|ctx| {
                     let token = format!("fakescan-dest-{}", Uuid::new_v4());
                     w.register_destination(&token, ctx);
-                    blocks.push_str(&format!(
-                        r#"
-        <wscn:DestinationResponse>
-          <wscn:ClientContext>{}</wscn:ClientContext>
-          <wscn:DestinationToken>{}</wscn:DestinationToken>
-        </wscn:DestinationResponse>"#,
-                        soap::esc(ctx),
-                        soap::esc(&token),
-                    ));
-                }
-                format!(
-                    r#"
-      <wscn:DestinationResponses>{blocks}
-      </wscn:DestinationResponses>"#
-                )
-            };
+                    responses::destination_response(ctx, &token)
+                })
+                .collect();
             info!(
                 %sub_id,
                 %expires,
@@ -784,29 +800,17 @@ async fn dispatch(
             // Lab: WIA open may Subscribe then immediately Unsubscribe + offline —
             // keep the request at info while diagnosing.
             info!(%body, "Subscribe request body");
-            let inner = format!(
-                r#"    <wse:SubscribeResponse xmlns:wse="{wse}">
-      <wse:SubscriptionManager>
-        <wsa:Address>{mgr}</wsa:Address>
-        <wsa:ReferenceParameters>
-          <wse:Identifier>{identifier}</wse:Identifier>
-        </wsa:ReferenceParameters>
-      </wse:SubscriptionManager>
-      <wse:Expires>{expires}</wse:Expires>{dests}
-    </wse:SubscribeResponse>"#,
-                wse = soap::WSE_NS,
-                identifier = soap::esc(&identifier),
-            );
-            Ok(SoapOut::Xml(soap::envelope(
+            let body_el = responses::subscribe_response(&mgr, &identifier, &expires, dest_blocks);
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::eventing_action("SubscribeResponse"),
                 relates,
-                &inner,
+                body_el,
             )))
         }
         "Renew" => {
-            let expires = soap::eventing_expires(body);
-            let req_id = soap::eventing_identifier(body);
+            let expires = req.expires();
+            let req_id = req.identifier().map(str::to_string);
             {
                 let mut w = world.write().await;
                 if w.subscription_deadline_elapsed(Instant::now()) {
@@ -831,21 +835,15 @@ async fn dispatch(
                 w.set_subscription_deadline(soap::expires_deadline_now(&expires));
             }
             info!(%expires, "WS-Eventing Renew accepted");
-            let inner = format!(
-                r#"    <wse:RenewResponse xmlns:wse="{wse}">
-      <wse:Expires>{expires}</wse:Expires>
-    </wse:RenewResponse>"#,
-                wse = soap::WSE_NS,
-            );
-            Ok(SoapOut::Xml(soap::envelope(
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::eventing_action("RenewResponse"),
                 relates,
-                &inner,
+                responses::renew_response(&expires),
             )))
         }
         "Unsubscribe" => {
-            let req_id = soap::eventing_identifier(body);
+            let req_id = req.identifier().map(str::to_string);
             {
                 let mut w = world.write().await;
                 // Identifier present: must match an active subscription (WSE InvalidMessage).
@@ -863,19 +861,15 @@ async fn dispatch(
                 w.clear_subscriptions();
             }
             info!("WS-Eventing Unsubscribe cleared destinations / NotifyTo");
-            let inner = format!(
-                r#"    <wse:UnsubscribeResponse xmlns:wse="{wse}"/>"#,
-                wse = soap::WSE_NS,
-            );
-            Ok(SoapOut::Xml(soap::envelope(
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::eventing_action("UnsubscribeResponse"),
                 relates,
-                &inner,
+                responses::unsubscribe_response(),
             )))
         }
         "GetStatus" => {
-            let req_id = soap::eventing_identifier(body);
+            let req_id = req.identifier().map(str::to_string);
             let stored = {
                 let mut w = world.write().await;
                 if w.subscription_deadline_elapsed(Instant::now()) {
@@ -896,84 +890,22 @@ async fn dispatch(
                 }
                 w.subscription_expires().map(str::to_owned)
             };
-            let expires = stored.unwrap_or_else(|| soap::eventing_expires(body));
-            let inner = format!(
-                r#"    <wse:GetStatusResponse xmlns:wse="{wse}">
-      <wse:Expires>{expires}</wse:Expires>
-    </wse:GetStatusResponse>"#,
-                wse = soap::WSE_NS,
-            );
-            Ok(SoapOut::Xml(soap::envelope(
+            let expires = stored.unwrap_or_else(|| req.expires());
+            Ok(SoapOut::Xml(responses::envelope_body(
                 scan_ns,
                 &soap::eventing_action("GetStatusResponse"),
                 relates,
-                &inner,
+                responses::get_status_response(&expires),
             )))
         }
         "Get" => {
             let w = world.read().await;
-            let service = soap::esc(w.service_endpoint());
-            let uuid = w.device_uuid();
-            // Add-device / Function Discovery shows FriendlyName; prefer a name
-            // Test-FakescanLooksLike accepts ("fakescan" or "Fake WSD scanner").
-            let friendly = soap::esc(friendly_name_for_listing(&w.profile().label));
-            // PnP-X: DeviceCategory requires Hosted HardwareId + CompatibleId
-            // (Microsoft PnPXDeviceCategory docs). CompatibleId matches wsdscdrv.inf
-            // (UMB\…/ScannerServiceType) — Brother live metadata includes both.
-            let compat = format!("{SCAN_NS_AIRSCAN}/ScannerServiceType");
-            let inner = format!(
-                r#"    <wsx:Metadata xmlns:wsx="http://schemas.xmlsoap.org/ws/2004/09/mex">
-      <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/ThisModel">
-        <wsdp:ThisModel xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
-                        xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10"
-                        xmlns:df="http://schemas.microsoft.com/windows/2008/09/devicefoundation">
-          <wsdp:Manufacturer xml:lang="en-US">fakescan</wsdp:Manufacturer>
-          <wsdp:ManufacturerUrl>http://localhost/</wsdp:ManufacturerUrl>
-          <wsdp:ModelName xml:lang="en-US">Fake WSD Scanner</wsdp:ModelName>
-          <wsdp:ModelNumber>1</wsdp:ModelNumber>
-          <wsdp:ModelUrl>http://localhost/</wsdp:ModelUrl>
-          <wsdp:PresentationUrl>http://localhost/</wsdp:PresentationUrl>
-          <pnpx:DeviceCategory>Scanners</pnpx:DeviceCategory>
-          <df:DeviceCategory>Imaging.Scanner</df:DeviceCategory>
-        </wsdp:ThisModel>
-      </wsx:MetadataSection>
-      <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/ThisDevice">
-        <wsdp:ThisDevice xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof">
-          <wsdp:FriendlyName xml:lang="en-US">{friendly}</wsdp:FriendlyName>
-          <wsdp:FirmwareVersion>0.1.0</wsdp:FirmwareVersion>
-          <wsdp:SerialNumber>FS-0001</wsdp:SerialNumber>
-        </wsdp:ThisDevice>
-      </wsx:MetadataSection>
-      <wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/Relationship">
-        <wsdp:Relationship Type="http://schemas.xmlsoap.org/ws/2006/02/devprof/host"
-                           xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
-                           xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">
-          <wsdp:Host>
-            <wsa:EndpointReference>
-              <wsa:Address>urn:uuid:{uuid}</wsa:Address>
-            </wsa:EndpointReference>
-            <wsdp:Types xmlns:wscn="{scan_ns}">wsdp:Device wscn:ScanDeviceType</wsdp:Types>
-            <wsdp:ServiceId>uri:{uuid}</wsdp:ServiceId>
-          </wsdp:Host>
-          <wsdp:Hosted>
-            <wsa:EndpointReference>
-              <wsa:Address>{service}</wsa:Address>
-            </wsa:EndpointReference>
-            <wsdp:Types xmlns:wscn="{scan_ns}">wscn:ScannerServiceType</wsdp:Types>
-            <wsdp:ServiceId>uri:{uuid}/ScannerService</wsdp:ServiceId>
-            <pnpx:HardwareId xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10">VEN_FAKE&amp;DEV_WSDSCAN</pnpx:HardwareId>
-            <pnpx:CompatibleId xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10">{compat}</pnpx:CompatibleId>
-          </wsdp:Hosted>
-        </wsdp:Relationship>
-      </wsx:MetadataSection>
-    </wsx:Metadata>"#,
-                scan_ns = SCAN_NS_AIRSCAN,
-            );
-            Ok(SoapOut::Xml(soap::envelope(
-                SCAN_NS,
-                "http://schemas.xmlsoap.org/ws/2004/09/transfer/GetResponse",
-                relates,
-                &inner,
+            let friendly = friendly_name_for_listing(&w.profile().label);
+            let device_uuid = w.device_uuid().to_string();
+            let metadata =
+                responses::transfer_get_metadata(friendly, &device_uuid, w.service_endpoint());
+            Ok(SoapOut::Xml(responses::transfer_get_response(
+                relates, metadata,
             )))
         }
         other => Err(FaultOut::from(format!("action not implemented: {other}"))),
@@ -1088,6 +1020,8 @@ fn mtom_response(
     image_ct: &str,
     retrieve_bps: u64,
     abort_after: Option<usize>,
+    cut: Option<crate::state::Cut>,
+    live: Option<crate::state::LiveCut>,
 ) -> Response {
     let wire = build_mtom(soap_xml, image, image_ct);
 
@@ -1109,19 +1043,32 @@ fn mtom_response(
     );
 
     let body = wire.body;
-    let cut = abort_after.map(|cfg| abort_cut_len(body.len(), cfg));
+    let cut = match cut {
+        Some(c) => Some(c.len(body.len())),
+        None => abort_after.map(|cfg| abort_cut_len(body.len(), cfg)),
+    };
     if let Some(n) = cut {
         warn!(
             abort_after = n,
             body_len = body.len(),
             "RetrieveImage MTOM abort mid-send"
         );
-        return (StatusCode::OK, headers, aborted_body(body, n, retrieve_bps)).into_response();
+        return (
+            StatusCode::OK,
+            headers,
+            aborted_body(body, n, retrieve_bps, live),
+        )
+            .into_response();
     }
-    if retrieve_bps == 0 {
+    if retrieve_bps == 0 && live.is_none() {
         return (StatusCode::OK, headers, body).into_response();
     }
-    (StatusCode::OK, headers, throttled_body(body, retrieve_bps)).into_response()
+    (
+        StatusCode::OK,
+        headers,
+        throttled_body(body, retrieve_bps, live),
+    )
+        .into_response()
 }
 
 /// `cfg == 0` → half of `body_len`; otherwise min(cfg, body_len-1), at least 1.
@@ -1138,36 +1085,65 @@ fn abort_cut_len(body_len: usize, cfg: usize) -> usize {
 }
 
 /// Pace a known-length body at about `bps` bytes/sec (8 KiB chunks).
-fn throttled_body(body: Vec<u8>, bps: u64) -> axum::body::Body {
+fn throttled_body(
+    body: Vec<u8>,
+    bps: u64,
+    live: Option<crate::state::LiveCut>,
+) -> axum::body::Body {
     use bytes::Bytes;
     use futures_util::stream::unfold;
     use std::time::Duration;
 
-    let bps = bps.max(1);
-    // ~8 KiB chunks; delay = chunk / bps.
+    // ~8 KiB chunks; delay = chunk / bps (bps 0 = unpaced, still cuttable via `live`).
     let chunk = 8 * 1024usize;
-    let delay = Duration::from_nanos(
-        (u128::from(chunk as u64) * 1_000_000_000u128 / u128::from(bps))
-            .try_into()
-            .unwrap_or(u64::MAX),
+    let delay = if bps == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(
+            (u128::from(chunk as u64) * 1_000_000_000u128 / u128::from(bps))
+                .try_into()
+                .unwrap_or(u64::MAX),
+        )
+    };
+    let stream = unfold(
+        (body, 0usize, true, false),
+        move |(data, off, first, failed)| {
+            let live = live.clone();
+            async move {
+                if failed || off >= data.len() {
+                    return None;
+                }
+                if !first {
+                    if delay.is_zero() {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                if live.as_ref().is_some_and(|l| l.tripped()) {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "fakescan fault plan: stream cut live",
+                    );
+                    return Some((Err(err), (data, off, false, true)));
+                }
+                let end = (off + chunk).min(data.len());
+                let piece = Bytes::copy_from_slice(&data[off..end]);
+                Some((Ok::<_, std::io::Error>(piece), (data, end, false, false)))
+            }
+        },
     );
-    let stream = unfold((body, 0usize, true), move |(data, off, first)| async move {
-        if off >= data.len() {
-            return None;
-        }
-        if !first {
-            tokio::time::sleep(delay).await;
-        }
-        let end = (off + chunk).min(data.len());
-        let piece = Bytes::copy_from_slice(&data[off..end]);
-        Some((Ok::<_, std::io::Error>(piece), (data, end, false)))
-    });
     axum::body::Body::from_stream(stream)
 }
 
 /// Send up to `abort_after` bytes (optionally paced), then fail the stream so the
 /// client sees a mid-transfer drop while `Content-Length` still claimed the full body.
-fn aborted_body(body: Vec<u8>, abort_after: usize, bps: u64) -> axum::body::Body {
+fn aborted_body(
+    body: Vec<u8>,
+    abort_after: usize,
+    bps: u64,
+    live: Option<crate::state::LiveCut>,
+) -> axum::body::Body {
     use bytes::Bytes;
     use futures_util::stream::unfold;
     use std::io::{Error, ErrorKind};
@@ -1188,92 +1164,36 @@ fn aborted_body(body: Vec<u8>, abort_after: usize, bps: u64) -> axum::body::Body
     };
     let stream = unfold(
         (body, 0usize, true, false),
-        move |(data, off, first, failed)| async move {
-            if failed {
-                return None;
+        move |(data, off, first, failed)| {
+            let live = live.clone();
+            async move {
+                if failed {
+                    return None;
+                }
+                if live.as_ref().is_some_and(|l| l.tripped()) {
+                    let err = Error::new(
+                        ErrorKind::ConnectionReset,
+                        "fakescan fault plan: stream cut live",
+                    );
+                    return Some((Err(err), (data, off, false, true)));
+                }
+                if off >= abort_after {
+                    let err = Error::new(
+                        ErrorKind::ConnectionReset,
+                        format!("fakescan abort_retrieve after {abort_after} bytes"),
+                    );
+                    return Some((Err(err), (data, off, false, true)));
+                }
+                if !first && !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let end = (off + chunk).min(abort_after);
+                let piece = Bytes::copy_from_slice(&data[off..end]);
+                Some((Ok::<_, Error>(piece), (data, end, false, false)))
             }
-            if off >= abort_after {
-                let err = Error::new(
-                    ErrorKind::ConnectionReset,
-                    format!("fakescan abort_retrieve after {abort_after} bytes"),
-                );
-                return Some((Err(err), (data, off, false, true)));
-            }
-            if !first && !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            let end = (off + chunk).min(abort_after);
-            let piece = Bytes::copy_from_slice(&data[off..end]);
-            Some((Ok::<_, Error>(piece), (data, end, false, false)))
         },
     );
     axum::body::Body::from_stream(stream)
-}
-
-/// Learn-style corrected ticket for `ValidationInfo` when `ValidTicket` is false.
-fn valid_scan_ticket_xml(
-    request_body: &str,
-    check: &crate::state::TicketValidation,
-    dpi: u32,
-    format: &str,
-) -> String {
-    let job_name =
-        crate::state::extract_tag(request_body, "JobName").unwrap_or_else(|| "fakescan".into());
-    let job_user = crate::state::extract_tag(request_body, "JobOriginatingUserName")
-        .unwrap_or_else(|| "fakescan".into());
-    let job_info = crate::state::extract_tag(request_body, "JobInformation");
-    let input_source =
-        crate::state::extract_tag(request_body, "InputSource").unwrap_or_else(|| "Platen".into());
-    let job_info_xml = job_info
-        .as_ref()
-        .map(|s| {
-            format!(
-                "\n            <wscn:JobInformation>{}</wscn:JobInformation>",
-                soap::esc(s)
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        r#"        <wscn:ValidScanTicket>
-          <wscn:JobDescription>
-            <wscn:JobName>{name}</wscn:JobName>
-            <wscn:JobOriginatingUserName>{user}</wscn:JobOriginatingUserName>{info}
-          </wscn:JobDescription>
-          <wscn:DocumentParameters>
-            <wscn:Format>{fmt}</wscn:Format>
-            <wscn:InputSource>{src}</wscn:InputSource>
-            <wscn:MediaSides>
-              <wscn:MediaFront>
-                <wscn:ColorProcessing>{color}</wscn:ColorProcessing>
-                <wscn:Resolution>
-                  <wscn:Width>{dpi}</wscn:Width>
-                  <wscn:Height>{dpi}</wscn:Height>
-                </wscn:Resolution>
-              </wscn:MediaFront>
-            </wscn:MediaSides>
-          </wscn:DocumentParameters>
-        </wscn:ValidScanTicket>"#,
-        name = soap::esc(&job_name),
-        user = soap::esc(&job_user),
-        info = job_info_xml,
-        fmt = soap::esc(format),
-        src = soap::esc(&input_source),
-        color = jfif_wire_color(format, check.color.wsd_token()),
-        dpi = dpi,
-    )
-}
-
-/// ColorProcessing token for JFIF/JPEG/EXIF FinalParams / ValidScanTicket.
-/// Lab: Grayscale8 here → Create Pending with no RetrieveImage; RGB24 accepts.
-fn jfif_wire_color<'a>(format: &str, ticket_color: &'a str) -> &'a str {
-    if format.eq_ignore_ascii_case("jfif")
-        || format.eq_ignore_ascii_case("jpeg")
-        || format.eq_ignore_ascii_case("exif")
-    {
-        "RGB24"
-    } else {
-        ticket_color
-    }
 }
 
 #[cfg(test)]
@@ -1408,15 +1328,8 @@ mod tests {
     <wse:Unsubscribe/>
   </soap:Body>
 </soap:Envelope>"#;
-        let result = dispatch(
-            &world,
-            &soap::eventing_action("Unsubscribe"),
-            SCAN_NS,
-            body,
-            None,
-            "test",
-        )
-        .await;
+        let req = soap::Request::parse(body);
+        let result = dispatch(&world, &req, body, "test", "test-dev").await;
         let Err(err) = result else {
             panic!("mismatched Identifier must fault");
         };
@@ -1453,15 +1366,8 @@ mod tests {
     <wse:Unsubscribe/>
   </soap:Body>
 </soap:Envelope>"#;
-        let result = dispatch(
-            &world,
-            &soap::eventing_action("Unsubscribe"),
-            SCAN_NS,
-            body,
-            None,
-            "test",
-        )
-        .await;
+        let req = soap::Request::parse(body);
+        let result = dispatch(&world, &req, body, "test", "test-dev").await;
         assert!(result.is_ok(), "absent Identifier clears");
         assert!(world.read().await.subscription_id().is_none());
     }

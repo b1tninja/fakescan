@@ -1,11 +1,10 @@
-use std::io::{Cursor, Write};
 use std::time::{Duration, Instant, SystemTime};
 
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::Writer;
 use uuid::Uuid;
 
-pub use super::envelope::Envelope;
+use super::envelope::{absolute_iri, ANONYMOUS_ROLE};
+pub use super::envelope::{Envelope, Finding, ReplyRole};
+use super::xml::{self, Element};
 
 /// Canonical WS-Scan namespace (Windows WSDScan / WDP Scan Service).
 pub const SCAN_NS: &str = "http://schemas.microsoft.com/windows/2006/01/wdp/scan";
@@ -15,6 +14,85 @@ pub const WSA_NS: &str = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
 pub const SOAP_NS: &str = "http://www.w3.org/2003/05/soap-envelope";
 /// WS-Eventing (WSDScan subscribes for scanner status / job events).
 pub const WSE_NS: &str = "http://schemas.xmlsoap.org/ws/2004/08/eventing";
+
+/// Parsed SOAP request (one parse per POST).
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub envelope: Envelope,
+    pub action: String,
+    pub short_action: String,
+    pub scan_ns: &'static str,
+    pub relates: Option<String>,
+    pub rejected: Option<Finding>,
+}
+
+impl Request {
+    pub fn parse(text: &str) -> Self {
+        let envelope = Envelope::parse(text);
+        let rejected = envelope.request_findings().into_iter().find(|f| f.reject);
+        let action = envelope
+            .action_uri(scan_ops(), WSE_NS, SCAN_NS)
+            .unwrap_or_else(|| "(unknown)".into());
+        let short_action = short_action(&action).to_string();
+        let scan_ns = scan_ns_from_envelope(&envelope);
+        let relates = envelope.message_id.clone().filter(|id| absolute_iri(id));
+        Self {
+            envelope,
+            action,
+            short_action,
+            scan_ns,
+            relates,
+            rejected,
+        }
+    }
+
+    pub fn field(&self, local: &str) -> Option<String> {
+        self.envelope
+            .body_tree()
+            .and_then(|body| body.find_text(local))
+            .map(|s| s.to_string())
+            .or_else(|| field_in_fragment(&self.envelope.body, local))
+    }
+
+    pub fn fields(&self, local: &str) -> Vec<String> {
+        self.envelope
+            .body_tree()
+            .map(|body| body.all_text(local))
+            .unwrap_or_default()
+    }
+
+    pub fn expires(&self) -> String {
+        if let Some(tree) = self.envelope.body_tree() {
+            return expires_from_tree(tree);
+        }
+        eventing_expires(&self.envelope.body)
+    }
+
+    pub fn identifier(&self) -> Option<&str> {
+        self.envelope.identifier.as_deref()
+    }
+
+    pub fn filter_dialect(&self) -> Option<String> {
+        if let Some(tree) = self.envelope.body_tree() {
+            return filter_dialect_from_tree(tree);
+        }
+        eventing_filter_dialect(&self.envelope.body)
+    }
+
+    pub fn notify_to(&self) -> Option<String> {
+        if let Some(tree) = self.envelope.body_tree() {
+            return notify_to_from_tree(tree);
+        }
+        notify_to_address(&self.envelope.body)
+    }
+
+    pub fn destination_contexts(&self) -> Vec<String> {
+        if let Some(tree) = self.envelope.body_tree() {
+            return tree.all_text("ClientContext");
+        }
+        scan_destination_contexts(&self.envelope.body)
+    }
+}
 
 pub fn action(body: &str) -> Option<String> {
     Envelope::parse(body).action_uri(scan_ops(), WSE_NS, SCAN_NS)
@@ -40,12 +118,17 @@ pub fn eventing_action(short: &str) -> String {
 /// Echo requested `wse:Expires` when it looks like xs:duration or UTC `xs:dateTime`;
 /// else a long grant.
 pub fn eventing_expires(body: &str) -> String {
-    if let Some(raw) = extract_tagged(body, "Expires") {
+    parse_fragment(body)
+        .map(|el| expires_from_tree(&el))
+        .unwrap_or_else(|| "PT8H".into())
+}
+
+fn expires_from_tree(tree: &Element) -> String {
+    if let Some(raw) = tree.find_text("Expires") {
         let t = raw.trim();
         if t.starts_with('P') || t.starts_with('p') {
             return esc(t);
         }
-        // Absolute UTC dateTime (`…Z` or `…+00:00`) — echoed for Instant deadline enforcement.
         if t.contains('T') && (t.ends_with('Z') || t.ends_with("+00:00")) {
             return esc(t);
         }
@@ -63,35 +146,15 @@ pub fn eventing_identifier(body: &str) -> Option<String> {
 /// DPWS prefers an Action filter; Windows may send scan-specific dialects.
 /// Unknown dialects are ignored (not faulted) — callers log for Brother compare.
 pub fn eventing_filter_dialect(body: &str) -> Option<String> {
-    let lower = body.to_ascii_lowercase();
-    let mut search = 0;
-    while let Some(rel) = lower[search..].find("filter") {
-        let at = search + rel;
-        // Element start: `<…Filter` / `<Filter` — not a closing tag or text.
-        let before = body.as_bytes().get(at.wrapping_sub(1)).copied();
-        if !matches!(before, Some(b'<') | Some(b':')) {
-            search = at + 6;
-            continue;
-        }
-        let after = &body[at..];
-        let tag_end = after.find('>')?;
-        let open_l = after[..tag_end].to_ascii_lowercase();
-        for quote in ['"', '\''] {
-            let key = format!("dialect={quote}");
-            if let Some(d0) = open_l.find(&key) {
-                // Attr name is ASCII — same byte offsets on the original open tag.
-                let rest = &after[d0 + key.len()..tag_end];
-                if let Some(d1) = rest.find(quote) {
-                    let v = rest[..d1].trim();
-                    if !v.is_empty() {
-                        return Some(v.to_string());
-                    }
-                }
-            }
-        }
-        search = at + 6;
-    }
-    None
+    parse_fragment(body).and_then(|el| filter_dialect_from_tree(&el))
+}
+
+fn filter_dialect_from_tree(tree: &Element) -> Option<String> {
+    tree.descendant("Filter")
+        .and_then(|f| f.attr("Dialect"))
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
 }
 
 /// Parse `xs:duration` forms used for `wse:Expires` deadlines.
@@ -268,66 +331,30 @@ fn civil_to_unix_secs(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Optio
 
 /// ClientContext values from `wscn:ScanDestinations` in a Subscribe body (0..n).
 pub fn scan_destination_contexts(body: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut idx = 0;
-    while let Some(rel) = body[idx..].find("ClientContext") {
-        let at = idx + rel;
-        let before = body.as_bytes().get(at.wrapping_sub(1)).copied();
-        let after = body.get(at + "ClientContext".len()..).unwrap_or("");
-        if matches!(before, Some(b'<') | Some(b':')) && after.starts_with('>') {
-            if let Some(end) = after[1..].find('<') {
-                let value = after[1..1 + end].trim();
-                if !value.is_empty() {
-                    out.push(value.to_string());
-                }
-            }
-        }
-        idx = at + "ClientContext".len();
-    }
-    out
+    parse_fragment(body)
+        .map(|el| el.all_text("ClientContext"))
+        .unwrap_or_default()
 }
 
 /// `wsa:Address` inside `wse:NotifyTo` from a Subscribe body (event sink URL).
 pub fn notify_to_address(body: &str) -> Option<String> {
-    let mut idx = 0;
-    while let Some(rel) = body[idx..].find("NotifyTo") {
-        let at = idx + rel;
-        let before = body.as_bytes().get(at.wrapping_sub(1)).copied();
-        let after = body.get(at + "NotifyTo".len()..).unwrap_or("");
-        if !matches!(before, Some(b'<') | Some(b':')) {
-            idx = at + "NotifyTo".len();
-            continue;
-        }
-        let Some(gt) = after.find('>') else {
-            idx = at + "NotifyTo".len();
-            continue;
-        };
-        // Self-closing <wse:NotifyTo … />
-        if after.as_bytes().get(gt.saturating_sub(1)) == Some(&b'/') {
-            idx = at + "NotifyTo".len();
-            continue;
-        }
-        let inner_start = at + "NotifyTo".len() + gt + 1;
-        let rest = body.get(inner_start..)?;
-        let Some(close_rel) = rest.find("NotifyTo>") else {
-            idx = at + "NotifyTo".len();
-            continue;
-        };
-        let region = &rest[..close_rel];
-        if let Some(addr) = extract_tagged(region, "Address") {
-            let t = addr.trim();
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-        idx = inner_start + close_rel + "NotifyTo>".len();
-    }
-    None
+    parse_fragment(body).and_then(|el| notify_to_from_tree(&el))
+}
+
+fn notify_to_from_tree(tree: &Element) -> Option<String> {
+    tree.descendant("NotifyTo")
+        .and_then(|n| n.find_text("Address"))
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
 }
 
 /// Prefer the Action URI's scan namespace; fall back to xmlns on the envelope.
 pub fn scan_ns_from_body(body: &str) -> &'static str {
-    let env = Envelope::parse(body);
+    scan_ns_from_envelope(&Envelope::parse(body))
+}
+
+fn scan_ns_from_envelope(env: &Envelope) -> &'static str {
     let action = env
         .action
         .clone()
@@ -364,24 +391,166 @@ pub fn body_problems(xml: &str) -> Vec<String> {
     super::scan_schema::body_problems(xml)
 }
 
-pub fn extract_tagged(xml: &str, local: &str) -> Option<String> {
-    let mut idx = 0;
-    while let Some(rel) = xml[idx..].find(local) {
-        let at = idx + rel;
-        let before = xml.as_bytes().get(at.wrapping_sub(1)).copied();
-        let after = xml.get(at + local.len()..).unwrap_or("");
-        if matches!(before, Some(b'<') | Some(b':')) && after.starts_with('>') {
-            let value_start = &after[1..];
-            if let Some(end) = value_start.find('<') {
-                let value = value_start[..end].trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-        idx = at + local.len();
+fn field_in_fragment(xml: &str, local: &str) -> Option<String> {
+    let el = parse_fragment(xml)?;
+    el.find_text(local).map(|s| s.to_string())
+}
+
+fn parse_fragment(body: &str) -> Option<Element> {
+    let t = body.trim();
+    if t.is_empty() {
+        return None;
     }
-    None
+    xml::parse(t).or_else(|| xml::parse(&format!("<wrap>{t}</wrap>")))
+}
+
+/// SOAP response envelope builder.
+#[derive(Debug, Clone, Default)]
+pub struct Response {
+    scan_ns: Option<String>,
+    action: Option<String>,
+    message_id: Option<String>,
+    relates_to: Option<String>,
+    to: Option<String>,
+    from_address: Option<String>,
+    eventing_xmlns: bool,
+    body: Vec<Element>,
+}
+
+impl Response {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn scan_ns(mut self, ns: &str) -> Self {
+        self.scan_ns = Some(ns.to_string());
+        self
+    }
+
+    pub fn action(mut self, uri: &str) -> Self {
+        self.action = Some(uri.to_string());
+        self
+    }
+
+    pub fn message_id(mut self, id: impl Into<String>) -> Self {
+        self.message_id = Some(id.into());
+        self
+    }
+
+    pub fn relates_to(mut self, id: impl Into<String>) -> Self {
+        let s = id.into();
+        if !s.is_empty() {
+            self.relates_to = Some(s);
+        }
+        self
+    }
+
+    pub fn to(mut self, uri: impl Into<String>) -> Self {
+        self.to = Some(uri.into());
+        self
+    }
+
+    pub fn from_address(mut self, uri: impl Into<String>) -> Self {
+        self.from_address = Some(uri.into());
+        self
+    }
+
+    pub fn eventing_xmlns(mut self, on: bool) -> Self {
+        self.eventing_xmlns = on;
+        self
+    }
+
+    pub fn body(mut self, el: Element) -> Self {
+        self.body.push(el);
+        self
+    }
+
+    pub fn to_xml(&self) -> String {
+        let scan_ns = self.scan_ns.as_deref().unwrap_or(SCAN_NS);
+        let action = self.action.as_deref().unwrap_or("");
+        let msg = self
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("uuid:{}", Uuid::new_v4()));
+        let mut env = Element::new("soap:Envelope")
+            .with_attr("xmlns:soap", SOAP_NS)
+            .with_attr("xmlns:wsa", WSA_NS)
+            .with_attr("xmlns:wscn", scan_ns)
+            .with_attr("xmlns:sca", scan_ns);
+        if self.eventing_xmlns {
+            env = env.with_attr("xmlns:wse", WSE_NS);
+        }
+        let to = self.to.as_deref().unwrap_or(ANONYMOUS_ROLE);
+        let mut header = Element::new("soap:Header")
+            .with(Element::text_el("wsa:To", to))
+            .with(Element::text_el("wsa:Action", action))
+            .with(Element::text_el("wsa:MessageID", msg));
+        if let Some(from) = &self.from_address {
+            header =
+                header.with(Element::new("wsa:From").with(Element::text_el("wsa:Address", from)));
+        }
+        if let Some(rel) = &self.relates_to {
+            header = header.with(Element::text_el("wsa:RelatesTo", rel));
+        }
+        let mut body = Element::new("soap:Body");
+        for el in &self.body {
+            body = body.with(el.clone());
+        }
+        env = env.with(header).with(body);
+        let xml = format!(r#"<?xml version="1.0" encoding="utf-8"?>{}"#, env.to_xml());
+        let role = if to == ANONYMOUS_ROLE {
+            ReplyRole::Reply
+        } else {
+            ReplyRole::Event
+        };
+        debug_assert!(
+            Envelope::parse(&xml).reply_problems(role).is_empty(),
+            "{xml}"
+        );
+        xml
+    }
+}
+
+/// SOAP 1.2 fault body.
+#[derive(Debug, Clone)]
+pub struct Fault {
+    pub subcode: Option<String>,
+    pub reason: String,
+}
+
+impl Fault {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            subcode: None,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn subcode(mut self, code: impl Into<String>) -> Self {
+        self.subcode = Some(code.into());
+        self
+    }
+
+    pub fn to_xml(&self, relates_to: Option<&str>) -> String {
+        let mut code =
+            Element::new("soap:Code").with(Element::text_el("soap:Value", "soap:Sender"));
+        if let Some(sub) = &self.subcode {
+            code =
+                code.with(Element::new("soap:Subcode").with(Element::text_el("soap:Value", sub)));
+        }
+        let reason = Element::new("soap:Reason").with(
+            Element::new("soap:Text")
+                .with_attr("xml:lang", "en")
+                .with_text(&self.reason),
+        );
+        let fault = Element::new("soap:Fault").with(code).with(reason);
+        Response::new()
+            .scan_ns(SCAN_NS)
+            .action("http://schemas.xmlsoap.org/ws/2004/08/addressing/fault")
+            .relates_to(relates_to.unwrap_or(""))
+            .body(fault)
+            .to_xml()
+    }
 }
 
 pub fn envelope(
@@ -390,101 +559,39 @@ pub fn envelope(
     relates_to: Option<&str>,
     body_xml: &str,
 ) -> String {
-    let msg = Uuid::new_v4();
-    // Both sca: and wscn: bind the scan NS — Windows GSE requests use
-    // sca:ScannerDescription and ElementData/@Name must resolve that prefix.
-    write_envelope(
-        &[("xmlns:wscn", scan_ns), ("xmlns:sca", scan_ns)],
-        action_uri,
-        &format!("uuid:{msg}"),
-        relates_to,
-        body_xml,
-    )
+    let mut resp = Response::new().scan_ns(scan_ns).action(action_uri);
+    if let Some(rel) = relates_to.map(str::trim).filter(|s| !s.is_empty()) {
+        resp = resp.relates_to(rel);
+    }
+    for el in parse_body_children(body_xml) {
+        resp = resp.body(el);
+    }
+    resp.to_xml()
 }
 
-fn write_envelope(
-    extra_xmlns: &[(&str, &str)],
-    action_uri: &str,
-    message_id: &str,
-    relates_to: Option<&str>,
-    body_xml: &str,
-) -> String {
-    let mut writer = Writer::new(Cursor::new(Vec::new()));
-    let _ = writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("utf-8"), None)));
-    let mut env = BytesStart::new("soap:Envelope");
-    env.push_attribute(("xmlns:soap", SOAP_NS));
-    env.push_attribute(("xmlns:wsa", WSA_NS));
-    for (name, value) in extra_xmlns {
-        env.push_attribute((*name, *value));
+pub(crate) fn parse_body_children(body_xml: &str) -> Vec<Element> {
+    let t = body_xml.trim();
+    if t.is_empty() {
+        return Vec::new();
     }
-    let _ = writer.write_event(Event::Start(env));
-    let _ = writer.write_event(Event::Start(BytesStart::new("soap:Header")));
-    write_text_el(
-        &mut writer,
-        "wsa:To",
-        "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous",
-    );
-    write_text_el(&mut writer, "wsa:Action", action_uri);
-    write_text_el(&mut writer, "wsa:MessageID", message_id);
-    if let Some(relates) = relates_to.map(str::trim).filter(|s| !s.is_empty()) {
-        write_text_el(&mut writer, "wsa:RelatesTo", relates);
+    if let Some(el) = xml::parse(t) {
+        return vec![el];
     }
-    let _ = writer.write_event(Event::End(BytesEnd::new("soap:Header")));
-    let _ = writer.write_event(Event::Start(BytesStart::new("soap:Body")));
-    // write_all advances the Cursor. extend_from_slice on the inner Vec does not,
-    // so the closing tags would overwrite the start of the payload.
-    let _ = writer.get_mut().write_all(body_xml.as_bytes());
-    let _ = writer.write_event(Event::End(BytesEnd::new("soap:Body")));
-    let _ = writer.write_event(Event::End(BytesEnd::new("soap:Envelope")));
-    let xml = String::from_utf8(writer.into_inner().into_inner()).unwrap_or_default();
-    debug_assert!(
-        Envelope::parse(&xml)
-            .reply_problems(super::envelope::ReplyRole::Reply)
-            .is_empty(),
-        "{xml}"
-    );
-    xml
-}
-
-fn write_text_el(writer: &mut Writer<Cursor<Vec<u8>>>, name: &str, text: &str) {
-    let _ = writer.write_event(Event::Start(BytesStart::new(name)));
-    let _ = writer.write_event(Event::Text(BytesText::new(text)));
-    let _ = writer.write_event(Event::End(BytesEnd::new(name)));
+    xml::parse(&format!("<body-wrap>{t}</body-wrap>"))
+        .map(|w| w.children)
+        .unwrap_or_default()
 }
 
 pub fn fault_with_code(subcode: Option<&str>, reason: &str, relates_to: Option<&str>) -> String {
-    let reason = esc(reason);
-    let sub = subcode
-        .map(|c| {
-            format!(
-                r#"
-        <soap:Subcode>
-          <soap:Value>{c}</soap:Value>
-        </soap:Subcode>"#
-            )
-        })
-        .unwrap_or_default();
-    let body = format!(
-        r#"    <soap:Fault>
-      <soap:Code>
-        <soap:Value>soap:Sender</soap:Value>{sub}
-      </soap:Code>
-      <soap:Reason><soap:Text xml:lang="en">{reason}</soap:Text></soap:Reason>
-    </soap:Fault>"#
-    );
-    envelope(
-        SCAN_NS,
-        "http://schemas.xmlsoap.org/ws/2004/08/addressing/fault",
-        relates_to,
-        &body,
-    )
+    let mut fault = Fault::new(reason);
+    if let Some(code) = subcode {
+        fault = fault.subcode(code);
+    }
+    fault.to_xml(relates_to)
 }
 
 pub fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    xml::esc(s)
 }
 
 pub fn short_action(action_uri: &str) -> &str {

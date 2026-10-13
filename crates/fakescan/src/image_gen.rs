@@ -11,6 +11,9 @@ pub const LETTER_W_THOU: u32 = 8500;
 /// (not 11000). WIA item extent uses this; CreateScanJob ImageInformation uses
 /// the smaller [`optical_page_pixels`] crop (Brother live behavior).
 pub const LETTER_H_THOU: u32 = 11700;
+/// ADF maximum height in 1/1000 inch (`ADFMaximumSize` / Feeder page height).
+/// Legal-length feeder windows use this; platen validation stays on [`LETTER_H_THOU`].
+pub const ADF_MAX_H_THOU: u32 = 14000;
 
 /// JPEG COM payload prefix so multi-page order is machine-readable without decoding pixels.
 pub const PAGE_MARKER_PREFIX: &[u8] = b"fakescan-page:";
@@ -122,6 +125,8 @@ pub enum PatternId {
     Grid,
     /// Resolution line ladder: coarse-to-fine horizontal and vertical line groups.
     Lines,
+    /// Self-describing diagnostic page (fiducials, wedge, strips, position array, QR); see `diag`.
+    Diag,
 }
 
 impl PatternId {
@@ -144,6 +149,7 @@ impl PatternId {
         PatternId::Align,
         PatternId::Grid,
         PatternId::Lines,
+        PatternId::Diag,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -166,6 +172,7 @@ impl PatternId {
             PatternId::Align => "align",
             PatternId::Grid => "grid",
             PatternId::Lines => "lines",
+            PatternId::Diag => "diag",
         }
     }
 
@@ -189,6 +196,7 @@ impl PatternId {
             "align" => Ok(PatternId::Align),
             "grid" => Ok(PatternId::Grid),
             "lines" => Ok(PatternId::Lines),
+            "diag" => Ok(PatternId::Diag),
             other => bail!(
                 "unknown pattern {other:?}; expected one of: {}",
                 PatternId::ALL
@@ -519,7 +527,13 @@ pub fn encode_pattern_pages_ctx(
             dpi
         }
     };
-    encode_images(wsd_format, &pages, jpeg_q, opts, effective_dpi)
+    let spec = PixelSpec {
+        color,
+        polarity: effects.map(|fx| fx.bilevel_polarity).unwrap_or_default(),
+        jfif_gray: effects.map(|fx| fx.jfif_gray).unwrap_or_default(),
+        jfif_bw: effects.map(|fx| fx.jfif_bw).unwrap_or_default(),
+    };
+    encode_images(wsd_format, &pages, jpeg_q, opts, effective_dpi, spec)
 }
 
 /// Back-compat alias: always JFIF with COM markers.
@@ -611,6 +625,7 @@ pub fn render_pattern_rgb_ctx(
         PatternId::Align => crate::image_charts::draw_align(w, h, page_index),
         PatternId::Grid => crate::image_charts::draw_grid(w, h, page_index),
         PatternId::Lines => crate::image_charts::draw_lines(w, h, page_index),
+        PatternId::Diag => diag::draw_diag(w, h, diag::effective_dpi(dpi)),
     };
     if opts.stamp_banner {
         let banner = pattern_banner(pattern, page_index, effective_side);
@@ -627,7 +642,18 @@ pub fn render_pattern_rgb_ctx(
             Some(peer) => format!("{base}|client={peer}"),
             None => base,
         };
-        if pattern != PatternId::Qr {
+        if pattern == PatternId::Diag {
+            let e = diag::effective_dpi(dpi);
+            stamp_qr(
+                &mut img,
+                &payload,
+                QrPlacement::AnchorBottomRight(
+                    diag::px(diag::QR_ANCHOR_MM.0, e),
+                    diag::px(diag::QR_ANCHOR_MM.1, e),
+                ),
+                diag::px(diag::QR_TARGET_MM, e),
+            )?;
+        } else if pattern != PatternId::Qr {
             stamp_qr(
                 &mut img,
                 &payload,
@@ -828,8 +854,39 @@ pub fn encode_image(
         JPEG_QUALITY_WITH_QR,
         EncodeOpts::WITH_COM,
         dpi,
+        PixelSpec::default(),
     )
 }
+
+/// Bit depth / polarity the stored pixels must have (from the ticket's
+/// ColorProcessing and the `bilevel_polarity` effect). Pages arrive as RGB
+/// buffers already converted by `effects::apply_pipeline` (equal channels for
+/// Gray8 / BW1); this decides how they are *stored*.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PixelSpec {
+    pub color: crate::effects::ColorMode,
+    pub polarity: crate::effects::BilevelPolarity,
+    /// `jfif_gray` effect: whether Gray8 JFIF/EXIF is a real 1-component JPEG.
+    pub jfif_gray: crate::effects::JfifGray,
+    /// `jfif_bw` effect: whether BW1 JFIF/EXIF is a real 1-component JPEG.
+    pub jfif_bw: crate::effects::JfifBw,
+}
+
+impl PixelSpec {
+    /// True when JFIF/EXIF output must be a genuine single-component gray JPEG.
+    pub fn gray_jpeg(&self) -> bool {
+        use crate::effects::{ColorMode, JfifBw};
+        match self.color {
+            ColorMode::Gray8 => self.jfif_gray.gray_jpeg(),
+            ColorMode::Bw1 => self.jfif_bw == JfifBw::Gray8,
+            ColorMode::Rgb24 => false,
+        }
+    }
+}
+
+/// Luma threshold for BW1 packing (below = black). WS-Scan has no Threshold
+/// element in the ticket; Brightness/Contrast effects act before this.
+pub const BW_THRESHOLD: u8 = 128;
 
 /// Encode one or more RGB pages. Multi-page Formats pack every page into one blob.
 fn encode_images(
@@ -838,59 +895,115 @@ fn encode_images(
     jpeg_quality: u8,
     opts: EncodeOpts,
     dpi: u32,
+    spec: PixelSpec,
 ) -> Result<Vec<u8>> {
+    use crate::effects::ColorMode;
     if pages.is_empty() {
         bail!("no pages to encode");
     }
     match wsd_format {
         "jfif" | "jpeg" | "jpg" => {
             let (img, idx, side) = take_single(pages, wsd_format)?;
-            encode_jpeg(img.clone(), idx, side, jpeg_quality, opts, dpi)
+            encode_jpeg_ex(
+                img.clone(),
+                idx,
+                side,
+                jpeg_quality,
+                opts,
+                dpi,
+                spec.gray_jpeg(),
+            )
         }
         "exif" => {
             let (img, idx, side) = take_single(pages, wsd_format)?;
-            encode_exif_jpeg(img.clone(), idx, side, jpeg_quality, opts, dpi)
+            encode_exif_jpeg(
+                img.clone(),
+                idx,
+                side,
+                jpeg_quality,
+                opts,
+                dpi,
+                spec.gray_jpeg(),
+            )
         }
         "dib" | "bmp" => {
             let (img, _, _) = take_single(pages, wsd_format)?;
-            encode_bmp(img.clone())
+            match spec.color {
+                ColorMode::Rgb24 => encode_bmp(img.clone(), dpi),
+                ColorMode::Gray8 => encode_bmp_indexed(img, 8, spec.polarity, dpi),
+                ColorMode::Bw1 => encode_bmp_indexed(img, 1, spec.polarity, dpi),
+            }
         }
         "png" => {
             let (img, _, _) = take_single(pages, wsd_format)?;
-            encode_png(img.clone())
+            match spec.color {
+                ColorMode::Rgb24 => encode_png(img.clone(), dpi),
+                ColorMode::Gray8 => encode_png_gray(img, 8, dpi),
+                ColorMode::Bw1 => encode_png_gray(img, 1, dpi),
+            }
         }
         "tiff-single-uncompressed" | "tiff" | "tif" => {
             let (img, _, _) = take_single(pages, wsd_format)?;
-            encode_tiff(img.clone())
+            match spec.color {
+                ColorMode::Rgb24 => encode_tiff(img.clone(), dpi),
+                _ => encode_tiff_indexed(&[img], spec, dpi),
+            }
         }
         "tiff-single-g4" => {
             let (img, _, _) = take_single(pages, wsd_format)?;
-            encode_tiff_g4(&[img])
+            encode_tiff_g4(&[img], dpi)
         }
         "tiff-single-g3mh" => {
             let (img, _, _) = take_single(pages, wsd_format)?;
-            encode_tiff_g3mh(&[img])
+            encode_tiff_g3mh(&[img], dpi)
         }
-        "tiff-single-jpeg-tn2" => encode_tiff_jpeg_tn2(pages, jpeg_quality, opts, dpi),
+        "tiff-single-jpeg-tn2" => encode_tiff_jpeg_tn2(
+            pages,
+            jpeg_quality,
+            opts,
+            dpi,
+            spec.color != ColorMode::Rgb24,
+        ),
         "tiff-multi-uncompressed" => {
             let imgs: Vec<&RgbImage> = pages.iter().map(|(i, _, _)| i).collect();
-            encode_tiff_multi_uncompressed(&imgs)
+            match spec.color {
+                ColorMode::Rgb24 => encode_tiff_multi_uncompressed(&imgs, dpi),
+                _ => encode_tiff_indexed(&imgs, spec, dpi),
+            }
         }
         "tiff-multi-g4" => {
             let imgs: Vec<&RgbImage> = pages.iter().map(|(i, _, _)| i).collect();
-            encode_tiff_g4(&imgs)
+            encode_tiff_g4(&imgs, dpi)
         }
         "tiff-multi-g3mh" => {
             let imgs: Vec<&RgbImage> = pages.iter().map(|(i, _, _)| i).collect();
-            encode_tiff_g3mh(&imgs)
+            encode_tiff_g3mh(&imgs, dpi)
         }
-        "tiff-multi-jpeg-tn2" => encode_tiff_jpeg_tn2(pages, jpeg_quality, opts, dpi),
+        "tiff-multi-jpeg-tn2" => encode_tiff_jpeg_tn2(
+            pages,
+            jpeg_quality,
+            opts,
+            dpi,
+            spec.color != ColorMode::Rgb24,
+        ),
         "jpeg2k" => {
             let (img, _, _) = take_single(pages, wsd_format)?;
-            encode_jpeg2k(img)
+            encode_jpeg2k(img, spec.color != ColorMode::Rgb24)
         }
-        "pdf-a" | "pdf" => encode_pdf_pages(pages, jpeg_quality, opts, dpi),
-        "xps" => encode_xps_pages(pages, jpeg_quality, opts, dpi),
+        "pdf-a" | "pdf" => encode_pdf_pages(
+            pages,
+            jpeg_quality,
+            opts,
+            dpi,
+            spec.color != ColorMode::Rgb24,
+        ),
+        "xps" => encode_xps_pages(
+            pages,
+            jpeg_quality,
+            opts,
+            dpi,
+            spec.color != ColorMode::Rgb24,
+        ),
         other => bail!("encode not implemented for format {other:?}"),
     }
 }
@@ -919,13 +1032,16 @@ fn restart_interval_mcu_row(width: u32) -> u16 {
 
 /// Encode JFIF toward Brother WSD / wsdscdrv shape: baseline SOF0, 4:2:0,
 /// APP0 units=dpi, DRI = one MCU row. (`image` crate emits 4:4:4 + aspect 1×1.)
-fn encode_jpeg(
+/// Optionally a genuine single-component 8-bit gray scan
+/// (`gray`; luma = the red channel of an already-gray RGB buffer, SOF0 Nf=1).
+fn encode_jpeg_ex(
     img: RgbImage,
     page_index: u32,
     side: Option<PageSide>,
     quality: u8,
     opts: EncodeOpts,
     dpi: u32,
+    gray: bool,
 ) -> Result<Vec<u8>> {
     let q = if quality == 0 {
         JPEG_QUALITY_WITH_QR
@@ -945,17 +1061,27 @@ fn encode_jpeg(
     {
         let mut encoder = jpeg_encoder::Encoder::new(&mut out, q);
         encoder.set_density(jpeg_encoder::PixelDensity::dpi(dens));
-        // Force 4:2:0 even at Q≥90 (crate default would be 4:4:4).
-        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
-        encoder.set_restart_interval(restart_interval_mcu_row(w));
-        encoder
-            .encode(
-                img.as_raw(),
-                w as u16,
-                h as u16,
-                jpeg_encoder::ColorType::Rgb,
-            )
-            .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
+        if gray {
+            // One component: MCU = one 8x8 block, so a restart row is width/8 MCUs.
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+            encoder.set_restart_interval((w.div_ceil(8)).clamp(1, u16::MAX as u32) as u16);
+            let luma: Vec<u8> = img.as_raw().chunks_exact(3).map(|p| p[0]).collect();
+            encoder
+                .encode(&luma, w as u16, h as u16, jpeg_encoder::ColorType::Luma)
+                .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
+        } else {
+            // Force 4:2:0 even at Q≥90 (crate default would be 4:4:4).
+            encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_2_2);
+            encoder.set_restart_interval(restart_interval_mcu_row(w));
+            encoder
+                .encode(
+                    img.as_raw(),
+                    w as u16,
+                    h as u16,
+                    jpeg_encoder::ColorType::Rgb,
+                )
+                .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
+        }
     }
     if out.is_empty() {
         bail!("empty jpeg");
@@ -1147,49 +1273,291 @@ fn remap_jpeg_component_ids_1_based(jpeg: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-fn encode_bmp(img: RgbImage) -> Result<Vec<u8>> {
-    use image::ImageEncoder;
-    let mut out = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut out);
-    let encoder = image::codecs::bmp::BmpEncoder::new(&mut cursor);
-    encoder
-        .write_image(
-            img.as_raw(),
-            img.width(),
-            img.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|e| anyhow::anyhow!("bmp encode: {e}"))?;
-    if out.is_empty() {
-        bail!("empty bmp");
+/// Pixels per metre for a dpi (BMP biXPelsPerMeter / PNG pHYs), rounded to nearest.
+fn pixels_per_metre(dpi: u32) -> u32 {
+    ((u64::from(dpi.max(1)) * 10_000 + 127) / 254) as u32
+}
+
+/// 24-bpp BI_RGB bottom-up BMP (BITMAPINFOHEADER, BGR rows padded to 4) with real density.
+fn encode_bmp(img: RgbImage, dpi: u32) -> Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        bail!("empty image for bmp");
+    }
+    let stride = stride_bytes(w, 24, 4) as usize;
+    let pix_len = stride * h as usize;
+    let off_bits = 14 + 40;
+    let mut out = Vec::with_capacity(off_bits + pix_len);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((off_bits + pix_len) as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&(off_bits as u32).to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(h as i32).to_le_bytes()); // positive = bottom-up
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    out.extend_from_slice(&(pix_len as u32).to_le_bytes());
+    let ppm = pixels_per_metre(dpi);
+    out.extend_from_slice(&ppm.to_le_bytes());
+    out.extend_from_slice(&ppm.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for y in (0..h).rev() {
+        let start = out.len();
+        for x in 0..w {
+            let p = img.get_pixel(x, y).0;
+            out.extend_from_slice(&[p[2], p[1], p[0]]);
+        }
+        out.resize(start + stride, 0);
     }
     Ok(out)
 }
 
-fn encode_png(img: RgbImage) -> Result<Vec<u8>> {
-    use image::ImageEncoder;
+/// BT.601-ish luma used by every gray / bilevel conversion here.
+fn luma8(p: &image::Rgb<u8>) -> u8 {
+    ((u32::from(p[0]) * 77 + u32::from(p[1]) * 150 + u32::from(p[2]) * 29) >> 8) as u8
+}
+
+/// Row stride in bytes for `bits` per pixel, padded to `align` bytes.
+pub fn stride_bytes(width_px: u32, bits: u32, align: u32) -> u32 {
+    let raw = (width_px.saturating_mul(bits)).div_ceil(8);
+    let a = align.max(1);
+    raw.div_ceil(a).saturating_mul(a)
+}
+
+/// Pack `img` top-down. `bits` 8: one luma byte per pixel. `bits` 1: MSB-first,
+/// bit 1 = white when `polarity` is black-is-zero, bit 1 = black otherwise.
+/// Rows are padded with zero bits/bytes to `align`.
+fn pack_rows(
+    img: &RgbImage,
+    bits: u32,
+    polarity: crate::effects::BilevelPolarity,
+    align: u32,
+) -> Vec<u8> {
+    let (w, h) = img.dimensions();
+    let stride = stride_bytes(w, bits, align) as usize;
+    let mut out = vec![0u8; stride * h as usize];
+    let white_is_one = polarity == crate::effects::BilevelPolarity::BlackIsZero;
+    for y in 0..h {
+        let row = &mut out[y as usize * stride..(y as usize + 1) * stride];
+        for x in 0..w {
+            let l = luma8(img.get_pixel(x, y));
+            if bits == 8 {
+                row[x as usize] = l;
+            } else {
+                let white = l >= BW_THRESHOLD;
+                if white == white_is_one {
+                    row[(x / 8) as usize] |= 0x80 >> (x % 8);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Real 1-bpp / 8-bpp BMP (BITMAPINFOHEADER, palette, rows padded to 4). 1-bpp is
+/// top-down (negative biHeight, as the Brother serves it), 8-bpp bottom-up.
+///
+/// 1-bpp palette is `[black, white]` (black-is-zero) or `[white, black]`
+/// (white-is-zero); 8-bpp is a 256-entry gray ramp.
+fn encode_bmp_indexed(
+    img: &RgbImage,
+    bits: u32,
+    polarity: crate::effects::BilevelPolarity,
+    dpi: u32,
+) -> Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        bail!("empty image for bmp");
+    }
+    let palette: Vec<[u8; 4]> = if bits == 1 {
+        let (a, b) = match polarity {
+            crate::effects::BilevelPolarity::BlackIsZero => (0u8, 255u8),
+            crate::effects::BilevelPolarity::WhiteIsZero => (255u8, 0u8),
+        };
+        vec![[a, a, a, 0], [b, b, b, 0]]
+    } else {
+        (0..=255u8).map(|v| [v, v, v, 0]).collect()
+    };
+    let top_down = pack_rows(img, bits, polarity, 4);
+    let stride = stride_bytes(w, bits, 4) as usize;
+    let pix_len = top_down.len();
+    let off_bits = 14 + 40 + palette.len() * 4;
+    let mut out = Vec::with_capacity(off_bits + pix_len);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((off_bits + pix_len) as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&(off_bits as u32).to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    // Brother serves its 1-bpp BMPs top-down (negative biHeight, BI_RGB is legal there);
+    // 8-bpp gray stays bottom-up.
+    let top_down_file = bits == 1;
+    let height_field = if top_down_file { -(h as i32) } else { h as i32 };
+    out.extend_from_slice(&height_field.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&(bits as u16).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    out.extend_from_slice(&(pix_len as u32).to_le_bytes());
+    let ppm = pixels_per_metre(dpi);
+    out.extend_from_slice(&ppm.to_le_bytes());
+    out.extend_from_slice(&ppm.to_le_bytes());
+    out.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+    for e in &palette {
+        out.extend_from_slice(e);
+    }
+    if top_down_file {
+        out.extend_from_slice(&top_down);
+    } else {
+        for row in top_down.chunks(stride).rev() {
+            out.extend_from_slice(row);
+        }
+    }
+    Ok(out)
+}
+
+/// Write a PNG with a `pHYs` chunk (pixels per metre) for `dpi`.
+fn png_write(
+    w: u32,
+    h: u32,
+    color: png::ColorType,
+    depth: png::BitDepth,
+    dpi: u32,
+    data: &[u8],
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut out);
-    let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
-    encoder
-        .write_image(
-            img.as_raw(),
-            img.width(),
-            img.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|e| anyhow::anyhow!("png encode: {e}"))?;
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(color);
+        enc.set_depth(depth);
+        let ppm = pixels_per_metre(dpi);
+        enc.set_pixel_dims(Some(png::PixelDimensions {
+            xppu: ppm,
+            yppu: ppm,
+            unit: png::Unit::Meter,
+        }));
+        let mut wr = enc
+            .write_header()
+            .map_err(|e| anyhow::anyhow!("png header: {e}"))?;
+        wr.write_image_data(data)
+            .map_err(|e| anyhow::anyhow!("png data: {e}"))?;
+    }
     if out.is_empty() {
         bail!("empty png");
     }
     Ok(out)
 }
 
-fn encode_tiff(img: RgbImage) -> Result<Vec<u8>> {
-    encode_tiff_multi_uncompressed(&[&img])
+/// 1-bit or 8-bit grayscale PNG (no polarity: PNG gray 0 is always black).
+fn encode_png_gray(img: &RgbImage, bits: u32, dpi: u32) -> Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    let data = pack_rows(img, bits, crate::effects::BilevelPolarity::BlackIsZero, 1);
+    let depth = if bits == 1 {
+        png::BitDepth::One
+    } else {
+        png::BitDepth::Eight
+    };
+    png_write(w, h, png::ColorType::Grayscale, depth, dpi, &data)
 }
 
-fn encode_tiff_multi_uncompressed(imgs: &[&RgbImage]) -> Result<Vec<u8>> {
+/// Uncompressed 1-bit (Bw1) or 8-bit gray TIFF, one IFD per page, single strip.
+///
+/// 1-bit: `Photometric` = 1 (MinIsBlack) for black-is-zero, 0 (MinIsWhite) for
+/// white-is-zero, with the bits stored to match so the visual is unchanged.
+fn encode_tiff_indexed(imgs: &[&RgbImage], spec: PixelSpec, dpi: u32) -> Result<Vec<u8>> {
+    use crate::effects::{BilevelPolarity, ColorMode};
+    if imgs.is_empty() {
+        bail!("no tiff pages");
+    }
+    let bits: u32 = if spec.color == ColorMode::Bw1 { 1 } else { 8 };
+    let photometric: u32 = match (bits, spec.polarity) {
+        (1, BilevelPolarity::WhiteIsZero) => 0,
+        _ => 1,
+    };
+    let pages: Vec<(Vec<u8>, u32, u32)> = imgs
+        .iter()
+        .map(|img| {
+            let (w, h) = img.dimensions();
+            if w == 0 || h == 0 {
+                bail!("empty image for tiff");
+            }
+            Ok((pack_rows(img, bits, spec.polarity, 1), w, h))
+        })
+        .collect::<Result<_>>()?;
+    let n = pages.len();
+    const ENTRIES: usize = 13;
+    let ifd_bytes = 2 + 12 * ENTRIES + 4;
+    let rat_bytes = 16;
+    let header = 8usize;
+    let mut cursor = header + n * (ifd_bytes + rat_bytes);
+    let mut offsets = Vec::with_capacity(n);
+    for (data, _, _) in &pages {
+        offsets.push(cursor as u32);
+        cursor += data.len();
+    }
+    let mut out = Vec::with_capacity(cursor);
+    out.extend_from_slice(&[b'I', b'I', 42, 0]);
+    out.extend_from_slice(&(header as u32).to_le_bytes());
+    for (i, (data, w, h)) in pages.iter().enumerate() {
+        let rat_at = out.len() + ifd_bytes;
+        let next = if i + 1 < n {
+            (rat_at + rat_bytes) as u32
+        } else {
+            0
+        };
+        out.extend_from_slice(&(ENTRIES as u16).to_le_bytes());
+        let tags: [(u16, u16, u32, u32); ENTRIES] = [
+            (256, 4, 1, *w),
+            (257, 4, 1, *h),
+            (258, 3, 1, bits),
+            (259, 3, 1, 1), // uncompressed
+            (262, 3, 1, photometric),
+            (273, 4, 1, offsets[i]),
+            (274, 3, 1, 1),
+            (277, 3, 1, 1), // SamplesPerPixel
+            (278, 4, 1, *h),
+            (279, 4, 1, data.len() as u32),
+            (282, 5, 1, rat_at as u32),
+            (283, 5, 1, (rat_at + 8) as u32),
+            (296, 3, 1, 2),
+        ];
+        for (tag, typ, count, val) in tags {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&typ.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(&val.to_le_bytes());
+        }
+        out.extend_from_slice(&next.to_le_bytes());
+        for _ in 0..2 {
+            out.extend_from_slice(&dpi.max(1).to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+        }
+    }
+    for (data, _, _) in &pages {
+        out.extend_from_slice(data);
+    }
+    Ok(out)
+}
+
+fn encode_png(img: RgbImage, dpi: u32) -> Result<Vec<u8>> {
+    png_write(
+        img.width(),
+        img.height(),
+        png::ColorType::Rgb,
+        png::BitDepth::Eight,
+        dpi,
+        img.as_raw(),
+    )
+}
+
+fn encode_tiff(img: RgbImage, dpi: u32) -> Result<Vec<u8>> {
+    encode_tiff_multi_uncompressed(&[&img], dpi)
+}
+
+fn encode_tiff_multi_uncompressed(imgs: &[&RgbImage], dpi: u32) -> Result<Vec<u8>> {
     use std::io::Cursor;
     let mut out = Vec::new();
     {
@@ -1197,12 +1565,18 @@ fn encode_tiff_multi_uncompressed(imgs: &[&RgbImage]) -> Result<Vec<u8>> {
         let mut enc = tiff::encoder::TiffEncoder::new(&mut cursor)
             .map_err(|e| anyhow::anyhow!("tiff: {e}"))?;
         for img in imgs {
-            enc.write_image::<tiff::encoder::colortype::RGB8>(
-                img.width(),
-                img.height(),
-                img.as_raw(),
-            )
-            .map_err(|e| anyhow::anyhow!("tiff page: {e}"))?;
+            let mut page = enc
+                .new_image::<tiff::encoder::colortype::RGB8>(img.width(), img.height())
+                .map_err(|e| anyhow::anyhow!("tiff page: {e}"))?;
+            page.resolution(
+                tiff::tags::ResolutionUnit::Inch,
+                tiff::encoder::Rational {
+                    n: dpi.max(1),
+                    d: 1,
+                },
+            );
+            page.write_data(img.as_raw())
+                .map_err(|e| anyhow::anyhow!("tiff page: {e}"))?;
         }
     }
     if out.is_empty() {
@@ -1212,15 +1586,11 @@ fn encode_tiff_multi_uncompressed(imgs: &[&RgbImage]) -> Result<Vec<u8>> {
 }
 
 /// CCITT Group 4 (WSD `tiff-*-g4`). Threshold RGB → bilevel, wrap with [`fax::tiff`].
-fn encode_tiff_g4(imgs: &[&RgbImage]) -> Result<Vec<u8>> {
+fn encode_tiff_g4(imgs: &[&RgbImage], dpi: u32) -> Result<Vec<u8>> {
     if imgs.is_empty() {
         bail!("empty g4 tiff");
     }
-    if imgs.len() == 1 {
-        let g4 = encode_g4_strip(imgs[0])?;
-        return Ok(fax::tiff::wrap(&g4, imgs[0].width(), imgs[0].height()));
-    }
-    // Multi-IFD G4: chain IFDs like fax::tiff::wrap but with next pointers.
+    // Own IFD writer (not `fax::tiff::wrap`) so XResolution/YResolution carry the real dpi.
     wrap_g4_multipage(
         &imgs
             .iter()
@@ -1229,6 +1599,7 @@ fn encode_tiff_g4(imgs: &[&RgbImage]) -> Result<Vec<u8>> {
                 Ok((data, img.width(), img.height()))
             })
             .collect::<Result<Vec<_>>>()?,
+        dpi,
     )
 }
 
@@ -1262,7 +1633,7 @@ fn encode_g4_strip(img: &RgbImage) -> Result<Vec<u8>> {
 }
 
 /// CCITT T.4 Group 3 1-D Modified Huffman (WSD `tiff-single-g3mh`).
-fn encode_tiff_g3mh(imgs: &[&RgbImage]) -> Result<Vec<u8>> {
+fn encode_tiff_g3mh(imgs: &[&RgbImage], dpi: u32) -> Result<Vec<u8>> {
     if imgs.is_empty() {
         bail!("empty g3mh tiff");
     }
@@ -1277,6 +1648,7 @@ fn encode_tiff_g3mh(imgs: &[&RgbImage]) -> Result<Vec<u8>> {
         &pages,
         /* compression */ 3,
         /* t4_options */ Some(0),
+        dpi,
     )
 }
 
@@ -1353,31 +1725,39 @@ fn encode_g3mh_strip(img: &RgbImage) -> Result<Vec<u8>> {
 }
 
 /// TIFF JPEG Technical Note #2 (`Compression=7`): each strip is a full JFIF stream.
+///
+/// Colour pages are 4:2:0 YCbCr JPEG, so the IFD says `Photometric=YCbCr` (6) with
+/// `YCbCrSubSampling=[2,2]` (TN2 forbids RGB photometric around a YCbCr stream; libtiff
+/// rejects it and WIC decodes wrong colours). Gray / bilevel pages (`gray`) are a one-component
+/// stream with `Photometric=BlackIsZero`, `SamplesPerPixel=1`.
 fn encode_tiff_jpeg_tn2(
     pages: &[(RgbImage, u32, Option<PageSide>)],
     jpeg_quality: u8,
     opts: EncodeOpts,
     dpi: u32,
+    gray: bool,
 ) -> Result<Vec<u8>> {
     let mut strips = Vec::with_capacity(pages.len());
     for (img, idx, side) in pages {
-        let jpeg = encode_jpeg(img.clone(), *idx, *side, jpeg_quality, opts, dpi)?;
+        let jpeg = encode_jpeg_ex(img.clone(), *idx, *side, jpeg_quality, opts, dpi, gray)?;
         strips.push((jpeg, img.width(), img.height()));
     }
-    wrap_jpeg_tiff_tn2(&strips)
+    wrap_jpeg_tiff_tn2(&strips, dpi, gray)
 }
 
-fn wrap_jpeg_tiff_tn2(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
+fn wrap_jpeg_tiff_tn2(pages: &[(Vec<u8>, u32, u32)], dpi: u32, gray: bool) -> Result<Vec<u8>> {
     if pages.is_empty() {
         bail!("empty jpeg-tn2 tiff");
     }
-    // Per-page IFD; BitsPerSample [8,8,8] stored after IFD; Photometric=RGB (2); Compression=7.
+    // Per-IFD out-of-line block: [BitsPerSample 3xSHORT (colour only)] + X/Y resolution rationals.
     let n = pages.len();
-    let entries_per = 12usize;
+    let entries_per = if gray { 14usize } else { 16usize };
     let ifd_bytes = 2 + 12 * entries_per + 4;
-    let bps_bytes = 6; // three SHORTs
+    let bps_bytes = if gray { 0 } else { 6 };
+    let rat_bytes = 16;
+    let block = bps_bytes + rat_bytes;
     let header = 8usize;
-    let ifd_block = n * (ifd_bytes + bps_bytes);
+    let ifd_block = n * (ifd_bytes + block);
     let mut strip_offsets = Vec::with_capacity(n);
     let mut cursor = header + ifd_block;
     for (data, _, _) in pages {
@@ -1394,26 +1774,38 @@ fn wrap_jpeg_tiff_tn2(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
         let ifd_at = out.len();
         assert_eq!(ifd_at, next_ifd as usize);
         let bps_at = ifd_at + ifd_bytes;
+        let rat_at = bps_at + bps_bytes;
         let next = if i + 1 < n {
-            (bps_at + bps_bytes) as u32
+            (rat_at + rat_bytes) as u32
         } else {
             0
         };
         out.extend_from_slice(&(entries_per as u16).to_le_bytes());
-        let tags: [(u16, u16, u32, u32); 12] = [
-            (256, 4, 1, *width),           // ImageWidth
-            (257, 4, 1, *height),          // ImageLength
-            (258, 3, 3, bps_at as u32),    // BitsPerSample → [8,8,8]
-            (259, 3, 1, 7),                // Compression JPEG TN2
-            (262, 3, 1, 2),                // Photometric RGB
-            (273, 4, 1, strip_offsets[i]), // StripOffsets
-            (274, 3, 1, 1),                // Orientation
-            (277, 3, 1, 3),                // SamplesPerPixel
-            (278, 4, 1, *height),          // RowsPerStrip
-            (279, 4, 1, data.len() as u32),
-            (284, 3, 1, 1), // PlanarConfiguration chunky
-            (296, 3, 1, 2), // ResolutionUnit inch
+        let mut tags: Vec<(u16, u16, u32, u32)> = vec![
+            (256, 4, 1, *width),  // ImageWidth
+            (257, 4, 1, *height), // ImageLength
+            if gray {
+                (258, 3, 1, 8) // BitsPerSample 8 (inline)
+            } else {
+                (258, 3, 3, bps_at as u32) // BitsPerSample -> [8,8,8]
+            },
+            (259, 3, 1, 7),                        // Compression JPEG TN2
+            (262, 3, 1, if gray { 1 } else { 6 }), // BlackIsZero / YCbCr
+            (273, 4, 1, strip_offsets[i]),         // StripOffsets
+            (274, 3, 1, 1),                        // Orientation
+            (277, 3, 1, if gray { 1 } else { 3 }), // SamplesPerPixel
+            (278, 4, 1, *height),                  // RowsPerStrip
+            (279, 4, 1, data.len() as u32),        // StripByteCounts
+            (282, 5, 1, rat_at as u32),            // XResolution
+            (283, 5, 1, (rat_at + 8) as u32),      // YResolution
+            (284, 3, 1, 1),                        // PlanarConfiguration chunky
+            (296, 3, 1, 2),                        // ResolutionUnit inch
         ];
+        if !gray {
+            tags.push((530, 3, 2, 2 | (2 << 16))); // YCbCrSubSampling [2,2] = the 4:2:0 stream
+            tags.push((531, 3, 1, 1)); // YCbCrPositioning centred (JPEG default)
+        }
+        debug_assert_eq!(tags.len(), entries_per);
         for (tag, typ, count, val) in tags {
             out.extend_from_slice(&tag.to_le_bytes());
             out.extend_from_slice(&typ.to_le_bytes());
@@ -1421,8 +1813,14 @@ fn wrap_jpeg_tiff_tn2(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
             out.extend_from_slice(&val.to_le_bytes());
         }
         out.extend_from_slice(&next.to_le_bytes());
-        for _ in 0..3 {
-            out.extend_from_slice(&8u16.to_le_bytes());
+        if !gray {
+            for _ in 0..3 {
+                out.extend_from_slice(&8u16.to_le_bytes());
+            }
+        }
+        for _ in 0..2 {
+            out.extend_from_slice(&dpi.max(1).to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
         }
         next_ifd = next;
     }
@@ -1432,16 +1830,21 @@ fn wrap_jpeg_tiff_tn2(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn encode_jpeg2k(img: &RgbImage) -> Result<Vec<u8>> {
+/// JP2; `gray` encodes one greyscale component (luma = red of the already-gray buffer).
+fn encode_jpeg2k(img: &RgbImage, gray: bool) -> Result<Vec<u8>> {
     use openjp2::{ColorSpace, EncodeOptions, Encoder, Format, Image};
 
-    let image =
+    let image = if gray {
+        let luma: Vec<u8> = img.as_raw().chunks_exact(3).map(|p| p[0]).collect();
+        Image::from_interleaved_u8(img.width(), img.height(), ColorSpace::Greyscale, 1, &luma)
+    } else {
         Image::from_interleaved_u8(img.width(), img.height(), ColorSpace::Srgb, 3, img.as_raw())
-            .map_err(|e| anyhow::anyhow!("jpeg2k image: {e:?}"))?;
+    }
+    .map_err(|e| anyhow::anyhow!("jpeg2k image: {e:?}"))?;
     let opts = EncodeOptions {
         format: Format::Jp2,
         irreversible: true,
-        use_mct: true,
+        use_mct: !gray,
         rates: vec![20.0],
         ..EncodeOptions::default()
     };
@@ -1449,14 +1852,15 @@ fn encode_jpeg2k(img: &RgbImage) -> Result<Vec<u8>> {
 }
 
 /// Multi-page G4 TIFF (II* little-endian), Photometric WhiteIsZero, Compression=4.
-fn wrap_g4_multipage(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
-    wrap_bilevel_tiff_multipage(pages, 4, None)
+fn wrap_g4_multipage(pages: &[(Vec<u8>, u32, u32)], dpi: u32) -> Result<Vec<u8>> {
+    wrap_bilevel_tiff_multipage(pages, 4, None, dpi)
 }
 
 fn wrap_bilevel_tiff_multipage(
     pages: &[(Vec<u8>, u32, u32)],
     compression: u32,
     t4_options: Option<u32>,
+    dpi: u32,
 ) -> Result<Vec<u8>> {
     if pages.is_empty() {
         bail!("no bilevel tiff pages");
@@ -1515,10 +1919,10 @@ fn wrap_bilevel_tiff_multipage(
             out.extend_from_slice(&val.to_le_bytes());
         }
         out.extend_from_slice(&next.to_le_bytes());
-        out.extend_from_slice(&200u32.to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&200u32.to_le_bytes());
-        out.extend_from_slice(&1u32.to_le_bytes());
+        for _ in 0..2 {
+            out.extend_from_slice(&dpi.max(1).to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+        }
         next_ifd = next;
     }
     for (data, _, _) in pages {
@@ -1535,8 +1939,9 @@ fn encode_exif_jpeg(
     jpeg_quality: u8,
     opts: EncodeOpts,
     dpi: u32,
+    gray: bool,
 ) -> Result<Vec<u8>> {
-    let mut jpeg = encode_jpeg(img, page_index, side, jpeg_quality, opts, dpi)?;
+    let mut jpeg = encode_jpeg_ex(img, page_index, side, jpeg_quality, opts, dpi, gray)?;
     inject_exif_app1(&mut jpeg)?;
     Ok(jpeg)
 }
@@ -1573,18 +1978,27 @@ fn encode_pdf_pages(
     jpeg_quality: u8,
     opts: EncodeOpts,
     dpi: u32,
+    gray: bool,
 ) -> Result<Vec<u8>> {
     let mut jpegs = Vec::with_capacity(pages.len());
     for (img, idx, side) in pages {
         let w = img.width();
         let h = img.height();
-        let jpeg = encode_jpeg(img.clone(), *idx, *side, jpeg_quality, opts, dpi)?;
+        let jpeg = encode_jpeg_ex(img.clone(), *idx, *side, jpeg_quality, opts, dpi, gray)?;
         jpegs.push((jpeg, w, h));
     }
-    wrap_jpegs_as_pdf(&jpegs)
+    wrap_jpegs_as_pdf(&jpegs, dpi, gray)
 }
 
-fn wrap_jpegs_as_pdf(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
+/// `value` rounded to 2 decimals with trailing zeros trimmed (`612`, `841.89`).
+fn fmt_units(value: f64) -> String {
+    let t = format!("{value:.2}");
+    t.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// One DCT-coded JPEG image per page. MediaBox is the physical page in points
+/// (`pixels * 72 / dpi`); `gray` pages use `/DeviceGray` (one-component stream).
+fn wrap_jpegs_as_pdf(pages: &[(Vec<u8>, u32, u32)], dpi: u32, gray: bool) -> Result<Vec<u8>> {
     if pages.is_empty() {
         bail!("empty pdf");
     }
@@ -1620,7 +2034,10 @@ fn wrap_jpegs_as_pdf(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
         format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>").as_bytes(),
     );
 
+    let cs = if gray { "/DeviceGray" } else { "/DeviceRGB" };
     for (i, (jpeg, width, height)) in pages.iter().enumerate() {
+        let pt_w = fmt_units(f64::from(*width) * 72.0 / f64::from(dpi.max(1)));
+        let pt_h = fmt_units(f64::from(*height) * 72.0 / f64::from(dpi.max(1)));
         let page_obj = 3 + 3 * i;
         let content_obj = page_obj + 1;
         let image_obj = page_obj + 2;
@@ -1629,12 +2046,12 @@ fn wrap_jpegs_as_pdf(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
             &mut offsets,
             page_obj,
             format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] \
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pt_w} {pt_h}] \
                  /Contents {content_obj} 0 R /Resources << /XObject << /Im0 {image_obj} 0 R >> >> >>"
             )
             .as_bytes(),
         );
-        let content = format!("q\n{width} 0 0 {height} 0 0 cm\n/Im0 Do\nQ\n");
+        let content = format!("q\n{pt_w} 0 0 {pt_h} 0 0 cm\n/Im0 Do\nQ\n");
         offsets[content_obj] = body.len();
         body.extend_from_slice(format!("{content_obj} 0 obj\n").as_bytes());
         body.extend_from_slice(format!("<< /Length {} >>\nstream\n", content.len()).as_bytes());
@@ -1646,7 +2063,7 @@ fn wrap_jpegs_as_pdf(pages: &[(Vec<u8>, u32, u32)]) -> Result<Vec<u8>> {
         body.extend_from_slice(
             format!(
                 "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
-                 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode \
+                 /ColorSpace {cs} /BitsPerComponent 8 /Filter /DCTDecode \
                  /Length {} >>\nstream\n",
                 jpeg.len()
             )
@@ -1678,6 +2095,7 @@ fn encode_xps_pages(
     jpeg_quality: u8,
     opts: EncodeOpts,
     dpi: u32,
+    gray: bool,
 ) -> Result<Vec<u8>> {
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
@@ -1685,13 +2103,14 @@ fn encode_xps_pages(
 
     let mut jpegs = Vec::with_capacity(pages.len());
     for (img, idx, side) in pages {
-        jpegs.push(encode_jpeg(
+        jpegs.push(encode_jpeg_ex(
             img.clone(),
             *idx,
             *side,
             jpeg_quality,
             opts,
             dpi,
+            gray,
         )?);
     }
     let n = jpegs.len();
@@ -1764,8 +2183,11 @@ fn encode_xps_pages(
 
         for (i, ((img, _, _), jpeg)) in pages.iter().zip(jpegs.iter()).enumerate() {
             let page = i + 1;
-            let w = img.width();
-            let h = img.height();
+            // XPS user space is 1/96 inch. An image's natural size is pixels * 96 / dpi, so the
+            // page, the geometry, Viewbox and Viewport are all that physical size (the JPEG
+            // carries the same dpi in APP0).
+            let w = fmt_units(f64::from(img.width()) * 96.0 / f64::from(dpi.max(1)));
+            let h = fmt_units(f64::from(img.height()) * 96.0 / f64::from(dpi.max(1)));
             zip.start_file(format!("Documents/1/Pages/{page}.fpage"), opts)?;
             let fpage = format!(
                 r#"<?xml version="1.0" encoding="utf-8"?>
@@ -1839,10 +2261,10 @@ pub fn format_is_compressed(wsd_format: &str) -> bool {
 ///
 /// Decoded-bitmap stride for ImageInformation / ValidateScanTicket.
 ///
-/// Brother live **jfif** always reports `width×3` (RGB stride), even when the
-/// ticket asks `Grayscale8`. Lab (2026-10-12): Gray8 + `BPL=width` → CreateScanJob
-/// Pending then no RetrieveImage (Automation and pdfcraft). Gray8 + `BPL=width×3`
-/// matches RGB24 accept. Uncompressed formats keep the real color stride.
+/// Brother live **jfif** reports `width×3` (RGB stride) for RGB24. For Grayscale8
+/// the default is now the consistent `BPL=width` (live proof 2026-10-12: Windows
+/// accepts Gray8 + `BPL=width` and Gray8 + `width×3`, but rejects the old RGB24
+/// coercion; see `JfifGray`). Uncompressed formats keep the real color stride.
 ///
 /// When `ms_strict` is true (profile `bytes_per_line_ms`), compressed formats
 /// return 0 per MS remarks; default `false` keeps the Brother stride above.
@@ -1852,6 +2274,27 @@ pub fn bytes_per_line(
     color: crate::effects::ColorMode,
     ms_strict: bool,
 ) -> u32 {
+    bytes_per_line_fx(
+        wsd_format,
+        width_px,
+        color,
+        ms_strict,
+        crate::effects::JfifGray::default(),
+        crate::effects::JfifBw::default(),
+    )
+}
+
+/// [`bytes_per_line`] honouring the `jfif_gray` effect: in `gray8` mode (default) a
+/// Gray8 JFIF/EXIF reports the true gray stride (`width`); the legacy `rgb24`,
+/// `gray8_rgb_stride` and `gray8_tiff` modes keep the `width×3` stride.
+pub fn bytes_per_line_fx(
+    wsd_format: &str,
+    width_px: u32,
+    color: crate::effects::ColorMode,
+    ms_strict: bool,
+    jfif_gray: crate::effects::JfifGray,
+    jfif_bw: crate::effects::JfifBw,
+) -> u32 {
     if ms_strict && format_is_compressed(wsd_format) {
         return 0;
     }
@@ -1860,19 +2303,36 @@ pub fn bytes_per_line(
         "jfif" | "jpeg" | "exif"
     );
     if compressed_jfif {
+        if color == crate::effects::ColorMode::Gray8 && jfif_gray == crate::effects::JfifGray::Gray8
+        {
+            return width_px;
+        }
+        if color == crate::effects::ColorMode::Bw1 && jfif_bw == crate::effects::JfifBw::Gray8 {
+            return width_px;
+        }
+        // RGB JFIF/EXIF (and the legacy gray modes) use the RGB stride, see jfif_wire_color.
         return width_px.saturating_mul(3);
     }
-    match color {
-        crate::effects::ColorMode::Rgb24 => width_px.saturating_mul(3),
-        crate::effects::ColorMode::Gray8 => width_px,
-        crate::effects::ColorMode::Bw1 => width_px.saturating_add(7) / 8,
-    }
+    // BMP/DIB rows are DWORD-aligned; other uncompressed/decoded strides are byte-packed.
+    let align = if matches!(wsd_format.to_ascii_lowercase().as_str(), "dib" | "bmp") {
+        4
+    } else {
+        1
+    };
+    let bits = match color {
+        crate::effects::ColorMode::Rgb24 => 24,
+        crate::effects::ColorMode::Gray8 => 8,
+        crate::effects::ColorMode::Bw1 => 1,
+    };
+    stride_bytes(width_px, bits, align)
 }
 
 #[derive(Clone, Copy)]
 enum QrPlacement {
     BottomRight,
     Center,
+    /// Bottom-right corner of the QR at this pixel (x, y).
+    AnchorBottomRight(u32, u32),
 }
 
 fn qr_corner_size(w: u32, h: u32) -> u32 {
@@ -1907,6 +2367,7 @@ fn stamp_qr(img: &mut RgbImage, payload: &str, place: QrPlacement, target: u32) 
             (w - qw - margin, h - qh - margin)
         }
         QrPlacement::Center => ((w - qw) / 2, (h - qh) / 2),
+        QrPlacement::AnchorBottomRight(ax, ay) => (ax.saturating_sub(qw), ay.saturating_sub(qh)),
     };
     for y in 0..qh {
         for x in 0..qw {
@@ -2714,6 +3175,824 @@ pub fn read_side_marker(jpeg: &[u8]) -> Option<PageSide> {
     found
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// `diag` pattern: self-describing page for blind image-handling analysis.
+// Layout is in millimetres (top-left anchored, px = round(mm * dpi / 25.4)).
+// See docs/patterns.md ("diag") and pdfcraft-fakescan docs/pattern-analyzer.md.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Layout, sequences and renderer for [`PatternId::Diag`].
+#[allow(clippy::needless_range_loop)]
+pub mod diag {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// Usable layout width / height in mm (the smallest optical page is 816x1144 px @100).
+    pub const LAYOUT_W_MM: f64 = 206.0;
+    pub const LAYOUT_H_MM: f64 = 288.0;
+    /// Everything above this y is covered by the tester banner.
+    pub const BANNER_RESERVE_MM: f64 = 12.0;
+
+    /// Axis-aligned rectangle in mm: `(x0, y0, x1, y1)`.
+    pub type RectMm = (f64, f64, f64, f64);
+
+    // Fiducials: 8x8 unit cells of 2 mm = 16 mm squares.
+    pub const FID_UNIT_MM: f64 = 2.0;
+    pub const FID_UNITS: u32 = 8;
+    pub const FID_TL: (f64, f64) = (4.0, 14.0);
+    pub const FID_TR: (f64, f64) = (186.0, 14.0);
+    pub const FID_BL: (f64, f64) = (4.0, 268.0);
+    pub const FID_BR: (f64, f64) = (186.0, 268.0);
+    /// Bar counts at TL, TR, BL, BR.
+    pub const FID_BARS: [u32; 4] = [1, 2, 3, 4];
+
+    // Correlation strips. Chip +1 = ink (black), -1 = paper (white).
+    pub const BARKER13: [i8; 13] = [1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1];
+    pub const BARKER_CHIP_MM: f64 = 4.0;
+    pub const BARKER_REPEATS: usize = 3;
+    pub const MSEQ_CHIP_MM: f64 = 2.5;
+    pub const MSEQ_LEN: usize = 63;
+    /// Horizontal strips (x0 mm, y0 mm); height 8 mm each.
+    pub const HSTRIP_BARKER: (f64, f64) = (24.0, 14.0);
+    pub const HSTRIP_MSEQ: (f64, f64) = (24.0, 24.0);
+    pub const STRIP_THICK_MM: f64 = 8.0;
+    /// Vertical strips (x0 mm, y0 mm); width 8 mm each, run downwards.
+    pub const VSTRIP_BARKER: (f64, f64) = (4.0, 34.0);
+    pub const VSTRIP_MSEQ: (f64, f64) = (13.0, 34.0);
+
+    // Polarity wedge band: black outline 1 mm, [black ref 13][16 steps x 7][white ref 13].
+    pub const WEDGE_BAND: RectMm = (26.0, 34.0, 166.0, 50.0);
+    pub const WEDGE_OUTLINE_MM: f64 = 1.0;
+    pub const WEDGE_REF_MM: f64 = 13.0;
+    pub const WEDGE_STEPS: usize = 16;
+    pub const WEDGE_STEP_MM: f64 = 7.0;
+    /// Wedge step k has gray level `17 * k` (0 = ink black ... 255 = paper white).
+    pub fn wedge_level(k: usize) -> u8 {
+        (17 * k) as u8
+    }
+
+    // Colour patches R,G,B,C,M,Y (20 x 12 mm, adjacent).
+    pub const PATCHES_Y: (f64, f64) = (52.0, 64.0);
+    pub const PATCHES_X0: f64 = 26.0;
+    pub const PATCH_W_MM: f64 = 20.0;
+    pub const PATCH_COLORS: [[u8; 3]; 6] = [
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [0, 255, 255],
+        [255, 0, 255],
+        [255, 255, 0],
+    ];
+
+    // Bit-order comb: pixel-exact. Byte-aligned start, 8-pixel motif (MSB = leftmost).
+    pub const COMB_Y_MM: f64 = 67.0;
+    pub const COMB_X0_MM: f64 = 26.0;
+    pub const COMB_MOTIF: u8 = 0b1101_0000;
+    pub const COMB_ROWS_PX: u32 = 8;
+    pub const COMB_WIDTH_MM: f64 = 130.0;
+    /// Extra pixels beyond a whole number of motifs (width not divisible by 8).
+    pub const COMB_TAIL_PX: u32 = 5;
+
+    // Vertical 1-px bars (pixel-exact, Golomb-ruler spacing x 4 px).
+    pub const BARS_Y_MM: (f64, f64) = (76.0, 96.0);
+    pub const BARS_X0_MM: f64 = 26.0;
+    pub const BARS_GOLOMB: [u32; 10] = [0, 1, 6, 10, 23, 26, 34, 41, 53, 55];
+    pub const BARS_PITCH_PX: u32 = 4;
+
+    // Raw (non-ECC) bit strip: 128 chips of 1 mm: 13 Barker preamble + 115 PRBS.
+    pub const RAW_Y_MM: (f64, f64) = (98.0, 105.0);
+    pub const RAW_X0_MM: f64 = 26.0;
+    pub const RAW_CHIP_MM: f64 = 1.0;
+    pub const RAW_BITS: usize = 128;
+    pub const RAW_SEED: u32 = 0xD1A6_0001;
+
+    // 2-D position array: 36 x 36 cells of 2 mm.
+    pub const POS_X0_MM: f64 = 26.0;
+    pub const POS_Y0_MM: f64 = 108.0;
+    pub const POS_CELL_MM: f64 = 2.0;
+    pub const POS_N: usize = 36;
+    pub const POS_SEED: u32 = 0xA55A_1234;
+
+    // Zone plate: 40 mm square, centre (128, 128), f(r) = ZONE_FMAX * r / ZONE_R cycles/mm.
+    pub const ZONE_BOX: RectMm = (108.0, 108.0, 148.0, 148.0);
+    pub const ZONE_CENTER_MM: (f64, f64) = (128.0, 128.0);
+    pub const ZONE_R_MM: f64 = 20.0;
+    pub const ZONE_FMAX: f64 = 1.2;
+
+    // QR: bottom-right corner of the QR (incl. quiet zone) sits at this point.
+    pub const QR_ANCHOR_MM: (f64, f64) = (184.0, 264.0);
+    pub const QR_TARGET_MM: f64 = 44.0;
+
+    /// Effective render dpi for a requested dpi (mirrors the 4 MP cap in [`job_page_pixels`]).
+    pub fn effective_dpi(dpi: u32) -> u32 {
+        let (w, h) = optical_page_pixels(dpi);
+        if w.saturating_mul(h) > MAX_PIXELS {
+            150
+        } else {
+            dpi
+        }
+    }
+
+    /// mm -> px at `dpi`.
+    pub fn px(mm: f64, dpi: u32) -> u32 {
+        (mm * dpi as f64 / 25.4).round().max(0.0) as u32
+    }
+
+    /// Periodic m-sequence of length 63 as +/-1 chips (+1 = ink).
+    /// `vertical == false`: x^6+x+1; `true`: x^6+x^5+x^2+x+1.
+    pub fn mseq63(vertical: bool) -> [i8; MSEQ_LEN] {
+        let mut a = [0u8; MSEQ_LEN + 6];
+        a[0] = 1;
+        for n in 0..MSEQ_LEN {
+            a[n + 6] = if vertical {
+                a[n + 5] ^ a[n + 2] ^ a[n + 1] ^ a[n]
+            } else {
+                a[n + 1] ^ a[n]
+            };
+        }
+        let mut out = [0i8; MSEQ_LEN];
+        for n in 0..MSEQ_LEN {
+            out[n] = if a[n] == 1 { 1 } else { -1 };
+        }
+        out
+    }
+
+    struct XorShift32(u32);
+    impl XorShift32 {
+        fn next(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+        fn bit(&mut self) -> u8 {
+            (self.next() >> 31) as u8
+        }
+    }
+
+    /// The 128 raw strip bits (1 = ink): Barker-13 preamble then xorshift32 MSBs.
+    pub fn raw_bits() -> [u8; RAW_BITS] {
+        let mut out = [0u8; RAW_BITS];
+        let mut rng = XorShift32(RAW_SEED);
+        for (i, o) in out.iter_mut().enumerate() {
+            let r = rng.bit();
+            *o = if i < 13 { (BARKER13[i] == 1) as u8 } else { r };
+        }
+        out
+    }
+
+    /// 36x36 cell array (1 = ink) in which every 4x4 window is unique.
+    pub fn position_array() -> &'static [[u8; POS_N]; POS_N] {
+        static ARR: OnceLock<[[u8; POS_N]; POS_N]> = OnceLock::new();
+        ARR.get_or_init(build_position_array)
+    }
+
+    fn window_at(bits: &[u8], r: usize, c: usize) -> usize {
+        // window whose bottom-right cell is (r, c)
+        let mut w = 0usize;
+        for dr in 0..4 {
+            for dc in 0..4 {
+                w = (w << 1) | bits[(r - 3 + dr) * POS_N + (c - 3 + dc)] as usize;
+            }
+        }
+        w
+    }
+
+    fn build_position_array() -> [[u8; POS_N]; POS_N] {
+        let n = POS_N * POS_N;
+        let mut bits = vec![0u8; n];
+        let mut tried = vec![0u8; n];
+        let mut first = vec![0u8; n];
+        let mut used = vec![false; 1 << 16];
+        let mut rng = XorShift32(POS_SEED);
+        let mut k = 0usize;
+        while k < n {
+            let (r, c) = (k / POS_N, k % POS_N);
+            if tried[k] == 0 {
+                first[k] = rng.bit();
+            }
+            if tried[k] == 2 {
+                tried[k] = 0;
+                assert!(k > 0, "position array search exhausted");
+                k -= 1;
+                let (r, c) = (k / POS_N, k % POS_N);
+                if r >= 3 && c >= 3 {
+                    used[window_at(&bits, r, c)] = false;
+                }
+                continue;
+            }
+            let b = first[k] ^ tried[k];
+            tried[k] += 1;
+            bits[k] = b;
+            if r >= 3 && c >= 3 {
+                let w = window_at(&bits, r, c);
+                if used[w] {
+                    continue;
+                }
+                used[w] = true;
+            }
+            k += 1;
+        }
+        let mut out = [[0u8; POS_N]; POS_N];
+        for r in 0..POS_N {
+            for c in 0..POS_N {
+                out[r][c] = bits[r * POS_N + c];
+            }
+        }
+        out
+    }
+
+    /// Fiducial bitmap (8x8 units, true = ink): full-height spine on the left,
+    /// `bars` teeth (rows 0,2,..,2*bars-2) running to the right.
+    pub fn fiducial_cells(bars: u32) -> [[bool; 8]; 8] {
+        let mut g = [[false; 8]; 8];
+        for row in g.iter_mut() {
+            row[0] = true;
+        }
+        for b in 0..bars as usize {
+            for c in 0..8 {
+                g[2 * b][c] = true;
+            }
+        }
+        g
+    }
+
+    const INK: Rgb<u8> = Rgb([0, 0, 0]);
+    const PAPER: Rgb<u8> = Rgb([255, 255, 255]);
+
+    fn rect_mm(img: &mut RgbImage, dpi: u32, x0: f64, y0: f64, x1: f64, y1: f64, c: Rgb<u8>) {
+        fill_rect(img, px(x0, dpi), px(y0, dpi), px(x1, dpi), px(y1, dpi), c);
+    }
+
+    fn draw_fiducial(img: &mut RgbImage, dpi: u32, org: (f64, f64), bars: u32) {
+        let g = fiducial_cells(bars);
+        for (r, row) in g.iter().enumerate() {
+            for (c, &on) in row.iter().enumerate() {
+                if on {
+                    let x = org.0 + c as f64 * FID_UNIT_MM;
+                    let y = org.1 + r as f64 * FID_UNIT_MM;
+                    rect_mm(img, dpi, x, y, x + FID_UNIT_MM, y + FID_UNIT_MM, INK);
+                }
+            }
+        }
+    }
+
+    fn strip_chips(
+        img: &mut RgbImage,
+        dpi: u32,
+        org: (f64, f64),
+        chips: &[i8],
+        chip_mm: f64,
+        vertical: bool,
+    ) {
+        for (i, &v) in chips.iter().enumerate() {
+            if v != 1 {
+                continue;
+            }
+            let a = i as f64 * chip_mm;
+            let b = a + chip_mm;
+            if vertical {
+                rect_mm(
+                    img,
+                    dpi,
+                    org.0,
+                    org.1 + a,
+                    org.0 + STRIP_THICK_MM,
+                    org.1 + b,
+                    INK,
+                );
+            } else {
+                rect_mm(
+                    img,
+                    dpi,
+                    org.0 + a,
+                    org.1,
+                    org.0 + b,
+                    org.1 + STRIP_THICK_MM,
+                    INK,
+                );
+            }
+        }
+    }
+
+    /// Barker-13 repeated [`BARKER_REPEATS`] times.
+    pub fn barker_run() -> Vec<i8> {
+        (0..BARKER_REPEATS).flat_map(|_| BARKER13).collect()
+    }
+
+    /// Absolute pixel x of the comb start (byte aligned).
+    pub fn comb_x0_px(dpi: u32) -> u32 {
+        px(COMB_X0_MM, dpi).div_ceil(8) * 8
+    }
+
+    /// Comb length in pixels (whole motifs + [`COMB_TAIL_PX`]).
+    pub fn comb_len_px(dpi: u32) -> u32 {
+        (px(COMB_WIDTH_MM, dpi) / 8) * 8 + COMB_TAIL_PX
+    }
+
+    /// Render the diag page (no banner / QR; those are stamped by the caller).
+    pub fn draw_diag(w: u32, h: u32, dpi: u32) -> RgbImage {
+        let mut img: RgbImage = ImageBuffer::from_pixel(w, h, PAPER);
+
+        // Fiducials.
+        for (org, bars) in [FID_TL, FID_TR, FID_BL, FID_BR].into_iter().zip(FID_BARS) {
+            draw_fiducial(&mut img, dpi, org, bars);
+        }
+
+        // Correlation strips.
+        let barker = barker_run();
+        strip_chips(&mut img, dpi, HSTRIP_BARKER, &barker, BARKER_CHIP_MM, false);
+        strip_chips(
+            &mut img,
+            dpi,
+            HSTRIP_MSEQ,
+            &mseq63(false),
+            MSEQ_CHIP_MM,
+            false,
+        );
+        strip_chips(&mut img, dpi, VSTRIP_BARKER, &barker, BARKER_CHIP_MM, true);
+        strip_chips(
+            &mut img,
+            dpi,
+            VSTRIP_MSEQ,
+            &mseq63(true),
+            MSEQ_CHIP_MM,
+            true,
+        );
+
+        // Polarity wedge band.
+        let (bx0, by0, bx1, by1) = WEDGE_BAND;
+        rect_mm(&mut img, dpi, bx0, by0, bx1, by1, INK);
+        let (ix0, iy0, ix1, iy1) = (
+            bx0 + WEDGE_OUTLINE_MM,
+            by0 + WEDGE_OUTLINE_MM,
+            bx1 - WEDGE_OUTLINE_MM,
+            by1 - WEDGE_OUTLINE_MM,
+        );
+        rect_mm(&mut img, dpi, ix0, iy0, ix0 + WEDGE_REF_MM, iy1, INK);
+        for k in 0..WEDGE_STEPS {
+            let x = ix0 + WEDGE_REF_MM + k as f64 * WEDGE_STEP_MM;
+            let l = wedge_level(k);
+            rect_mm(
+                &mut img,
+                dpi,
+                x,
+                iy0,
+                x + WEDGE_STEP_MM,
+                iy1,
+                Rgb([l, l, l]),
+            );
+        }
+        rect_mm(&mut img, dpi, ix1 - WEDGE_REF_MM, iy0, ix1, iy1, PAPER);
+
+        // Colour patches.
+        for (i, c) in PATCH_COLORS.iter().enumerate() {
+            let x = PATCHES_X0 + i as f64 * PATCH_W_MM;
+            rect_mm(
+                &mut img,
+                dpi,
+                x,
+                PATCHES_Y.0,
+                x + PATCH_W_MM,
+                PATCHES_Y.1,
+                Rgb(*c),
+            );
+        }
+
+        // Bit-order comb (pixel-exact).
+        let cx0 = comb_x0_px(dpi);
+        let cy0 = px(COMB_Y_MM, dpi);
+        for i in 0..comb_len_px(dpi) {
+            if COMB_MOTIF & (0x80 >> (i % 8)) != 0 {
+                fill_rect(&mut img, cx0 + i, cy0, cx0 + i + 1, cy0 + COMB_ROWS_PX, INK);
+            }
+        }
+
+        // Vertical 1-px bars (pixel-exact).
+        let bx = px(BARS_X0_MM, dpi);
+        let (y0, y1) = (px(BARS_Y_MM.0, dpi), px(BARS_Y_MM.1, dpi));
+        for g in BARS_GOLOMB {
+            let x = bx + g * BARS_PITCH_PX;
+            fill_rect(&mut img, x, y0, x + 1, y1, INK);
+        }
+
+        // Raw bit strip.
+        for (i, b) in raw_bits().iter().enumerate() {
+            if *b == 1 {
+                let x = RAW_X0_MM + i as f64 * RAW_CHIP_MM;
+                rect_mm(
+                    &mut img,
+                    dpi,
+                    x,
+                    RAW_Y_MM.0,
+                    x + RAW_CHIP_MM,
+                    RAW_Y_MM.1,
+                    INK,
+                );
+            }
+        }
+
+        // Position array.
+        let arr = position_array();
+        for (r, row) in arr.iter().enumerate() {
+            for (c, &b) in row.iter().enumerate() {
+                if b == 1 {
+                    let x = POS_X0_MM + c as f64 * POS_CELL_MM;
+                    let y = POS_Y0_MM + r as f64 * POS_CELL_MM;
+                    rect_mm(&mut img, dpi, x, y, x + POS_CELL_MM, y + POS_CELL_MM, INK);
+                }
+            }
+        }
+
+        // Zone plate.
+        let (zx0, zy0, zx1, zy1) = ZONE_BOX;
+        let pxmm = dpi as f64 / 25.4;
+        for y in px(zy0, dpi)..px(zy1, dpi).min(h) {
+            for x in px(zx0, dpi)..px(zx1, dpi).min(w) {
+                let dx = (x as f64 + 0.5) / pxmm - ZONE_CENTER_MM.0;
+                let dy = (y as f64 + 0.5) / pxmm - ZONE_CENTER_MM.1;
+                let phase = std::f64::consts::PI * ZONE_FMAX * (dx * dx + dy * dy) / ZONE_R_MM;
+                let l = (127.5 + 127.5 * phase.cos()).round() as u8;
+                img.put_pixel(x, y, Rgb([l, l, l]));
+            }
+        }
+
+        // Frame: 1-px border at the very edge (top row is covered by the banner).
+        draw_border(&mut img, INK);
+        img
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashSet;
+
+        fn corr(a: &[i8], b: &[i8], lag: usize) -> i32 {
+            // circular cross-correlation at `lag`
+            let n = a.len();
+            (0..n).map(|i| a[i] as i32 * b[(i + lag) % n] as i32).sum()
+        }
+
+        #[test]
+        fn layout_fits_smallest_page_and_scales_with_dpi() {
+            for dpi in [100u32, 150, 200, 300] {
+                let (w, h) = job_page_pixels(dpi);
+                let e = effective_dpi(dpi);
+                assert!(px(LAYOUT_W_MM, e) <= w, "dpi {dpi}: layout wider than page");
+                assert!(
+                    px(LAYOUT_H_MM, e) <= h,
+                    "dpi {dpi}: layout taller than page"
+                );
+                let (img, _) = render_pattern_rgb(PatternId::Diag, dpi, 0, None).unwrap();
+                assert_eq!(img.dimensions(), (w, h));
+            }
+            assert_eq!(
+                effective_dpi(300),
+                150,
+                "300 dpi is capped to 150 by the 4 MP limit"
+            );
+            assert_eq!(effective_dpi(200), 200);
+            // mm -> px scaling: 10 mm @ 254 dpi is exactly 100 px, and 2x dpi doubles it.
+            assert_eq!(px(10.0, 254), 100);
+            assert_eq!(px(25.4, 200), 200);
+            assert_eq!(px(25.4, 100) * 2, px(25.4, 200));
+        }
+
+        #[test]
+        fn every_feature_is_at_least_3px_at_100dpi_unless_pixel_exact() {
+            let d = 100;
+            for mm in [
+                FID_UNIT_MM,
+                BARKER_CHIP_MM,
+                MSEQ_CHIP_MM,
+                STRIP_THICK_MM,
+                WEDGE_OUTLINE_MM,
+                WEDGE_STEP_MM,
+                PATCH_W_MM,
+                RAW_CHIP_MM,
+                POS_CELL_MM,
+            ] {
+                assert!(px(mm, d) >= 3, "{mm} mm is {} px at 100 dpi", px(mm, d));
+            }
+            // Regions below the banner.
+            for y in [FID_TL.1, HSTRIP_BARKER.1] {
+                assert!(y >= BANNER_RESERVE_MM);
+            }
+        }
+
+        #[test]
+        fn render_is_deterministic_and_page_dependent_only_via_qr() {
+            let (a, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
+            let (b, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
+            assert_eq!(a.as_raw(), b.as_raw());
+            let (c, _) = render_pattern_rgb(PatternId::Diag, 100, 1, None).unwrap();
+            assert_ne!(a.as_raw(), c.as_raw());
+            let j0 = jpeg_pattern(PatternId::Diag, 100, 0).unwrap();
+            assert_eq!(j0, jpeg_pattern(PatternId::Diag, 100, 0).unwrap());
+            assert_eq!(read_page_marker(&j0), Some(0));
+        }
+
+        #[test]
+        fn qr_decodes_after_thresholding_at_200dpi() {
+            let (img, _) = render_pattern_rgb(PatternId::Diag, 200, 7, None).unwrap();
+            let mut g = image::GrayImage::new(img.width(), img.height());
+            for (x, y, p) in img.enumerate_pixels() {
+                g.put_pixel(
+                    x,
+                    y,
+                    image::Luma([if luma8(p) >= BW_THRESHOLD { 255 } else { 0 }]),
+                );
+            }
+            let mut prepared = rqrr::PreparedImage::prepare(g);
+            let grids = prepared.detect_grids();
+            assert!(!grids.is_empty(), "QR not found on thresholded diag page");
+            let (_m, text) = grids[0].decode().expect("decode");
+            assert_eq!(text, qr_payload(PatternId::Diag, 7, None));
+            let p = parse_qr_payload(&text).unwrap();
+            assert_eq!((p.page, p.pattern), (7, PatternId::Diag));
+        }
+
+        #[test]
+        fn qr_does_not_overlap_other_features() {
+            // Reserve box (see QR_ANCHOR_MM); the QR must stay inside x>=128, y>=208 mm.
+            for dpi in [100u32, 150, 200] {
+                let code = QrCode::with_error_correction_level(
+                    qr_payload(PatternId::Diag, 99, Some(PageSide::Back)).as_bytes(),
+                    EcLevel::M,
+                )
+                .unwrap();
+                let side = code
+                    .render::<Rgb<u8>>()
+                    .quiet_zone(true)
+                    .min_dimensions(px(QR_TARGET_MM, dpi), px(QR_TARGET_MM, dpi))
+                    .build()
+                    .width();
+                assert!(
+                    px(QR_ANCHOR_MM.0, dpi) as i64 - side as i64 >= px(128.0, dpi) as i64,
+                    "dpi {dpi}: QR {side}px too wide"
+                );
+                assert!(px(QR_ANCHOR_MM.1, dpi) as i64 - side as i64 >= px(208.0, dpi) as i64);
+            }
+        }
+
+        #[test]
+        fn position_array_windows_are_all_unique() {
+            let a = position_array();
+            let mut seen = HashSet::new();
+            for r in 0..=POS_N - 4 {
+                for c in 0..=POS_N - 4 {
+                    let mut w = 0u32;
+                    for dr in 0..4 {
+                        for dc in 0..4 {
+                            w = (w << 1) | a[r + dr][c + dc] as u32;
+                        }
+                    }
+                    assert!(seen.insert(w), "duplicate 4x4 window at ({r},{c})");
+                }
+            }
+            assert_eq!(seen.len(), (POS_N - 3) * (POS_N - 3));
+            // Not degenerate: roughly balanced ink.
+            let ink: usize = a.iter().flatten().map(|&b| b as usize).sum();
+            let n = POS_N * POS_N;
+            assert!(ink > n * 35 / 100 && ink < n * 65 / 100, "ink {ink}/{n}");
+            // Deterministic.
+            assert_eq!(build_position_array(), *a);
+        }
+
+        #[test]
+        fn rendered_position_array_matches_cells_at_100dpi() {
+            let (img, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
+            let a = position_array();
+            for r in 0..POS_N {
+                for c in 0..POS_N {
+                    let x = px(POS_X0_MM + (c as f64 + 0.5) * POS_CELL_MM, 100);
+                    let y = px(POS_Y0_MM + (r as f64 + 0.5) * POS_CELL_MM, 100);
+                    let ink = luma8(img.get_pixel(x, y)) < 128;
+                    assert_eq!(ink, a[r][c] == 1, "cell ({r},{c})");
+                }
+            }
+        }
+
+        #[test]
+        fn barker13_autocorrelation_sidelobes_are_at_most_one() {
+            let b = BARKER13;
+            assert_eq!(corr_aperiodic(&b, &b, 0), 13);
+            for lag in 1..13 {
+                assert!(corr_aperiodic(&b, &b, lag).abs() <= 1, "lag {lag}");
+            }
+            // Mirror: the reversed template does not correlate with the strip.
+            let rev: Vec<i8> = b.iter().rev().copied().collect();
+            let best = (0..13)
+                .map(|l| corr_aperiodic(&b, &rev, l).abs())
+                .max()
+                .unwrap();
+            assert!(best < 13, "Barker-13 palindromic?");
+            // Polarity: negation flips the sign of the peak.
+            let neg: Vec<i8> = b.iter().map(|v| -v).collect();
+            assert_eq!(corr_aperiodic(&b, &neg, 0), -13);
+            assert_eq!(barker_run().len(), 39);
+        }
+
+        fn corr_aperiodic(a: &[i8], b: &[i8], lag: usize) -> i32 {
+            (0..a.len().saturating_sub(lag))
+                .map(|i| a[i] as i32 * b[i + lag] as i32)
+                .sum()
+        }
+
+        #[test]
+        fn mseq63_periodic_autocorrelation_is_two_valued_for_both_polys() {
+            for vertical in [false, true] {
+                let m = mseq63(vertical);
+                assert_eq!(m.iter().map(|&v| v as i32).sum::<i32>(), 1, "balance");
+                assert_eq!(corr(&m, &m, 0), 63);
+                for lag in 1..63 {
+                    assert_eq!(corr(&m, &m, lag), -1, "poly vertical={vertical} lag {lag}");
+                }
+                // Reversed template (mirror) stays far below the peak.
+                let rev: Vec<i8> = m.iter().rev().copied().collect();
+                let worst = (0..63).map(|l| corr(&m, &rev, l).abs()).max().unwrap();
+                assert!(worst <= 21, "mirror cross-correlation {worst} too high");
+                // Negation gives -63 (polarity).
+                let neg: Vec<i8> = m.iter().map(|v| -v).collect();
+                assert_eq!(corr(&m, &neg, 0), -63);
+            }
+            // The two sequences are different families.
+            let (h, v) = (mseq63(false), mseq63(true));
+            let worst = (0..63).map(|l| corr(&h, &v, l).abs()).max().unwrap();
+            assert!(worst <= 21, "H/V cross-correlation {worst}");
+        }
+
+        #[test]
+        fn raw_bits_are_stable_and_start_with_barker() {
+            let b = raw_bits();
+            for i in 0..13 {
+                assert_eq!(b[i] == 1, BARKER13[i] == 1);
+            }
+            assert_eq!(b, raw_bits());
+            let ones: usize = b[13..].iter().map(|&v| v as usize).sum();
+            assert!(ones > 30 && ones < 85, "ones={ones}");
+        }
+
+        type Grid = Vec<Vec<bool>>;
+
+        fn composite() -> Grid {
+            // 40x30 unit grid with the four fiducials in their corners (4 units in from edges 2).
+            let (gw, gh) = (40usize, 30usize);
+            let mut g = vec![vec![false; gw]; gh];
+            let origins = [(1, 1), (gw - 9, 1), (1, gh - 9), (gw - 9, gh - 9)];
+            for (o, bars) in origins.iter().zip(FID_BARS) {
+                let f = fiducial_cells(bars);
+                for r in 0..8 {
+                    for c in 0..8 {
+                        g[o.1 + r][o.0 + c] = f[r][c];
+                    }
+                }
+            }
+            g
+        }
+
+        fn mirror_x(g: &Grid) -> Grid {
+            g.iter()
+                .map(|r| r.iter().rev().copied().collect())
+                .collect()
+        }
+        fn flip_y(g: &Grid) -> Grid {
+            g.iter().rev().cloned().collect()
+        }
+        fn rot90(g: &Grid) -> Grid {
+            let (h, w) = (g.len(), g[0].len());
+            (0..w)
+                .map(|c| (0..h).map(|r| g[h - 1 - r][c]).collect())
+                .collect()
+        }
+
+        #[test]
+        fn fiducials_are_distinct_under_all_8_symmetries() {
+            let g0 = composite();
+            let mut variants = vec![];
+            let mut g = g0.clone();
+            for _ in 0..4 {
+                variants.push(g.clone());
+                variants.push(mirror_x(&g));
+                g = rot90(&g);
+            }
+            assert_eq!(variants.len(), 8);
+            for i in 0..8 {
+                for j in i + 1..8 {
+                    assert_ne!(variants[i], variants[j], "symmetries {i} and {j} collide");
+                }
+            }
+            // Sanity: flip_y equals mirror_x then rot180 -> in the set.
+            assert!(variants.contains(&flip_y(&g0)));
+            // Single fiducials are pairwise distinct and all asymmetric.
+            let cells: Vec<_> = FID_BARS.iter().map(|&b| fiducial_cells(b)).collect();
+            for i in 0..4 {
+                for j in i + 1..4 {
+                    assert_ne!(cells[i], cells[j]);
+                }
+            }
+            assert_eq!(FID_BARS, [1, 2, 3, 4]);
+        }
+
+        #[test]
+        fn comb_row_packs_to_motif_bytes_with_odd_tail() {
+            for dpi in [100u32, 200] {
+                let (img, _) = render_pattern_rgb(PatternId::Diag, dpi, 0, None).unwrap();
+                let x0 = comb_x0_px(dpi);
+                assert_eq!(x0 % 8, 0);
+                let len = comb_len_px(dpi);
+                assert_ne!(len % 8, 0, "comb width must not be a multiple of 8");
+                let y = px(COMB_Y_MM, dpi) + 3;
+                let mut bytes = vec![];
+                for b in 0..len / 8 {
+                    let mut v = 0u8;
+                    for k in 0..8 {
+                        if luma8(img.get_pixel(x0 + b * 8 + k, y)) < 128 {
+                            v |= 0x80 >> k;
+                        }
+                    }
+                    bytes.push(v);
+                }
+                assert!(bytes.iter().all(|&b| b == COMB_MOTIF));
+                assert_ne!(COMB_MOTIF.reverse_bits(), COMB_MOTIF);
+                // Rows: 8 identical rows then paper.
+                assert!(luma8(img.get_pixel(x0, y + 8)) > 200);
+            }
+        }
+
+        #[test]
+        fn vertical_bars_are_one_px_and_golomb_distinct() {
+            let mut d = HashSet::new();
+            for i in 0..BARS_GOLOMB.len() {
+                for j in i + 1..BARS_GOLOMB.len() {
+                    assert!(d.insert(BARS_GOLOMB[j] - BARS_GOLOMB[i]), "repeated gap");
+                }
+            }
+            let (img, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
+            let x0 = px(BARS_X0_MM, 100);
+            let ymid = (px(BARS_Y_MM.0, 100) + px(BARS_Y_MM.1, 100)) / 2;
+            let mut ink_cols = vec![];
+            for x in x0.saturating_sub(5)..x0 + 230 {
+                if luma8(img.get_pixel(x, ymid)) < 128 {
+                    ink_cols.push(x - x0);
+                }
+            }
+            let want: Vec<u32> = BARS_GOLOMB.iter().map(|g| g * BARS_PITCH_PX).collect();
+            assert_eq!(ink_cols, want);
+            // Border: left/right/bottom columns are ink.
+            let (w, h) = img.dimensions();
+            assert!(luma8(img.get_pixel(0, h / 2)) < 10 && luma8(img.get_pixel(w - 1, h / 2)) < 10);
+            assert!(luma8(img.get_pixel(w / 2, h - 1)) < 10);
+        }
+
+        #[test]
+        fn wedge_patches_and_zone_plate_render() {
+            let dpi = 200;
+            let (img, _) = render_pattern_rgb(PatternId::Diag, dpi, 0, None).unwrap();
+            let ymid = px((WEDGE_BAND.1 + WEDGE_BAND.3) / 2.0, dpi);
+            let ix0 = WEDGE_BAND.0 + WEDGE_OUTLINE_MM;
+            let at = |x_mm: f64, y: u32| luma8(img.get_pixel(px(x_mm, dpi), y));
+            assert!(at(ix0 + 1.0, ymid) < 5, "black ref");
+            for k in 0..WEDGE_STEPS {
+                let x = ix0 + WEDGE_REF_MM + (k as f64 + 0.5) * WEDGE_STEP_MM;
+                let got = at(x, ymid) as i32;
+                assert!((got - wedge_level(k) as i32).abs() <= 1, "step {k}: {got}");
+            }
+            assert!(
+                at(WEDGE_BAND.2 - WEDGE_OUTLINE_MM - 1.0, ymid) > 250,
+                "white ref"
+            );
+            let py = px((PATCHES_Y.0 + PATCHES_Y.1) / 2.0, dpi);
+            for (i, c) in PATCH_COLORS.iter().enumerate() {
+                let p = img.get_pixel(px(PATCHES_X0 + (i as f64 + 0.5) * PATCH_W_MM, dpi), py);
+                assert_eq!(p.0, *c, "patch {i}");
+            }
+            // Zone plate: centre is bright (cos 0 = 1) and the plate has a wide gray range.
+            let zc = img.get_pixel(px(ZONE_CENTER_MM.0, dpi), px(ZONE_CENTER_MM.1, dpi));
+            assert!(zc.0[0] > 240);
+            let (mut lo, mut hi) = (255u8, 0u8);
+            for y in px(ZONE_BOX.1, dpi)..px(ZONE_BOX.3, dpi) {
+                for x in px(ZONE_BOX.0, dpi)..px(ZONE_BOX.2, dpi) {
+                    let v = img.get_pixel(x, y).0[0];
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+            }
+            assert!(lo < 15 && hi > 240);
+        }
+
+        #[test]
+        fn diag_pattern_id_roundtrip_and_encoding_unchanged_for_others() {
+            assert_eq!(PatternId::parse("diag").unwrap(), PatternId::Diag);
+            assert_eq!(PatternId::Diag.as_str(), "diag");
+            assert!(PatternId::ALL.contains(&PatternId::Diag));
+            assert!(pattern_banner(PatternId::Diag, 2, None).contains("diag"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2844,21 +4123,22 @@ mod tests {
     #[test]
     fn bytes_per_line_zero_when_compressed() {
         use crate::effects::ColorMode;
-        // Default / ms_strict=false: Brother/wsdscdrv jfif RGB stride.
+        // Default / ms_strict=false: Brother/wsdscdrv jfif RGB stride; gray jfif = width.
         assert_eq!(bytes_per_line("jfif", 850, ColorMode::Rgb24, false), 2550);
-        assert_eq!(bytes_per_line("jfif", 850, ColorMode::Gray8, false), 2550);
+        assert_eq!(bytes_per_line("jfif", 850, ColorMode::Gray8, false), 850);
         assert_eq!(bytes_per_line("png", 850, ColorMode::Gray8, false), 850);
-        assert_eq!(bytes_per_line("dib", 850, ColorMode::Rgb24, false), 850 * 3);
+        // BMP/DIB rows are DWORD-padded: 2550 -> 2552.
+        assert_eq!(bytes_per_line("dib", 850, ColorMode::Rgb24, false), 2552);
         assert_eq!(
             bytes_per_line("tiff-single-uncompressed", 850, ColorMode::Gray8, false),
             850
         );
-        assert_eq!(bytes_per_line("dib", 900, ColorMode::Bw1, false), 113);
+        assert_eq!(bytes_per_line("dib", 900, ColorMode::Bw1, false), 116);
         // ms_strict=true: compressed → 0; uncompressed stride unchanged.
         assert_eq!(bytes_per_line("jfif", 850, ColorMode::Rgb24, true), 0);
         assert_eq!(bytes_per_line("jfif", 850, ColorMode::Gray8, true), 0);
         assert_eq!(bytes_per_line("png", 850, ColorMode::Gray8, true), 0);
-        assert_eq!(bytes_per_line("dib", 850, ColorMode::Rgb24, true), 850 * 3);
+        assert_eq!(bytes_per_line("dib", 850, ColorMode::Rgb24, true), 2552);
     }
 
     #[test]
@@ -3498,5 +4778,1074 @@ mod tests {
             !content.contains("client="),
             "QR payload must NOT contain client= when peer absent; got: {content}"
         );
+    }
+}
+
+#[cfg(test)]
+mod bilevel_tests {
+    use super::*;
+    use crate::effects::{BilevelPolarity, ColorMode, ImageEffects};
+
+    const DPI: u32 = 100;
+
+    fn fx(p: BilevelPolarity) -> ImageEffects {
+        ImageEffects {
+            bilevel_polarity: p,
+            ..ImageEffects::default()
+        }
+    }
+
+    fn enc(fmt: &str, color: ColorMode, p: BilevelPolarity, dpi: u32, sheets: &[u32]) -> Vec<u8> {
+        encode_pattern_pages(
+            fmt,
+            PatternId::PageId,
+            dpi,
+            sheets,
+            None,
+            Some(&fx(p)),
+            color,
+            EncodeOpts::WITH_COM,
+        )
+        .unwrap()
+    }
+
+    /// Reference: the RGB buffer the pipeline produces for `color` (before packing).
+    fn reference(color: ColorMode, dpi: u32, sheet: u32) -> RgbImage {
+        let (mut img, _) = render_pattern_rgb_ctx(
+            PatternId::PageId,
+            dpi,
+            sheet,
+            None,
+            EncodeOpts::WITH_COM,
+            None,
+        )
+        .unwrap();
+        crate::effects::apply_pipeline(&mut img, &ImageEffects::default(), sheet, color);
+        img
+    }
+
+    fn u16le(b: &[u8], o: usize) -> u32 {
+        u32::from(u16::from_le_bytes([b[o], b[o + 1]]))
+    }
+    fn u32le(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
+
+    struct Bmp {
+        /// File stores rows top-down (negative biHeight).
+        top_down: bool,
+        w: u32,
+        h: u32,
+        bpp: u32,
+        palette: Vec<u8>, // gray level per entry (B channel)
+        stride: usize,
+        pixels: Vec<u8>, // top-down rows, stride bytes each
+        size_image: u32,
+        clr_used: u32,
+    }
+
+    fn parse_bmp(b: &[u8]) -> Bmp {
+        assert_eq!(&b[0..2], b"BM");
+        assert_eq!(u32le(b, 14), 40, "BITMAPINFOHEADER");
+        let w = u32le(b, 18);
+        let h_raw = u32le(b, 22) as i32;
+        let top_down = h_raw < 0;
+        let h = h_raw.unsigned_abs();
+        let bpp = u16le(b, 28);
+        assert_eq!(u32le(b, 30), 0, "BI_RGB");
+        let size_image = u32le(b, 34);
+        let clr_used = u32le(b, 46);
+        let off = u32le(b, 10) as usize;
+        let n_pal = (off - 54) / 4;
+        let palette: Vec<u8> = (0..n_pal).map(|i| b[54 + i * 4]).collect();
+        let stride = (w * bpp).div_ceil(32) as usize * 4;
+        assert_eq!(b.len(), off + stride * h as usize, "file size");
+        let mut rows: Vec<&[u8]> = b[off..].chunks(stride).collect();
+        if !top_down {
+            rows.reverse(); // bottom-up -> top-down
+        }
+        Bmp {
+            top_down,
+            w,
+            h,
+            bpp,
+            palette,
+            stride,
+            pixels: rows.concat(),
+            size_image,
+            clr_used,
+        }
+    }
+
+    /// Visual gray level (0..255) of pixel (x, y) after applying the palette.
+    fn bmp_visual(bmp: &Bmp, x: u32, y: u32) -> u8 {
+        let row = &bmp.pixels[y as usize * bmp.stride..];
+        let idx = if bmp.bpp == 1 {
+            usize::from((row[(x / 8) as usize] >> (7 - x % 8)) & 1)
+        } else {
+            usize::from(row[x as usize])
+        };
+        bmp.palette[idx]
+    }
+
+    fn assert_matches_ref(bmp: &Bmp, r: &RgbImage) {
+        assert_eq!((bmp.w, bmp.h), r.dimensions());
+        for y in 0..bmp.h {
+            for x in 0..bmp.w {
+                assert_eq!(
+                    bmp_visual(bmp, x, y),
+                    r.get_pixel(x, y).0[0],
+                    "visual mismatch at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bmp_1bpp_header_stride_palette_and_bit_order() {
+        let b = enc(
+            "bmp",
+            ColorMode::Bw1,
+            BilevelPolarity::BlackIsZero,
+            DPI,
+            &[0],
+        );
+        let bmp = parse_bmp(&b);
+        let r = reference(ColorMode::Bw1, DPI, 0);
+        assert_eq!(bmp.bpp, 1);
+        assert!(
+            bmp.top_down,
+            "Brother 1-bpp BMPs are top-down (negative biHeight)"
+        );
+        assert_eq!(bmp.palette, vec![0, 255], "[black, white]");
+        assert_eq!(bmp.clr_used, 2);
+        assert_eq!(bmp.stride, (r.width().div_ceil(8)).div_ceil(4) as usize * 4);
+        assert_eq!(bmp.size_image as usize, bmp.stride * bmp.h as usize);
+        assert_matches_ref(&bmp, &r);
+        // MSB-first: first pixel of the first row is bit 7 of byte 0.
+        let first_white = r.get_pixel(0, 0).0[0] == 255;
+        assert_eq!(bmp.pixels[0] >> 7 == 1, first_white);
+        // Far smaller than the 24-bpp file.
+        let rgb = enc(
+            "bmp",
+            ColorMode::Rgb24,
+            BilevelPolarity::BlackIsZero,
+            DPI,
+            &[0],
+        );
+        assert!(b.len() * 20 < rgb.len(), "{} vs {}", b.len(), rgb.len());
+    }
+
+    #[test]
+    fn bmp_polarity_flips_palette_not_visual() {
+        let a = parse_bmp(&enc(
+            "bmp",
+            ColorMode::Bw1,
+            BilevelPolarity::BlackIsZero,
+            DPI,
+            &[1],
+        ));
+        let w = parse_bmp(&enc(
+            "bmp",
+            ColorMode::Bw1,
+            BilevelPolarity::WhiteIsZero,
+            DPI,
+            &[1],
+        ));
+        assert_eq!(a.palette, vec![0, 255]);
+        assert_eq!(w.palette, vec![255, 0], "[white, black]");
+        assert_eq!((a.bpp, w.bpp), (1, 1));
+        assert_ne!(a.pixels, w.pixels, "stored bits are inverted");
+        let r = reference(ColorMode::Bw1, DPI, 1);
+        assert_matches_ref(&a, &r);
+        assert_matches_ref(&w, &r);
+    }
+
+    #[test]
+    fn bmp_8bpp_gray_palette_and_values() {
+        let b = enc(
+            "dib",
+            ColorMode::Gray8,
+            BilevelPolarity::WhiteIsZero,
+            DPI,
+            &[0],
+        );
+        let bmp = parse_bmp(&b);
+        assert_eq!(bmp.bpp, 8);
+        assert!(!bmp.top_down, "8-bpp stays bottom-up");
+        assert_eq!(bmp.palette.len(), 256);
+        assert!(bmp
+            .palette
+            .iter()
+            .enumerate()
+            .all(|(i, &v)| v as usize == i));
+        assert_eq!(bmp.stride, bmp.w.div_ceil(4) as usize * 4);
+        assert_matches_ref(&bmp, &reference(ColorMode::Gray8, DPI, 0));
+        let levels: std::collections::HashSet<u8> = bmp.pixels.iter().copied().collect();
+        assert!(levels.len() > 2, "{} levels", levels.len());
+    }
+
+    #[test]
+    fn bmp_rgb24_unchanged() {
+        let b = enc(
+            "bmp",
+            ColorMode::Rgb24,
+            BilevelPolarity::WhiteIsZero,
+            DPI,
+            &[0],
+        );
+        assert_eq!(u16le(&b, 28), 24);
+    }
+
+    struct TiffPage {
+        w: u32,
+        h: u32,
+        bps: u32,
+        spp: u32,
+        photometric: u32,
+        compression: u32,
+        rows_per_strip: u32,
+        strip_bytes: u32,
+        strip: Vec<u8>,
+    }
+
+    fn parse_tiff(b: &[u8]) -> Vec<TiffPage> {
+        assert_eq!(&b[0..4], &[b'I', b'I', 42, 0]);
+        let mut ifd = u32le(b, 4) as usize;
+        let mut pages = Vec::new();
+        while ifd != 0 {
+            let n = u16le(b, ifd) as usize;
+            let mut t = std::collections::HashMap::new();
+            for i in 0..n {
+                let e = ifd + 2 + i * 12;
+                t.insert(u16le(b, e), (u16le(b, e + 2), u32le(b, e + 4), e + 8));
+            }
+            let opt = |tag: u32| {
+                t.get(&tag).map(
+                    |&(typ, _, at)| {
+                        if typ == 3 {
+                            u16le(b, at)
+                        } else {
+                            u32le(b, at)
+                        }
+                    },
+                )
+            };
+            let val = |tag: u32| opt(tag).unwrap_or_else(|| panic!("missing tag {tag}"));
+            let off = val(273) as usize;
+            let len = opt(279).unwrap_or((b.len() - off) as u32);
+            pages.push(TiffPage {
+                w: val(256),
+                h: val(257),
+                bps: opt(258).unwrap_or(1),
+                spp: opt(277).unwrap_or(1),
+                photometric: opt(262).unwrap_or(0),
+                compression: opt(259).unwrap_or(1),
+                rows_per_strip: opt(278).unwrap_or(val(257)),
+                strip_bytes: len,
+                strip: b[off..off + len as usize].to_vec(),
+            });
+            ifd = u32le(b, ifd + 2 + n * 12) as usize;
+        }
+        pages
+    }
+
+    fn tiff_visual(p: &TiffPage, x: u32, y: u32) -> u8 {
+        let stride = (p.w * p.bps).div_ceil(8) as usize;
+        let row = &p.strip[y as usize * stride..];
+        if p.bps == 8 {
+            return row[x as usize];
+        }
+        let bit = (row[(x / 8) as usize] >> (7 - x % 8)) & 1;
+        // Photometric 1 (MinIsBlack): 1 = white; 0 (MinIsWhite): 1 = black.
+        if (bit == 1) == (p.photometric == 1) {
+            255
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn tiff_1bit_tags_and_both_polarities_same_visual() {
+        let r = reference(ColorMode::Bw1, DPI, 0);
+        for (pol, photo) in [
+            (BilevelPolarity::BlackIsZero, 1),
+            (BilevelPolarity::WhiteIsZero, 0),
+        ] {
+            let b = enc("tiff-single-uncompressed", ColorMode::Bw1, pol, DPI, &[0]);
+            let pages = parse_tiff(&b);
+            assert_eq!(pages.len(), 1);
+            let p = &pages[0];
+            assert_eq!((p.w, p.h), r.dimensions());
+            assert_eq!((p.bps, p.spp, p.compression), (1, 1, 1));
+            assert_eq!(p.photometric, photo, "{pol:?}");
+            assert_eq!(p.rows_per_strip, p.h);
+            assert_eq!(p.strip_bytes, r.width().div_ceil(8) * p.h);
+            for y in 0..p.h {
+                for x in 0..p.w {
+                    assert_eq!(
+                        tiff_visual(p, x, y),
+                        r.get_pixel(x, y).0[0],
+                        "{pol:?} ({x},{y})"
+                    );
+                }
+            }
+            let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(&b)).unwrap();
+            assert_eq!(dec.colortype().unwrap(), tiff::ColorType::Gray(1));
+            assert_eq!(dec.dimensions().unwrap(), r.dimensions());
+        }
+    }
+
+    #[test]
+    fn tiff_8bit_gray_and_multi_page() {
+        let b = enc(
+            "tiff-multi-uncompressed",
+            ColorMode::Gray8,
+            BilevelPolarity::WhiteIsZero,
+            DPI,
+            &[0, 1],
+        );
+        let pages = parse_tiff(&b);
+        assert_eq!(pages.len(), 2);
+        for (i, p) in pages.iter().enumerate() {
+            assert_eq!(
+                (p.bps, p.spp, p.photometric),
+                (8, 1, 1),
+                "gray is always MinIsBlack"
+            );
+            assert_eq!(p.strip_bytes, p.w * p.h);
+            let r = reference(ColorMode::Gray8, DPI, i as u32);
+            assert_eq!((p.w, p.h), r.dimensions());
+            assert_eq!(tiff_visual(p, 5, 7), r.get_pixel(5, 7).0[0]);
+        }
+        assert_ne!(pages[0].strip, pages[1].strip, "pages stay distinct");
+        let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(&b)).unwrap();
+        assert_eq!(dec.colortype().unwrap(), tiff::ColorType::Gray(8));
+        let rgb = enc(
+            "tiff-multi-uncompressed",
+            ColorMode::Rgb24,
+            BilevelPolarity::BlackIsZero,
+            DPI,
+            &[0, 1],
+        );
+        let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(&rgb)).unwrap();
+        assert_eq!(dec.colortype().unwrap(), tiff::ColorType::RGB(8));
+    }
+
+    #[test]
+    fn png_1bit_and_8bit_gray() {
+        for (color, depth) in [
+            (ColorMode::Bw1, png::BitDepth::One),
+            (ColorMode::Gray8, png::BitDepth::Eight),
+        ] {
+            let b = enc("png", color, BilevelPolarity::WhiteIsZero, DPI, &[0]);
+            let dec = png::Decoder::new(std::io::Cursor::new(&b));
+            let mut rd = dec.read_info().unwrap();
+            let info = rd.info();
+            assert_eq!(info.color_type, png::ColorType::Grayscale);
+            assert_eq!(info.bit_depth, depth);
+            let mut buf = vec![0u8; rd.output_buffer_size().unwrap()];
+            let fi = rd.next_frame(&mut buf).unwrap();
+            let r = reference(color, DPI, 0);
+            let (w, h) = r.dimensions();
+            assert_eq!((fi.width, fi.height), (w, h));
+            let stride = fi.line_size;
+            for y in (0..h).step_by(7) {
+                for x in (0..w).step_by(3) {
+                    let v = if color == ColorMode::Bw1 {
+                        if (buf[y as usize * stride + (x / 8) as usize] >> (7 - x % 8)) & 1 == 1 {
+                            255
+                        } else {
+                            0
+                        }
+                    } else {
+                        buf[y as usize * stride + x as usize]
+                    };
+                    assert_eq!(v, r.get_pixel(x, y).0[0]);
+                }
+            }
+            let li = image::load_from_memory(&b).unwrap();
+            assert_eq!(li.width(), w);
+        }
+    }
+
+    fn g4_bitmap(tiff_bytes: &[u8]) -> Vec<bool> {
+        let p = &parse_tiff(tiff_bytes)[0];
+        let mut out = Vec::new();
+        fax::decoder::decode_g4(p.strip.iter().copied(), p.w as u16, Some(p.h as u16), |t| {
+            out.extend(fax::decoder::pels(t, p.w as u16).map(|c| c == fax::Color::Black));
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn g4_still_decodes_to_the_thresholded_bitmap() {
+        let r = reference(ColorMode::Bw1, DPI, 0);
+        let want: Vec<bool> = r.pixels().map(|p| p.0[0] < 128).collect();
+        let b = enc(
+            "tiff-single-g4",
+            ColorMode::Bw1,
+            BilevelPolarity::WhiteIsZero,
+            DPI,
+            &[0],
+        );
+        let p = &parse_tiff(&b)[0];
+        assert_eq!((p.compression, p.photometric, p.bps), (4, 0, 1));
+        assert_eq!(g4_bitmap(&b), want);
+        // Polarity does not touch CCITT output.
+        assert_eq!(
+            enc(
+                "tiff-single-g4",
+                ColorMode::Bw1,
+                BilevelPolarity::BlackIsZero,
+                DPI,
+                &[0]
+            ),
+            b
+        );
+    }
+
+    #[test]
+    fn jfif_bw_modes_component_count_and_bilevel_samples() {
+        use crate::effects::JfifBw;
+        // gray8 (default): single component; legacy rgb24: Brother-style 3 components.
+        // Both carry thresholded ~0/255 samples; polarity does not touch JPEG.
+        for (mode, comps) in [(JfifBw::Gray8, 1usize), (JfifBw::Rgb24, 3)] {
+            for pol in [BilevelPolarity::BlackIsZero, BilevelPolarity::WhiteIsZero] {
+                for fmt in ["jfif", "jpeg", "exif"] {
+                    let e = ImageEffects {
+                        jfif_bw: mode,
+                        ..fx(pol)
+                    };
+                    let b = encode_pattern_pages(
+                        fmt,
+                        PatternId::PageId,
+                        DPI,
+                        &[0],
+                        None,
+                        Some(&e),
+                        ColorMode::Bw1,
+                        EncodeOpts::WITH_COM,
+                    )
+                    .unwrap();
+                    assert_eq!(jpeg_sof0_components(&b).len(), comps, "{fmt} {mode:?}");
+                    let img = image::load_from_memory(&b).unwrap().to_luma8();
+                    let total = img.pixels().count();
+                    let extreme = img
+                        .pixels()
+                        .filter(|p| p.0[0] <= 40 || p.0[0] >= 215)
+                        .count();
+                    assert!(extreme * 100 >= total * 97, "{extreme}/{total} near 0/255");
+                    let dark = img.pixels().filter(|p| p.0[0] < 128).count();
+                    assert!(dark > 0 && dark * 2 < total, "mostly light with some dark");
+                }
+            }
+        }
+        // Default effects => gray8.
+        let b = enc(
+            "jfif",
+            ColorMode::Bw1,
+            BilevelPolarity::BlackIsZero,
+            DPI,
+            &[0],
+        );
+        assert_eq!(jpeg_sof0_components(&b).len(), 1);
+        assert_eq!(
+            image::load_from_memory(&b).unwrap().color(),
+            image::ColorType::L8
+        );
+    }
+
+    #[test]
+    fn bytes_per_line_fx_gray_modes() {
+        use crate::effects::JfifBw as B;
+        use crate::effects::JfifGray as J;
+        for (mode, want) in [
+            (J::Rgb24, 4944),
+            (J::Gray8, 1648),
+            (J::Gray8RgbStride, 4944),
+            (J::Gray8Tiff, 4944),
+        ] {
+            assert_eq!(
+                bytes_per_line_fx(
+                    "jfif",
+                    1648,
+                    ColorMode::Gray8,
+                    false,
+                    mode,
+                    crate::effects::JfifBw::default()
+                ),
+                want,
+                "{mode:?}"
+            );
+        }
+        // BW1 JFIF follows jfif_bw: gray8 -> width, rgb24 -> width x 3; 1-bit formats unchanged.
+        for (bw, want) in [
+            (crate::effects::JfifBw::Gray8, 1648),
+            (crate::effects::JfifBw::Rgb24, 4944),
+        ] {
+            for f in ["jfif", "jpeg", "exif"] {
+                assert_eq!(
+                    bytes_per_line_fx(f, 1648, ColorMode::Bw1, false, J::Gray8, bw),
+                    want,
+                    "{f} {bw:?}"
+                );
+            }
+            assert_eq!(
+                bytes_per_line_fx(
+                    "tiff-single-uncompressed",
+                    1648,
+                    ColorMode::Bw1,
+                    false,
+                    J::Gray8,
+                    bw
+                ),
+                206
+            );
+        }
+        // Only Gray8 tickets are affected; RGB JFIF and uncompressed formats are not.
+        let g = ColorMode::Gray8;
+        assert_eq!(
+            bytes_per_line_fx(
+                "jfif",
+                1648,
+                ColorMode::Rgb24,
+                false,
+                J::Gray8,
+                B::default()
+            ),
+            4944
+        );
+        assert_eq!(
+            bytes_per_line_fx("exif", 1648, g, false, J::Gray8, B::default()),
+            1648
+        );
+        assert_eq!(
+            bytes_per_line_fx(
+                "tiff-single-uncompressed",
+                1648,
+                g,
+                false,
+                J::Gray8Tiff,
+                B::default()
+            ),
+            1648
+        );
+        assert_eq!(
+            bytes_per_line_fx("jfif", 1648, g, true, J::Gray8, B::default()),
+            0
+        );
+    }
+
+    #[test]
+    fn jfif_gray_mode_encodes_single_component_jpeg() {
+        let r = reference(ColorMode::Gray8, DPI, 0);
+        let mut pages = vec![(r.clone(), 0u32, None)];
+        let spec = PixelSpec {
+            color: ColorMode::Gray8,
+            polarity: BilevelPolarity::BlackIsZero,
+            jfif_gray: crate::effects::JfifGray::Gray8,
+            ..PixelSpec::default()
+        };
+        for f in ["jfif", "exif"] {
+            let b = encode_images(f, &pages, 95, EncodeOpts::WITH_COM, DPI, spec).unwrap();
+            assert_eq!(jpeg_sof0_components(&b).len(), 1, "{f}");
+            let img = image::load_from_memory(&b).unwrap();
+            assert_eq!(img.color(), image::ColorType::L8);
+            assert_eq!((img.width(), img.height()), r.dimensions());
+            // Samples track the pattern luminance.
+            let got = img.to_luma8();
+            let n = got.pixels().count() as u64;
+            let diff: u64 = got
+                .pixels()
+                .zip(r.pixels())
+                .map(|(a, b)| u64::from(a.0[0].abs_diff(b.0[0])))
+                .sum();
+            assert!(diff / n < 6, "mean abs diff {}", diff / n);
+        }
+        // Default spec keeps three components for gray tickets.
+        pages.truncate(1);
+        let b = encode_images(
+            "jfif",
+            &pages,
+            95,
+            EncodeOpts::WITH_COM,
+            DPI,
+            PixelSpec {
+                jfif_gray: crate::effects::JfifGray::Rgb24,
+                ..spec
+            },
+        )
+        .unwrap();
+        assert_eq!(jpeg_sof0_components(&b).len(), 3);
+    }
+
+    #[test]
+    fn bytes_per_line_table() {
+        use ColorMode::*;
+        let t = [
+            ("bmp", 1648, Bw1, 208), // ceil(1648/8)=206 -> 208
+            ("dib", 1648, Bw1, 208),
+            ("bmp", 1648, Gray8, 1648),
+            ("bmp", 1648, Rgb24, 4944),
+            ("bmp", 850, Rgb24, 2552), // 2550 padded to DWORD
+            ("bmp", 850, Gray8, 852),
+            ("bmp", 900, Bw1, 116), // 113 padded
+            ("tiff-single-uncompressed", 1648, Bw1, 206),
+            ("tiff-single-uncompressed", 1648, Gray8, 1648),
+            ("tiff-single-uncompressed", 1648, Rgb24, 4944),
+            ("tiff-multi-uncompressed", 900, Bw1, 113),
+            ("png", 900, Bw1, 113),
+            ("jfif", 1648, Bw1, 1648), // jfif_bw default gray8
+            ("jfif", 1648, Gray8, 1648),
+        ];
+        for (f, w, c, want) in t {
+            assert_eq!(bytes_per_line(f, w, c, false), want, "{f} {w} {c:?}");
+        }
+        assert_eq!(bytes_per_line("bmp", 1648, Bw1, true), 208);
+        assert_eq!(bytes_per_line("jfif", 1648, Bw1, true), 0);
+    }
+
+    #[test]
+    fn qr_survives_thresholding_to_1bit_bmp() {
+        for dpi in [200u32, 100] {
+            let b = enc(
+                "bmp",
+                ColorMode::Bw1,
+                BilevelPolarity::WhiteIsZero,
+                dpi,
+                &[3],
+            );
+            let bmp = parse_bmp(&b);
+            let img = image::GrayImage::from_fn(bmp.w, bmp.h, |x, y| {
+                image::Luma([bmp_visual(&bmp, x, y)])
+            });
+            let mut prep = rqrr::PreparedImage::prepare(img);
+            let grids = prep.detect_grids();
+            let decoded = grids.first().and_then(|g| g.decode().ok());
+            eprintln!(
+                "QR after 1-bit threshold at {dpi} dpi: {}",
+                decoded.is_some()
+            );
+            if dpi == 200 {
+                let (_m, content) = decoded.expect("QR must decode at default dpi");
+                assert_eq!(parse_qr_payload(&content).unwrap().page, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_bw_pages_differ() {
+        let a = enc(
+            "bmp",
+            ColorMode::Bw1,
+            BilevelPolarity::BlackIsZero,
+            DPI,
+            &[0],
+        );
+        let b = enc(
+            "bmp",
+            ColorMode::Bw1,
+            BilevelPolarity::BlackIsZero,
+            DPI,
+            &[1],
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn polarity_parse_and_effects_body() {
+        use crate::effects::EffectsBody;
+        assert_eq!(
+            BilevelPolarity::parse("white_is_zero").unwrap(),
+            BilevelPolarity::WhiteIsZero
+        );
+        assert_eq!(
+            BilevelPolarity::parse("MinIsBlack").unwrap(),
+            BilevelPolarity::BlackIsZero
+        );
+        assert!(BilevelPolarity::parse("sideways").is_err());
+        let mut e = ImageEffects::default();
+        e.apply_body(&EffectsBody {
+            bilevel_polarity: Some("white_is_zero".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(e.bilevel_polarity, BilevelPolarity::WhiteIsZero);
+        assert!(e.is_clean(), "polarity is not a pixel defect");
+        assert_eq!(e.summary().bilevel_polarity, "white_is_zero");
+        e.apply_preset("dirty_adf").unwrap();
+        assert_eq!(e.bilevel_polarity, BilevelPolarity::WhiteIsZero);
+        e.apply_body(&EffectsBody {
+            clear: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(e.bilevel_polarity, BilevelPolarity::BlackIsZero);
+        assert!(e
+            .apply_body(&EffectsBody {
+                bilevel_polarity: Some("x".into()),
+                ..Default::default()
+            })
+            .is_err());
+    }
+}
+
+/// Container-level checks: TIFF TN2 photometric, resolution metadata, PDF/XPS geometry,
+/// gray/bilevel stream shapes.
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+    use crate::effects::{ColorMode, ImageEffects};
+    use std::collections::HashMap;
+
+    fn enc(fmt: &str, color: ColorMode, dpi: u32, sheets: &[u32]) -> Vec<u8> {
+        encode_pattern_pages(
+            fmt,
+            PatternId::PageId,
+            dpi,
+            sheets,
+            None,
+            Some(&ImageEffects::default()),
+            color,
+            EncodeOpts::WITH_COM,
+        )
+        .unwrap()
+    }
+
+    fn reference(color: ColorMode, dpi: u32, sheet: u32) -> RgbImage {
+        let (mut img, _) = render_pattern_rgb_ctx(
+            PatternId::PageId,
+            dpi,
+            sheet,
+            None,
+            EncodeOpts::WITH_COM,
+            None,
+        )
+        .unwrap();
+        crate::effects::apply_pipeline(&mut img, &ImageEffects::default(), sheet, color);
+        img
+    }
+
+    fn u16le(b: &[u8], o: usize) -> u32 {
+        u32::from(u16::from_le_bytes([b[o], b[o + 1]]))
+    }
+    fn u32le(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
+
+    /// One IFD: tag -> (type, count, value-field offset).
+    type Ifd = HashMap<u32, (u32, u32, usize)>;
+
+    fn ifds(b: &[u8]) -> Vec<Ifd> {
+        assert_eq!(&b[0..4], &[b'I', b'I', 42, 0]);
+        let mut at = u32le(b, 4) as usize;
+        let mut out = Vec::new();
+        while at != 0 {
+            let n = u16le(b, at) as usize;
+            let mut prev = 0;
+            let mut m = Ifd::new();
+            for i in 0..n {
+                let e = at + 2 + i * 12;
+                let tag = u16le(b, e);
+                assert!(tag > prev, "IFD tags must be sorted ({tag} after {prev})");
+                prev = tag;
+                m.insert(tag, (u16le(b, e + 2), u32le(b, e + 4), e + 8));
+            }
+            out.push(m);
+            at = u32le(b, at + 2 + n * 12) as usize;
+        }
+        out
+    }
+
+    fn short(b: &[u8], ifd: &Ifd, tag: u32) -> u32 {
+        let (typ, _, at) = ifd[&tag];
+        assert_eq!(typ, 3, "tag {tag} is a SHORT");
+        u16le(b, at)
+    }
+
+    fn rational(b: &[u8], ifd: &Ifd, tag: u32) -> (u32, u32) {
+        let (typ, _, at) = ifd[&tag];
+        assert_eq!(typ, 5, "tag {tag} is a RATIONAL");
+        let off = u32le(b, at) as usize;
+        (u32le(b, off), u32le(b, off + 4))
+    }
+
+    fn assert_tiff_dpi(b: &[u8], dpi: u32, label: &str) {
+        let pages = ifds(b);
+        assert!(!pages.is_empty());
+        for ifd in &pages {
+            assert_eq!(short(b, ifd, 296), 2, "{label}: ResolutionUnit inch");
+            assert_eq!(rational(b, ifd, 282), (dpi, 1), "{label}: XResolution");
+            assert_eq!(rational(b, ifd, 283), (dpi, 1), "{label}: YResolution");
+        }
+    }
+
+    fn strip(b: &[u8], ifd: &Ifd) -> Vec<u8> {
+        let off = u32le(b, ifd[&273].2) as usize;
+        let len = u32le(b, ifd[&279].2) as usize;
+        b[off..off + len].to_vec()
+    }
+
+    #[test]
+    fn tn2_color_tiff_is_ycbcr_with_matching_subsampling() {
+        for fmt in ["tiff-single-jpeg-tn2", "tiff-multi-jpeg-tn2"] {
+            let sheets: &[u32] = if fmt.contains("multi") { &[0, 1] } else { &[0] };
+            let b = enc(fmt, ColorMode::Rgb24, 100, sheets);
+            let pages = ifds(&b);
+            assert_eq!(pages.len(), sheets.len());
+            for ifd in &pages {
+                assert_eq!(short(&b, ifd, 259), 7, "{fmt}: JPEG");
+                assert_eq!(short(&b, ifd, 262), 6, "{fmt}: Photometric YCbCr, not RGB");
+                assert_eq!(short(&b, ifd, 277), 3);
+                assert_eq!(ifd[&258].1, 3, "BitsPerSample count");
+                // YCbCrSubSampling must equal the stream's luma sampling factors.
+                let (typ, count, at) = ifd[&530];
+                assert_eq!((typ, count), (3, 2), "YCbCrSubSampling SHORT[2]");
+                let sub = (u16le(&b, at), u16le(&b, at + 2));
+                let jpeg = strip(&b, ifd);
+                let comps = jpeg_sof0_components(&jpeg);
+                assert_eq!(comps.len(), 3);
+                let (_, h, v) = comps[0];
+                assert_eq!(sub, (u32::from(h), u32::from(v)), "tag 530 == SOF luma H,V");
+                assert_eq!(sub, (2, 2), "4:2:0");
+                assert_eq!(short(&b, ifd, 531), 1, "YCbCrPositioning centred");
+            }
+        }
+    }
+
+    #[test]
+    fn tn2_color_tiff_decodes_with_correct_colours_independently() {
+        // Decode the finished TIFF with the independent `tiff` crate (JPEG via zune) and
+        // compare the mean of every channel with the rendered page.
+        let b = enc("tiff-single-jpeg-tn2", ColorMode::Rgb24, 100, &[0]);
+        let want = reference(ColorMode::Rgb24, 100, 0);
+        let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(&b)).expect("tiff decode");
+        let (w, h) = dec.dimensions().unwrap();
+        assert_eq!((w, h), want.dimensions());
+        let ct = dec.colortype().unwrap();
+        let raw = match dec.read_image().expect("read_image") {
+            tiff::decoder::DecodingResult::U8(v) => v,
+            _ => panic!("unexpected sample type"),
+        };
+        assert_eq!(raw.len(), (w * h * 3) as usize, "{ct:?}");
+        // The tiff crate honours Photometric=YCbCr and hands back the stream's YCbCr samples
+        // (it would refuse or mis-label them had the IFD said RGB); convert with JFIF BT.601.
+        assert_eq!(ct, tiff::ColorType::YCbCr(8));
+        let ycc = |p: &[u8]| -> [u8; 3] {
+            let (y, cb, cr) = (
+                f32::from(p[0]),
+                f32::from(p[1]) - 128.0,
+                f32::from(p[2]) - 128.0,
+            );
+            let q = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+            [
+                q(y + 1.402 * cr),
+                q(y - 0.344_136 * cb - 0.714_136 * cr),
+                q(y + 1.772 * cb),
+            ]
+        };
+        let mean = |px: &mut dyn Iterator<Item = [u8; 3]>| {
+            let (mut s, mut n) = ([0u64; 3], 0u64);
+            for p in px {
+                for c in 0..3 {
+                    s[c] += u64::from(p[c]);
+                }
+                n += 1;
+            }
+            [s[0] / n, s[1] / n, s[2] / n]
+        };
+        let got = mean(&mut raw.chunks_exact(3).map(ycc));
+        let exp = mean(&mut want.pixels().map(|p| p.0));
+        for c in 0..3 {
+            assert!(
+                got[c].abs_diff(exp[c]) <= 3,
+                "channel {c}: decoded mean {} vs rendered {} ({ct:?})",
+                got[c],
+                exp[c]
+            );
+        }
+    }
+
+    #[test]
+    fn tn2_gray_and_bw_tiff_are_single_component_black_is_zero() {
+        for color in [ColorMode::Gray8, ColorMode::Bw1] {
+            let b = enc("tiff-multi-jpeg-tn2", color, 100, &[0, 1]);
+            let pages = ifds(&b);
+            assert_eq!(pages.len(), 2);
+            for ifd in &pages {
+                assert_eq!(short(&b, ifd, 262), 1, "{color:?}: BlackIsZero");
+                assert_eq!(short(&b, ifd, 277), 1);
+                assert_eq!(short(&b, ifd, 258), 8);
+                assert!(!ifd.contains_key(&530), "no YCbCr tags for gray");
+                assert_eq!(jpeg_sof0_components(&strip(&b, ifd)).len(), 1, "{color:?}");
+            }
+            let mut dec = tiff::decoder::Decoder::new(std::io::Cursor::new(&b)).unwrap();
+            assert_eq!(dec.colortype().unwrap(), tiff::ColorType::Gray(8));
+        }
+    }
+
+    #[test]
+    fn tn2_tiff_bytes_are_deterministic() {
+        for color in [ColorMode::Rgb24, ColorMode::Gray8] {
+            assert_eq!(
+                enc("tiff-multi-jpeg-tn2", color, 100, &[0, 1]),
+                enc("tiff-multi-jpeg-tn2", color, 100, &[0, 1])
+            );
+        }
+    }
+
+    #[test]
+    fn every_tiff_flavour_carries_the_real_dpi() {
+        for dpi in [100u32, 150] {
+            for (fmt, color) in [
+                ("tiff-single-uncompressed", ColorMode::Rgb24),
+                ("tiff-multi-uncompressed", ColorMode::Rgb24),
+                ("tiff-single-uncompressed", ColorMode::Gray8),
+                ("tiff-multi-uncompressed", ColorMode::Bw1),
+                ("tiff-single-g4", ColorMode::Bw1),
+                ("tiff-multi-g4", ColorMode::Bw1),
+                ("tiff-single-g3mh", ColorMode::Bw1),
+                ("tiff-single-jpeg-tn2", ColorMode::Rgb24),
+                ("tiff-multi-jpeg-tn2", ColorMode::Gray8),
+            ] {
+                let sheets: &[u32] = if fmt.contains("multi") { &[0, 1] } else { &[0] };
+                let b = enc(fmt, color, dpi, sheets);
+                assert_tiff_dpi(&b, dpi, &format!("{fmt} {color:?} @{dpi}"));
+            }
+        }
+    }
+
+    #[test]
+    fn jfif_density_png_phys_and_bmp_ppm_carry_the_dpi() {
+        // 150 dpi -> 5906 px/m (rounded), 100 -> 3937.
+        for (dpi, ppm) in [(100u32, 3937u32), (150, 5906)] {
+            for color in [ColorMode::Rgb24, ColorMode::Gray8, ColorMode::Bw1] {
+                let j = enc("jfif", color, dpi, &[0]);
+                assert_eq!(
+                    jpeg_jfif_density(&j),
+                    Some((1, dpi as u16, dpi as u16)),
+                    "jfif {color:?}"
+                );
+                let png = enc("png", color, dpi, &[0]);
+                let rd = png::Decoder::new(std::io::Cursor::new(&png))
+                    .read_info()
+                    .unwrap();
+                let pd = rd.info().pixel_dims.expect("pHYs");
+                assert_eq!(
+                    (pd.xppu, pd.yppu, pd.unit),
+                    (ppm, ppm, png::Unit::Meter),
+                    "png {color:?}"
+                );
+                let bmp = enc("bmp", color, dpi, &[0]);
+                assert_eq!(u32le(&bmp, 38), ppm, "bmp X ppm {color:?}");
+                assert_eq!(u32le(&bmp, 42), ppm, "bmp Y ppm {color:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bmp_24bpp_stays_bottom_up_and_pixel_exact() {
+        let b = enc("bmp", ColorMode::Rgb24, 100, &[0]);
+        assert_eq!(u16le(&b, 28), 24);
+        assert!((u32le(&b, 22) as i32) > 0, "24-bpp stays bottom-up");
+        let want = reference(ColorMode::Rgb24, 100, 0);
+        let got = image::load_from_memory_with_format(&b, image::ImageFormat::Bmp)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(got, want, "BGR order and row order");
+    }
+
+    #[test]
+    fn gray_and_bw_jpeg2k_are_single_component() {
+        // SIZ marker (FF51): Csiz sits 38 bytes after the marker's first byte.
+        let csiz = |b: &[u8]| {
+            let at = b.windows(2).position(|w| w == [0xFF, 0x51]).expect("SIZ");
+            u16::from_be_bytes([b[at + 38], b[at + 39]])
+        };
+        assert_eq!(csiz(&enc("jpeg2k", ColorMode::Rgb24, 100, &[0])), 3);
+        assert_eq!(csiz(&enc("jpeg2k", ColorMode::Gray8, 100, &[0])), 1);
+        assert_eq!(csiz(&enc("jpeg2k", ColorMode::Bw1, 100, &[0])), 1);
+    }
+
+    #[test]
+    fn jfif_gray_and_bw_defaults_are_one_component() {
+        // Gray8 JFIF follows the jfif_gray effect (default gray8 -> 1 component) ...
+        assert_eq!(
+            jpeg_sof0_components(&enc("jfif", ColorMode::Gray8, 100, &[0])).len(),
+            1
+        );
+        // ... Bw1 JFIF follows jfif_bw (default gray8 -> 1 component; rgb24 is covered in
+        // bilevel_tests::jfif_bw_modes_*).
+        assert_eq!(
+            jpeg_sof0_components(&enc("jfif", ColorMode::Bw1, 100, &[0])).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn pdf_mediabox_is_physical_points_and_colorspace_follows_color() {
+        // 100 dpi page -> pixels * 72 / 100 points.
+        let (pw, ph) = capped_page_pixels(100);
+        let want_w = fmt_units(f64::from(pw) * 72.0 / 100.0);
+        let want_h = fmt_units(f64::from(ph) * 72.0 / 100.0);
+        for (color, cs, other) in [
+            (ColorMode::Rgb24, "/ColorSpace /DeviceRGB", "DeviceGray"),
+            (ColorMode::Gray8, "/ColorSpace /DeviceGray", "DeviceRGB"),
+            (ColorMode::Bw1, "/ColorSpace /DeviceGray", "DeviceRGB"),
+        ] {
+            let b = enc("pdf-a", color, 100, &[0, 1]);
+            let t = String::from_utf8_lossy(&b).into_owned();
+            let mb = format!("/MediaBox [0 0 {want_w} {want_h}]");
+            assert_eq!(t.matches(&mb).count(), 2, "{color:?}: {mb}");
+            assert!(
+                t.contains(&format!("{want_w} 0 0 {want_h} 0 0 cm")),
+                "{color:?}: image fills the page"
+            );
+            assert_eq!(t.matches(cs).count(), 2, "{color:?}: {cs}");
+            assert!(t.contains(&format!("/Width {pw} /Height {ph}")));
+            assert!(!t.contains(other), "{color:?}: no stray {other}");
+        }
+        // 200 dpi letter is ~612x792 pt, not ~1700x2200.
+        let b = enc("pdf", ColorMode::Rgb24, 200, &[0]);
+        let t = String::from_utf8_lossy(&b).into_owned();
+        let mb = t.split("/MediaBox [0 0 ").nth(1).unwrap();
+        let w: f64 = mb.split(' ').next().unwrap().parse().unwrap();
+        assert!((590.0..=616.0).contains(&w), "MediaBox width {w}pt");
+    }
+
+    #[test]
+    fn xps_page_is_in_96ths_of_an_inch_with_matching_brush() {
+        use std::io::Read;
+        for (dpi, color) in [(100u32, ColorMode::Rgb24), (200, ColorMode::Gray8)] {
+            let b = enc("xps", color, dpi, &[0, 1]);
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(b)).unwrap();
+            let (pw, ph) = capped_page_pixels(dpi);
+            let w = fmt_units(f64::from(pw) * 96.0 / f64::from(dpi));
+            let h = fmt_units(f64::from(ph) * 96.0 / f64::from(dpi));
+            for page in 1..=2 {
+                let mut s = String::new();
+                z.by_name(&format!("Documents/1/Pages/{page}.fpage"))
+                    .unwrap()
+                    .read_to_string(&mut s)
+                    .unwrap();
+                assert!(s.contains(&format!("Width=\"{w}\" Height=\"{h}\"")), "{s}");
+                assert!(s.contains(&format!("M 0,0 L {w},0 {w},{h} 0,{h} Z")), "{s}");
+                assert!(s.contains(&format!("Viewbox=\"0,0,{w},{h}\"")), "{s}");
+                assert!(s.contains(&format!("Viewport=\"0,0,{w},{h}\"")), "{s}");
+                let mut jpg = Vec::new();
+                z.by_name(&format!("Documents/1/Resources/{page}.jpg"))
+                    .unwrap()
+                    .read_to_end(&mut jpg)
+                    .unwrap();
+                // Natural image size = pixels * 96 / dpi relies on the JPEG's own density.
+                assert_eq!(jpeg_jfif_density(&jpg), Some((1, dpi as u16, dpi as u16)));
+                assert_eq!(
+                    jpeg_sof0_components(&jpg).len(),
+                    if color == ColorMode::Rgb24 { 3 } else { 1 }
+                );
+            }
+        }
     }
 }

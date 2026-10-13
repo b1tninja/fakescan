@@ -84,6 +84,9 @@ pub struct DiscoveryConfig {
     /// `0` → same as `instance_id` at `run()`. Bumped on start so clients
     /// refresh cached Transfer Get metadata after a process restart.
     pub metadata_version: u64,
+    /// Called with the requester's IP when this device answers a Probe/Resolve (the manager
+    /// records it as peer contact for the device). `None` = nobody is told.
+    pub on_peer: Option<Arc<dyn Fn(std::net::IpAddr) + Send + Sync>>,
 }
 
 /// Boot-time InstanceId / MetadataVersion (seconds since UNIX epoch, ≥ 1).
@@ -92,11 +95,24 @@ pub struct DiscoveryConfig {
 /// and comes back. WSDAPI ignores Hellos whose MessageNumber is below the last
 /// seen value *for that InstanceId* — fixing InstanceId at `1` across restarts
 /// makes post-restart Hellos look stale after a long prior run.
+///
+/// Strictly increasing within a process: a device removed and re-added in the same wall-clock
+/// second (UI toggle, registry reload) would otherwise reuse the InstanceId while restarting
+/// `MessageNumber` at 1, and WSDAPI drops those Hellos as stale.
 pub fn boot_sequence_id() -> u64 {
-    SystemTime::now()
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().max(1))
-        .unwrap_or(1)
+        .unwrap_or(1);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(prev.saturating_add(1));
+        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => prev = seen,
+        }
+    }
 }
 
 /// Run WS-Discovery until `stop` is signaled, then multicast Bye and return.
@@ -175,7 +191,13 @@ pub async fn run(
             }
         }
     } else {
-        info!("no :3702 recv socket (dasHost likely exclusive); Hello-only mode");
+        if cfg.listen_probes {
+            info!("could not bind :3702 for Probe/Resolve (another process holds it exclusively); Hello-only mode");
+        } else {
+            info!(
+                "Probe/Resolve listening is off (Windows default; enable with --probe-listen); Hello-only mode:                  Probe/Resolve from Windows 'Add device' refresh are not answered"
+            );
+        }
         loop {
             tokio::select! {
                 _ = &mut stop => {
@@ -227,18 +249,20 @@ async fn send_bye(
     }
 }
 
-async fn handle_datagram(
-    send: &UdpSocket,
-    cfg: &DiscoveryConfig,
-    bytes: &[u8],
-    peer: SocketAddr,
-    msg_number: &mut u64,
-) {
-    let text = String::from_utf8_lossy(bytes);
+/// What kind of WS-Discovery request a datagram is, as far as THIS device (`uuid`) answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestKind {
+    Probe,
+    Resolve,
+}
+
+/// Decide whether `text` is a Probe/Resolve this device answers. `None` for Match datagrams,
+/// unrelated traffic, a Probe whose Types filter excludes scanners, or a Resolve addressed to
+/// another device's EPR.
+pub fn classify_request(text: &str, uuid: Uuid) -> Option<RequestKind> {
     // Ignore our own / others' match replies.
     if text.contains("ProbeMatch") || text.contains("ResolveMatch") {
-        debug!(%peer, bytes = bytes.len(), "discovery Match datagram (ignored)");
-        return;
+        return None;
     }
     let is_resolve = text.contains("<wsd:Resolve")
         || text.contains(":Resolve>")
@@ -249,11 +273,9 @@ async fn handle_datagram(
         || text.contains("<Probe>")
         || text.contains("discovery/Probe");
     if !is_probe && !is_resolve {
-        debug!(%peer, bytes = bytes.len(), "discovery datagram (ignored)");
-        return;
+        return None;
     }
-
-    // Resolve always targets our EPR; Probe may filter by Types.
+    // Resolve always targets an EPR; Probe may filter by Types.
     let types_ok = is_resolve
         || text.contains("ScannerServiceType")
         || text.contains("ScanDeviceType")
@@ -261,16 +283,37 @@ async fn handle_datagram(
         || text.contains(":Device")
         || !text.contains("Types>");
     if !types_ok {
-        debug!(%peer, "Probe Types filter miss");
-        return;
+        return None;
     }
-    // Resolve for a different device UUID — ignore.
     if is_resolve {
-        let uuid_s = cfg.device_uuid.to_string();
+        let uuid_s = uuid.to_string();
         if !text.contains(&uuid_s) && !text.contains(&uuid_s.to_ascii_uppercase()) {
-            debug!(%peer, "Resolve for other EPR (ignored)");
-            return;
+            return None;
         }
+        return Some(RequestKind::Resolve);
+    }
+    Some(RequestKind::Probe)
+}
+
+/// Handle one inbound datagram (pub for tests; the receive loop is the only production caller).
+pub async fn handle_datagram(
+    send: &UdpSocket,
+    cfg: &DiscoveryConfig,
+    bytes: &[u8],
+    peer: SocketAddr,
+    msg_number: &mut u64,
+) {
+    let text = String::from_utf8_lossy(bytes);
+    let Some(kind) = classify_request(&text, cfg.device_uuid) else {
+        debug!(%peer, bytes = bytes.len(), "discovery datagram (ignored by this device)");
+        return;
+    };
+    let is_resolve = kind == RequestKind::Resolve;
+    // Peer contact: only a device that is actually going to answer records the peer, so a Probe
+    // that matches every device marks all of them and a Resolve marks just its target. The
+    // callback throttles (same interval as the HTTP path).
+    if let Some(on_peer) = &cfg.on_peer {
+        on_peer(peer.ip());
     }
 
     *msg_number = msg_number.saturating_add(1);
@@ -522,6 +565,7 @@ mod tests {
             stats: Arc::new(DiscoveryStats::default()),
             instance_id,
             metadata_version,
+            on_peer: None,
         }
     }
 
@@ -584,11 +628,119 @@ mod tests {
     }
 
     #[test]
+    fn boot_sequence_id_is_strictly_increasing_and_fits_xs_unsigned_int() {
+        let a = boot_sequence_id();
+        let b = boot_sequence_id();
+        let c = boot_sequence_id();
+        assert!(a < b && b < c, "{a} {b} {c}");
+        // AppSequence/@InstanceId and MetadataVersion are xs:unsignedInt.
+        assert!(c <= u64::from(u32::MAX), "{c}");
+    }
+
+    /// Wire shape WSDAPI validates on Hello: To/Action, AppSequence, and the body child order
+    /// EndpointReference, Types, XAddrs, MetadataVersion (no Scopes: Brother omits them too).
+    /// Every QName prefix used in Types must be declared on the envelope.
+    #[test]
+    fn hello_matches_wsd_message_shape() {
+        let xml = build_hello(&cfg(1_700_000_000, 1_700_000_001), 1);
+        let at = |needle: &str| {
+            xml.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing: {xml}"))
+        };
+        assert!(xml.contains("<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>"));
+        assert!(xml.contains(
+            "<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Hello</wsa:Action>"
+        ));
+        assert!(
+            xml.contains("<wsa:MessageID>urn:uuid:"),
+            "WSDAPI uses urn:uuid: ids: {xml}"
+        );
+        assert!(
+            at("<wsa:EndpointReference>") < at("<wsd:Types>")
+                && at("<wsd:Types>") < at("<wsd:XAddrs>")
+                && at("<wsd:XAddrs>") < at("<wsd:MetadataVersion>"),
+            "{xml}"
+        );
+        assert!(!xml.contains("Scopes"), "{xml}");
+        assert!(xml.contains("<wsd:Types>wsdp:Device wscn:ScanDeviceType</wsd:Types>"));
+        assert!(xml.contains(r#"xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof""#));
+        assert!(xml.contains(&format!(r#"xmlns:wscn="{SCAN_NS}""#)));
+        // One datagram, no IP fragmentation on a 1500-byte MTU.
+        assert!(xml.len() < 1400, "Hello is {} bytes", xml.len());
+        let pm = build_probe_match(&cfg(1, 1), Uuid::nil(), 1);
+        assert!(pm.len() < 1400, "ProbeMatch is {} bytes", pm.len());
+        assert!(pm.contains(
+            "<wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>"
+        ));
+        assert!(pm.contains("discovery/ProbeMatches</wsa:Action>"));
+    }
+
+    #[test]
     fn discovery_stats_sequence_round_trips() {
         let stats = DiscoveryStats::default();
         assert_eq!(stats.sequence(), (0, 0));
         let id = boot_sequence_id();
         stats.set_sequence(id, id.saturating_add(1));
         assert_eq!(stats.sequence(), (id, id.saturating_add(1)));
+    }
+
+    const PROBE: &str = r#"<s:Envelope><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action><a:MessageID>urn:uuid:11111111-1111-1111-1111-111111111111</a:MessageID></s:Header><s:Body><d:Probe><d:Types>wsdp:Device</d:Types></d:Probe></s:Body></s:Envelope>"#;
+
+    fn resolve_for(uuid: Uuid) -> String {
+        format!(
+            r#"<s:Envelope><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Resolve</a:Action></s:Header><s:Body><d:Resolve><a:EndpointReference><a:Address>urn:uuid:{uuid}</a:Address></a:EndpointReference></d:Resolve></s:Body></s:Envelope>"#
+        )
+    }
+
+    #[test]
+    fn classify_probe_resolve_and_ignored() {
+        let me = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+        assert_eq!(classify_request(PROBE, me), Some(RequestKind::Probe));
+        assert_eq!(
+            classify_request(&resolve_for(me), me),
+            Some(RequestKind::Resolve)
+        );
+        assert_eq!(
+            classify_request(&resolve_for(other), me),
+            None,
+            "Resolve for another EPR"
+        );
+        assert_eq!(classify_request("<ProbeMatch/>", me), None);
+        assert_eq!(classify_request("hello", me), None);
+    }
+
+    /// handle_datagram reports the peer only when this device answers; no multicast sockets.
+    #[tokio::test]
+    async fn on_peer_fires_only_for_the_device_that_answers() {
+        use std::sync::Mutex;
+        let sock = bind_loopback().await;
+        let seen: Arc<Mutex<Vec<std::net::IpAddr>>> = Arc::default();
+        let mk = |uuid: Uuid| {
+            let seen = Arc::clone(&seen);
+            let mut c = cfg(5, 5);
+            c.device_uuid = uuid;
+            c.on_peer = Some(Arc::new(move |ip| seen.lock().unwrap().push(ip)));
+            c
+        };
+        let (a, b) = (Uuid::from_u128(0xa), Uuid::from_u128(0xb));
+        let peer: SocketAddr = "127.0.0.1:9".parse().unwrap(); // discard port; the reply is dropped
+        let mut n = 0u64;
+        // Resolve for a: only a's config reports.
+        handle_datagram(&sock, &mk(a), resolve_for(a).as_bytes(), peer, &mut n).await;
+        handle_datagram(&sock, &mk(b), resolve_for(a).as_bytes(), peer, &mut n).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // A Types-matching Probe is answered (and reported) by every device.
+        handle_datagram(&sock, &mk(a), PROBE.as_bytes(), peer, &mut n).await;
+        handle_datagram(&sock, &mk(b), PROBE.as_bytes(), peer, &mut n).await;
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        // Match datagrams and noise report nothing.
+        handle_datagram(&sock, &mk(a), b"<ProbeMatches/>", peer, &mut n).await;
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert!(seen.lock().unwrap().iter().all(|ip| ip.is_loopback()));
+    }
+
+    async fn bind_loopback() -> UdpSocket {
+        UdpSocket::bind("127.0.0.1:0").await.unwrap()
     }
 }

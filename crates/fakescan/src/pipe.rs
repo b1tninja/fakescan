@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::manager::DeviceCtx;
 use crate::state::World;
 
 /// Start `\\.\pipe\fakescan-<name>`.
@@ -31,19 +32,19 @@ use crate::state::World;
 /// `tokio::spawn` it without blocking.
 ///
 /// On non-Windows platforms this returns immediately after logging a debug note.
-pub async fn serve(name: &str, world: Arc<RwLock<World>>) {
+pub async fn serve(name: &str, world: Arc<RwLock<World>>, ctx: Option<DeviceCtx>) {
     #[cfg(target_os = "windows")]
-    serve_windows(name, world).await;
+    serve_windows(name, world, ctx).await;
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (name, world);
+        let _ = (name, world, ctx);
         tracing::debug!("named pipe server is Windows-only; skipped on this platform");
     }
 }
 
 #[cfg(target_os = "windows")]
-async fn serve_windows(name: &str, world: Arc<RwLock<World>>) {
+async fn serve_windows(name: &str, world: Arc<RwLock<World>>, ctx: Option<DeviceCtx>) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -82,6 +83,7 @@ async fn serve_windows(name: &str, world: Arc<RwLock<World>>) {
         }
 
         let world2 = Arc::clone(&world);
+        let ctx2 = ctx.clone();
         tokio::spawn(async move {
             let (reader, mut writer) = tokio::io::split(server);
             let mut lines = BufReader::new(reader).lines();
@@ -91,7 +93,7 @@ async fn serve_windows(name: &str, world: Arc<RwLock<World>>) {
                     continue;
                 }
                 let resp = match serde_json::from_str::<crate::ctl::CtlRequest>(&raw) {
-                    Ok(req) => match crate::ctl::dispatch(&world2, req).await {
+                    Ok(req) => match crate::ctl::dispatch_ctx(ctx2.as_ref(), &world2, req).await {
                         Ok(v) => serde_json::json!({ "ok": true, "result": v }),
                         Err(e) => {
                             serde_json::json!({ "ok": false, "error": e.to_string() })

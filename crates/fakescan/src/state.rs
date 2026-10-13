@@ -12,6 +12,13 @@ use crate::effects::{ColorMode, EffectsBody, EffectsSummary, ImageEffects};
 use crate::image_gen::{self, PageSide, PatternId};
 use crate::profile::Profile;
 use crate::scenarios::{self, Scenario};
+use crate::wsd::soap::Envelope;
+use crate::wsd::xml::{self, Element};
+
+mod faultplan;
+pub use faultplan::{
+    Cut, FaultKind, LiveCut, PlanBody, PlanEntryView, PlanIn, Trigger, WhenIn, WhenObj,
+};
 
 /// Sheet index order for RetrieveImage (manual duplex flip pass uses `Reverse`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -51,6 +58,12 @@ pub struct ScanJob {
     pub height_px: u32,
     pub pages_left: u32,
     pub page_index: u32,
+    /// Feeder sheets already consumed by earlier jobs when this one was created
+    /// (first sheet index this job reads; 0 on a freshly loaded stack and for glass).
+    pub sheet_base: u32,
+    /// Sheets in the loaded stack at Create (for `order=reverse`); equals the job's own
+    /// sheet count when the job takes the whole stack.
+    pub stack_total: u32,
     /// Hardware ADF duplex: each sheet yields front then back (2 faces).
     pub duplex: bool,
     /// When CreateScanJob accepted the ticket (JobTimedOut clock).
@@ -73,8 +86,18 @@ pub struct ScanJob {
 
 /// Default Create→Retrieve / between-Retrieve idle limit (MS CreateScanJobResponse).
 pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default delay before `empty_feeder_brother` refuses a feeder job (measured ~10 s on the Brother).
+pub const DEFAULT_EMPTY_FEEDER_DELAY_MS: u64 = 10_000;
 
 impl ScanJob {
+    /// Face position within the loaded feeder stack (faces consumed by earlier jobs of the
+    /// same stack plus this job's delivered pages). Equals `page_index` for the first job on a
+    /// stack and for glass, so fault-plan `page` / `after_pages` keep their per-scan meaning
+    /// there while a stack scanned as several one-page jobs still counts 1, 2, 3.
+    pub fn stack_position(&self) -> u32 {
+        self.sheet_base * if self.duplex { 2 } else { 1 } + self.page_index
+    }
+
     pub fn job_state(&self) -> &'static str {
         if self.aborted {
             "Aborted"
@@ -116,6 +139,9 @@ pub struct World {
     lab_listen: Option<std::net::SocketAddr>,
     /// Synthetic pages available in the feeder (0 = empty / glass-only).
     pages_remaining: u32,
+    /// Sheets in the stack at the last load (`set_pages`); consumed so far =
+    /// `feeder_loaded - pages_remaining`. A job takes only the sheets it asked for.
+    feeder_loaded: u32,
     /// Paper jam fault (wired via `/v1/fault` / `/v1/condition`).
     jam: bool,
     /// Cover / interlock open fault (wired via `/v1/fault` / `/v1/condition`).
@@ -158,6 +184,8 @@ pub struct World {
     offline_after_n: u32,
     /// After this many images, next RetrieveImage sets multi_feed and fails (0 = off).
     multi_feed_after_n: u32,
+    /// General fault plan (`POST /v1/faults/plan`).
+    plan: faultplan::PlanState,
     /// Cut the next RetrieveImage MTOM body mid-send (TCP stream error). Sticky until reset.
     abort_retrieve: bool,
     /// After this many images already transferred, next RetrieveImage aborts mid-MTOM (0 = off).
@@ -166,6 +194,12 @@ pub struct World {
     abort_retrieve_bytes: u64,
     /// Extra delay on the first RetrieveImage of each job (lamp warm-up), ms (0 = off).
     lamp_warmup_ms: u64,
+    /// Brother empty-feeder emulation armed (refuse feeder jobs as busy after a delay).
+    empty_feeder_brother: bool,
+    empty_feeder_delay_ms: u64,
+    /// Set by `create_job` when it refused for the empty feeder; the WSD handler takes it,
+    /// drops the world lock and sleeps this many ms before answering.
+    empty_feeder_refusal_ms: Option<u64>,
     /// Synthetic JPEG layout for RetrieveImage (`POST /v1/pattern`).
     image_pattern: PatternId,
     /// Post-pattern defects (`POST /v1/effects`).
@@ -216,6 +250,10 @@ pub struct World {
     condition_history: Vec<ConditionHistoryEntry>,
     /// Raise-time ISO for active sticky conditions (Ids 1–4), keyed by Id.
     condition_raised_at: HashMap<u32, String>,
+    /// Drained by the SOAP layer after RetrieveImage for NotifyTo (mid-job faults).
+    pending_condition_changes: Vec<ConditionChange>,
+    /// Ring of every Validate/Create ticket seen (`GET /v1/tickets`).
+    tickets: crate::tickets::TicketLog,
 }
 
 /// One finished job row for `GetJobHistory`.
@@ -301,6 +339,28 @@ pub struct TraceView {
     pub events: Vec<TraceEvent>,
 }
 
+/// Feeder load refused by the profile's tray limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagesError {
+    OverCapacity { requested: u32, capacity: u32 },
+}
+
+impl std::fmt::Display for PagesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PagesError::OverCapacity {
+                requested,
+                capacity,
+            } => write!(
+                f,
+                "cannot load {requested} sheets: feeder tray holds at most {capacity}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PagesError {}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
     pub profile_id: String,
@@ -310,6 +370,8 @@ pub struct Status {
     /// Profile advertises hardware ADF duplex (`ADFSupportsDuplex`).
     pub duplex: bool,
     pub pages_remaining: u32,
+    /// Tray capacity in sheets (`feeder.capacity`); null = no tray limit.
+    pub feeder_capacity: Option<u32>,
     pub jam: bool,
     pub cover_open: bool,
     /// Double-feed / multi-pick sticky flag (`MultipleFeedError`).
@@ -347,6 +409,10 @@ pub struct Status {
     pub offline_after_n: u32,
     /// 0 = off; multi-feed on RetrieveImage after this many images already transferred.
     pub multi_feed_after_n: u32,
+    /// 0 = off; cover opens on RetrieveImage after this many images (plan sugar).
+    pub cover_open_after_n: u32,
+    /// Fault plan entries (pending and fired) plus read-only legacy `*_after_n` rows.
+    pub fault_plan: Vec<PlanEntryView>,
     /// Cut RetrieveImage MTOM mid-send while armed.
     pub abort_retrieve: bool,
     /// 0 = off; abort MTOM after this many images already transferred.
@@ -355,6 +421,10 @@ pub struct Status {
     pub abort_retrieve_bytes: u64,
     /// Extra ms on first RetrieveImage of each job (0 = off).
     pub lamp_warmup_ms: u64,
+    /// `empty_feeder_brother` armed (see [`FaultBody::empty_feeder_brother`]).
+    pub empty_feeder_brother: bool,
+    /// Delay before the empty-feeder refusal, ms.
+    pub empty_feeder_delay_ms: u64,
     /// Active synthetic image pattern id (`page_id`, `wedges`, `duplex_pair`, …).
     pub image_pattern: String,
     /// Active image effects (skew, speckles, streaks, hole punches).
@@ -532,6 +602,8 @@ pub struct FaultBody {
     pub offline_after_n: Option<u32>,
     /// Multi-feed after N successful transfers (`0` clears).
     pub multi_feed_after_n: Option<u32>,
+    /// Cover opens after N successful transfers (`0` clears). Sugar for a fault-plan entry.
+    pub cover_open_after_n: Option<u32>,
     /// Cut RetrieveImage MTOM mid-send (sticky). Cleared by `reset` / `false`.
     pub abort_retrieve: Option<bool>,
     /// Abort MTOM after N successful transfers (`0` clears).
@@ -540,6 +612,12 @@ pub struct FaultBody {
     pub abort_retrieve_bytes: Option<u64>,
     /// Lamp warm-up delay on first image of each job (`0` clears).
     pub lamp_warmup_ms: Option<u64>,
+    /// Reproduce the real Brother with an EMPTY feeder: published status stays Idle with no
+    /// conditions, a feeder job (0 sheets loaded) is refused with the `busy` fault
+    /// (`ServerErrorNotAcceptingJobs`) after `empty_feeder_delay_ms`. Cleared by `reset` / `false`.
+    pub empty_feeder_brother: Option<bool>,
+    /// Delay before that refusal, ms (default 10000; `reset` restores the default).
+    pub empty_feeder_delay_ms: Option<u64>,
 }
 
 /// Result of ValidateScanTicket against the loaded profile.
@@ -571,6 +649,7 @@ impl World {
             lab_listen: None,
             feeder_ready: sticky,
             pages_remaining: 0,
+            feeder_loaded: 0,
             jam: false,
             cover_open: false,
             multi_feed: false,
@@ -591,10 +670,14 @@ impl World {
             empty_mid_job: 0,
             offline_after_n: 0,
             multi_feed_after_n: 0,
+            plan: Default::default(),
             abort_retrieve: false,
             abort_retrieve_after_n: 0,
             abort_retrieve_bytes: 0,
             lamp_warmup_ms: 0,
+            empty_feeder_brother: false,
+            empty_feeder_delay_ms: DEFAULT_EMPTY_FEEDER_DELAY_MS,
+            empty_feeder_refusal_ms: None,
             image_pattern: PatternId::default(),
             effects: ImageEffects::default(),
             scenario_id: None,
@@ -622,7 +705,14 @@ impl World {
             job_history: Vec::new(),
             condition_history: Vec::new(),
             condition_raised_at: HashMap::new(),
+            pending_condition_changes: Vec::new(),
+            tickets: crate::tickets::TicketLog::default(),
         }
+    }
+
+    /// The scan-ticket ring (interior-locked; recording needs only `&World`).
+    pub fn tickets(&self) -> &crate::tickets::TicketLog {
+        &self.tickets
     }
 
     /// Record a DestinationToken issued in SubscribeResponse (device-push).
@@ -1206,6 +1296,16 @@ impl World {
         self.busy
     }
 
+    /// `empty_feeder_brother` armed.
+    pub fn empty_feeder_brother(&self) -> bool {
+        self.empty_feeder_brother
+    }
+
+    /// Delay (ms) the last `create_job` refusal owes for the empty-feeder emulation, if any.
+    pub fn take_empty_feeder_refusal_ms(&mut self) -> Option<u64> {
+        self.empty_feeder_refusal_ms.take()
+    }
+
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
     }
@@ -1279,6 +1379,72 @@ impl World {
                 job.state_reason = "ScannerStopped".into();
             }
         }
+    }
+
+    /// NotifyTo deltas queued during RetrieveImage (mid-job `*_after_n` trips).
+    pub fn drain_pending_condition_changes(&mut self) -> Vec<ConditionChange> {
+        if self.pending_condition_changes.is_empty() {
+            return Vec::new();
+        }
+        let out = self.pending_condition_changes.clone();
+        self.pending_condition_changes.clear();
+        out
+    }
+
+    fn enqueue_condition_change(&mut self, change: ConditionChange) {
+        self.pending_condition_changes.push(change);
+    }
+
+    /// Same deltas as `apply_faults` jam=true — used when `jam_after_n` trips mid RetrieveImage.
+    fn raise_jam_sticky(&mut self) {
+        let before = self.jam;
+        if before {
+            return;
+        }
+        self.record_condition_transition(1, "MediaJam", "ADF", "Critical", true);
+        self.jam = true;
+        self.mark_jobs_scanner_stopped();
+        self.enqueue_condition_change(ConditionChange {
+            id: 1,
+            name: "MediaJam",
+            component: "ADF",
+            severity: "Critical",
+            raised: true,
+        });
+    }
+
+    fn raise_multi_feed_sticky(&mut self) {
+        let before = self.multi_feed;
+        if before {
+            return;
+        }
+        self.record_condition_transition(3, "MultipleFeedError", "ADF", "Critical", true);
+        self.multi_feed = true;
+        self.mark_jobs_scanner_stopped();
+        self.enqueue_condition_change(ConditionChange {
+            id: 3,
+            name: "MultipleFeedError",
+            component: "ADF",
+            severity: "Critical",
+            raised: true,
+        });
+    }
+
+    /// AttentionRequired only (id=0) — StatusSummary + Create/Retrieve refuse.
+    fn raise_offline_sticky(&mut self) {
+        let before = self.offline;
+        if before {
+            return;
+        }
+        self.offline = true;
+        self.mark_jobs_scanner_stopped();
+        self.enqueue_condition_change(ConditionChange {
+            id: 0,
+            name: "AttentionRequired",
+            component: "",
+            severity: "",
+            raised: true,
+        });
     }
 
     pub fn slow_retrieve_ms(&self) -> u64 {
@@ -1623,6 +1789,9 @@ impl World {
         if let Some(n) = body.multi_feed_after_n {
             self.multi_feed_after_n = n;
         }
+        if let Some(n) = body.cover_open_after_n {
+            self.set_cover_open_after_n(n);
+        }
         if let Some(abort) = body.abort_retrieve {
             self.abort_retrieve = abort;
         }
@@ -1634,6 +1803,12 @@ impl World {
         }
         if let Some(ms) = body.lamp_warmup_ms {
             self.lamp_warmup_ms = ms;
+        }
+        if let Some(on) = body.empty_feeder_brother {
+            self.empty_feeder_brother = on;
+        }
+        if let Some(ms) = body.empty_feeder_delay_ms {
+            self.empty_feeder_delay_ms = ms;
         }
         self.note(
             "ctl",
@@ -1784,6 +1959,7 @@ impl World {
             sticky_ready: self.profile.feeder.sticky_ready,
             duplex: self.profile.feeder.duplex,
             pages_remaining: self.pages_remaining,
+            feeder_capacity: self.profile.feeder.capacity,
             jam: self.jam,
             cover_open: self.cover_open,
             multi_feed: self.multi_feed,
@@ -1804,10 +1980,14 @@ impl World {
             empty_mid_job: self.empty_mid_job,
             offline_after_n: self.offline_after_n,
             multi_feed_after_n: self.multi_feed_after_n,
+            cover_open_after_n: self.cover_open_after_n(),
+            fault_plan: self.fault_plan_view(),
             abort_retrieve: self.abort_retrieve,
             abort_retrieve_after_n: self.abort_retrieve_after_n,
             abort_retrieve_bytes: self.abort_retrieve_bytes,
             lamp_warmup_ms: self.lamp_warmup_ms,
+            empty_feeder_brother: self.empty_feeder_brother,
+            empty_feeder_delay_ms: self.empty_feeder_delay_ms,
             image_pattern: self.image_pattern.as_str().to_string(),
             effects: self.effects.summary(),
             scenario: self.scenario_id.clone(),
@@ -1865,6 +2045,7 @@ impl World {
         self.profile = profile;
         self.feeder_ready = sticky;
         self.pages_remaining = 0;
+        self.feeder_loaded = 0;
         self.jam = false;
         self.cover_open = false;
         self.multi_feed = false;
@@ -1885,10 +2066,14 @@ impl World {
         self.empty_mid_job = 0;
         self.offline_after_n = 0;
         self.multi_feed_after_n = 0;
+        self.plan.clear();
         self.abort_retrieve = false;
         self.abort_retrieve_after_n = 0;
         self.abort_retrieve_bytes = 0;
         self.lamp_warmup_ms = 0;
+        self.empty_feeder_brother = false;
+        self.empty_feeder_delay_ms = DEFAULT_EMPTY_FEEDER_DELAY_MS;
+        self.empty_feeder_refusal_ms = None;
         self.image_pattern = PatternId::default();
         self.effects = ImageEffects::default();
         self.scenario_id = None;
@@ -1906,6 +2091,7 @@ impl World {
         self.job_history.clear();
         self.condition_history.clear();
         self.condition_raised_at.clear();
+        self.pending_condition_changes.clear();
         Ok(())
     }
 
@@ -1915,9 +2101,27 @@ impl World {
 
     /// Set feeder page count only (keeps current side/order). Prefer [`Self::apply_pages`]
     /// from the control plane so side/order travel with the stack.
+    pub fn try_set_pages(&mut self, count: u32) -> Result<(), PagesError> {
+        self.check_pages_capacity(count)?;
+        self.set_pages(count);
+        Ok(())
+    }
+
+    /// `Err` when `count` exceeds the profile's tray `capacity` (state untouched).
+    pub fn check_pages_capacity(&self, count: u32) -> Result<(), PagesError> {
+        match self.profile.feeder.capacity {
+            Some(capacity) if count > capacity => Err(PagesError::OverCapacity {
+                requested: count,
+                capacity,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     pub fn set_pages(&mut self, count: u32) {
         let max = self.profile.feeder.pages_max;
         self.pages_remaining = count.min(max);
+        self.feeder_loaded = self.pages_remaining;
         if self.pages_remaining > 0 {
             self.feeder_ready = true;
         } else if !self.profile.feeder.sticky_ready {
@@ -1942,6 +2146,8 @@ impl World {
     ///
     /// Synthetic pages clear the hard loopback store (mutually exclusive).
     pub fn apply_pages(&mut self, body: &PagesBody) -> Result<()> {
+        // Over-capacity is refused before any state changes (handler maps PagesError to 409).
+        self.check_pages_capacity(body.count)?;
         self.clear_loopback();
         self.set_pages(body.count);
         self.page_side = match body.side.as_deref() {
@@ -1959,8 +2165,10 @@ impl World {
     }
 
     pub fn reset(&mut self) {
+        self.tickets.clear();
         self.feeder_ready = self.profile.feeder.sticky_ready;
         self.pages_remaining = 0;
+        self.feeder_loaded = 0;
         self.jam = false;
         self.cover_open = false;
         self.multi_feed = false;
@@ -1981,10 +2189,14 @@ impl World {
         self.empty_mid_job = 0;
         self.offline_after_n = 0;
         self.multi_feed_after_n = 0;
+        self.plan.clear();
         self.abort_retrieve = false;
         self.abort_retrieve_after_n = 0;
         self.abort_retrieve_bytes = 0;
         self.lamp_warmup_ms = 0;
+        self.empty_feeder_brother = false;
+        self.empty_feeder_delay_ms = DEFAULT_EMPTY_FEEDER_DELAY_MS;
+        self.empty_feeder_refusal_ms = None;
         self.image_pattern = PatternId::default();
         self.effects = ImageEffects::default();
         self.scenario_id = None;
@@ -2003,6 +2215,7 @@ impl World {
         self.job_history.clear();
         self.condition_history.clear();
         self.condition_raised_at.clear();
+        self.pending_condition_changes.clear();
         self.note("ctl", "reset", "ok", "cleared");
     }
 
@@ -2016,6 +2229,91 @@ impl World {
 
     pub fn effects(&self) -> &ImageEffects {
         &self.effects
+    }
+
+    /// `jfif_gray=gray8_tiff`: the Format a Grayscale8 JFIF/JPEG/EXIF ticket is
+    /// answered with (`tiff-single-uncompressed`), if the mode is on and the
+    /// profile offers it. `None` = keep the requested format.
+    pub fn jfif_gray_format(&self, format: &str, color: ColorMode) -> Option<String> {
+        const TIFF: &str = "tiff-single-uncompressed";
+        let jfif = matches!(
+            format.to_ascii_lowercase().as_str(),
+            "jfif" | "jpeg" | "jpg" | "exif"
+        );
+        (self.effects.jfif_gray == crate::effects::JfifGray::Gray8Tiff
+            && color == ColorMode::Gray8
+            && jfif
+            && self.profile.formats.iter().any(|f| f == TIFF))
+        .then(|| TIFF.to_string())
+    }
+
+    /// `jfif_bw=reject`: Some(fault reason) when a BlackAndWhite1 ticket asks for a
+    /// JPEG-family Format (JPEG cannot carry 1-bit; the driver then falls back).
+    pub fn jfif_bw_reject(&self, format: &str, color: ColorMode) -> Option<String> {
+        let jfif = matches!(
+            format.to_ascii_lowercase().as_str(),
+            "jfif" | "jpeg" | "jpg" | "exif"
+        );
+        (self.effects.jfif_bw == crate::effects::JfifBw::Reject && color == ColorMode::Bw1 && jfif)
+            .then(|| {
+                format!(
+                    "ClientErrorDocumentFormatNotSupported: format {format} cannot carry BlackAndWhite1"
+                )
+            })
+    }
+
+    /// `refuse_tickets`: Some(fault reason) when a rule matches the ticket (all fields
+    /// present in the rule must match; absent = wildcard). Format matches either the
+    /// requested or the resolved wire token; colour / dpi are the resolved values.
+    pub fn refuse_ticket(&self, body: &str, check: &TicketValidation) -> Option<String> {
+        if self.effects.refuse_tickets.is_empty() {
+            return None;
+        }
+        let norm = |s: &str| {
+            normalize_format(s)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| s.trim().to_ascii_lowercase())
+        };
+        let requested_format = extract_tag(body, "Format").map(|f| norm(&f));
+        let resolved_format = norm(&check.format);
+        let source = extract_tag(body, "InputSource").map(|s| {
+            if s.eq_ignore_ascii_case("Feeder") {
+                "ADF".to_string()
+            } else {
+                s
+            }
+        });
+        for rule in &self.effects.refuse_tickets {
+            if let Some(f) = rule.format.as_deref() {
+                let f = norm(f);
+                if requested_format.as_deref() != Some(f.as_str()) && resolved_format != f {
+                    continue;
+                }
+            }
+            if let Some(c) = rule.color.as_deref() {
+                if !check.color.wsd_token().eq_ignore_ascii_case(c) {
+                    continue;
+                }
+            }
+            if let Some(s) = rule.input_source.as_deref() {
+                if !source.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(s)) {
+                    continue;
+                }
+            }
+            if let Some(r) = rule.resolution {
+                if check.dpi != r {
+                    continue;
+                }
+            }
+            let fault = rule.fault_name();
+            return Some(format!(
+                "{fault}: ticket refused by refuse_tickets (format {}, color {}, dpi {})",
+                check.format,
+                check.color.wsd_token(),
+                check.dpi
+            ));
+        }
+        None
     }
 
     /// Validate a ScanTicket body (ValidateScanTicket / CreateScanJob).
@@ -2082,6 +2380,22 @@ impl World {
             .map(|s| input_source_in_profile(s, &self.profile))
             .unwrap_or(true);
         let region_ok = scan_region_in_bounds(body);
+        // ADF tray media sizes (glass / Platen unaffected).
+        let adf_source = match source_tag.as_deref() {
+            Some(src) => {
+                src.eq_ignore_ascii_case("ADF")
+                    || src.eq_ignore_ascii_case("Feeder")
+                    || src.eq_ignore_ascii_case("ADFDuplex")
+            }
+            None => self.feeder_ready && self.pages_remaining > 0,
+        };
+        let size_must_honor =
+            extract_must_honor(body, "InputMediaSize") || extract_must_honor(body, "InputSize");
+        let size_ok = !adf_source
+            || match input_media_size(body) {
+                Some((w, h)) => self.profile.feeder.accepts_media(w, h),
+                None => true,
+            };
         // Two+ MustHonor=true values the device cannot satisfy → named Validate/Create fault
         // (Learn CreateScanJob / ValidateScanTicket: ConflictingRequiredParameters).
         let mut honor_conflicts: Vec<&str> = Vec::new();
@@ -2099,6 +2413,9 @@ impl World {
         }
         if !region_ok && region_must_honor {
             honor_conflicts.push("ScanRegion");
+        }
+        if !size_ok && size_must_honor {
+            honor_conflicts.push("InputSize");
         }
         if honor_conflicts.len() >= 2 {
             return TicketValidation {
@@ -2171,6 +2488,20 @@ impl World {
         }
         // MustHonor false/absent: ignore unsupported source (Create may still pick Platen).
 
+        if !size_ok && size_must_honor {
+            let (w, h) = input_media_size(body).unwrap_or((0, 0));
+            return TicketValidation {
+                valid: false,
+                dpi,
+                format,
+                color,
+                reason: Some(format!(
+                    "InputMediaSize {w}x{h} not in profile feeder media_sizes"
+                )),
+            };
+        }
+        // MustHonor false/absent: unsupported ADF size is ignored (device uses its own).
+
         if !region_ok && region_must_honor {
             return TicketValidation {
                 valid: false,
@@ -2202,6 +2533,7 @@ impl World {
     /// Create a scan job from a CreateScanJobRequest body (raw SOAP XML).
     pub fn create_job(&mut self, body: &str) -> Result<ScanJob> {
         self.sweep_timed_out_jobs();
+        self.empty_feeder_refusal_ms = None;
         if let Some(reason) = self.not_accepting_reason() {
             bail!("{reason}");
         }
@@ -2214,6 +2546,9 @@ impl World {
             _ => bail!("InvalidArgs: ScanIdentifier and DestinationToken required together"),
         }
         let check = self.validate_ticket(body);
+        if let Some(reason) = self.refuse_ticket(body, &check) {
+            bail!(reason);
+        }
         if !check.valid {
             // Prefer the ticket reason verbatim when it already names a WSD ClientError*
             // (FormatNotSupported → driver lossless fallback). Otherwise keep a prefix.
@@ -2243,8 +2578,13 @@ impl World {
             input_source = "ADF".into();
         }
         let dpi = check.dpi;
-        let format = check.format.clone();
         let color = check.color;
+        if let Some(reason) = self.jfif_bw_reject(&check.format, color) {
+            bail!(reason);
+        }
+        let format = self
+            .jfif_gray_format(&check.format, color)
+            .unwrap_or_else(|| check.format.clone());
         let requested_format = extract_tag(body, "Format");
         let format_used_default = requested_format.is_none();
         let format_overridden = requested_format
@@ -2263,10 +2603,18 @@ impl World {
             || input_source.eq_ignore_ascii_case("Feeder")
             || wants_duplex;
         let duplex = wants_duplex && self.profile.feeder.duplex;
+        let mut sheet_base = 0;
+        let mut stack_total = 0;
         let pages = if is_adf {
             // Sticky FEED_READY can stay true with an empty stack (Brother quirk).
             // ADF Create still fails so Auto can fall back to glass.
             if self.pages_remaining == 0 {
+                if self.empty_feeder_brother {
+                    // Real Brother: empty feeder looks Idle; the job is refused as busy,
+                    // late (the WSD handler sleeps `empty_feeder_refusal_ms` first).
+                    self.empty_feeder_refusal_ms = Some(self.empty_feeder_delay_ms);
+                    bail!("ServerErrorNotAcceptingJobs: device busy");
+                }
                 bail!("ADF selected but feeder empty");
             }
             let sheets = self.pages_remaining;
@@ -2286,8 +2634,13 @@ impl World {
                         .saturating_mul(if duplex { 2 } else { 1 }),
                 ),
             };
-            self.pages_remaining = 0;
-            if !self.profile.feeder.sticky_ready {
+            // A job consumes only the sheets it asked for (a real feeder keeps the rest
+            // loaded for the next CreateScanJob); 0 / absent takes everything left.
+            let sheets_taken = if duplex { n.div_ceil(2) } else { n }.min(sheets);
+            sheet_base = self.feeder_loaded.saturating_sub(self.pages_remaining);
+            stack_total = self.feeder_loaded.max(sheet_base + sheets);
+            self.pages_remaining -= sheets_taken;
+            if self.pages_remaining == 0 && !self.profile.feeder.sticky_ready {
                 self.feeder_ready = false;
             }
             n
@@ -2313,6 +2666,8 @@ impl World {
             height_px,
             pages_left: pages,
             page_index: 0,
+            sheet_base,
+            stack_total,
             duplex,
             created_at: now,
             last_activity: now,
@@ -2411,6 +2766,13 @@ impl World {
     ) -> Result<(ScanJob, Vec<u8>)> {
         let delay = self.slow_retrieve_ms;
         let warmup = self.lamp_warmup_ms;
+        // Fault plan: live / timed / between-pages entries fire here; a mid-page entry
+        // is returned for the page about to stream.
+        let gate = self.plan_gate_retrieve(job_id, token);
+        if let Some(reason) = gate.fault {
+            bail!("{reason}");
+        }
+        let mid_cut = gate.mid;
         if let Some(reason) = self.not_accepting_reason() {
             bail!("{reason}");
         }
@@ -2429,8 +2791,7 @@ impl World {
         if jam_after > 0 {
             if let Some(job) = self.jobs.get(&job_id) {
                 if job.token == token && job.page_index >= jam_after {
-                    self.jam = true;
-                    self.mark_jobs_scanner_stopped();
+                    self.raise_jam_sticky();
                     bail!("ClientErrorMediaJam: jam_after_n={jam_after} tripped on job {job_id}");
                 }
             }
@@ -2439,8 +2800,7 @@ impl World {
         if multi_after > 0 {
             if let Some(job) = self.jobs.get(&job_id) {
                 if job.token == token && job.page_index >= multi_after {
-                    self.multi_feed = true;
-                    self.mark_jobs_scanner_stopped();
+                    self.raise_multi_feed_sticky();
                     bail!(
                         "ClientErrorMultipleFeed: multi_feed_after_n={multi_after} tripped on job {job_id}"
                     );
@@ -2451,8 +2811,7 @@ impl World {
         if offline_after > 0 {
             if let Some(job) = self.jobs.get(&job_id) {
                 if job.token == token && job.page_index >= offline_after {
-                    self.offline = true;
-                    self.mark_jobs_scanner_stopped();
+                    self.raise_offline_sticky();
                     bail!(
                         "ServerErrorNotAcceptingJobs: offline_after_n={offline_after} tripped on job {job_id}"
                     );
@@ -2488,7 +2847,9 @@ impl World {
         }
         // Empty mid-job: pretend the feeder ran out early.
         if empty_after > 0 && job.page_index >= empty_after {
-            job.pages_left = 0;
+            // Job ends early: Completed + JobCompletedWithErrors (history + NotifyTo JobEnd
+            // see a terminal state instead of a stale JobScanningAndTransfering).
+            self.end_job_empty(job_id);
             bail!("ClientErrorNoImagesAvailable: empty_mid_job={empty_after} on job {job_id}");
         }
         // First/mid Retrieve while still Processing: XSD WKV spelling (one `r` in Transfering).
@@ -2498,16 +2859,21 @@ impl World {
         let take = image_gen::pages_per_retrieve(&format, job.pages_left);
         // Face indices → sheet indices. Hardware duplex: 2 faces per sheet.
         // Reverse order is for a flip-stack second pass (manual duplex).
-        let face_total = job.page_index + job.pages_left;
-        let sheet_total = if duplex_job {
-            face_total.div_ceil(2)
+        let sheet_base = job.sheet_base;
+        let sheet_total = if job.stack_total > 0 {
+            job.stack_total
         } else {
-            face_total
+            let face_total = job.page_index + job.pages_left;
+            if duplex_job {
+                face_total.div_ceil(2)
+            } else {
+                face_total
+            }
         };
         let sheets: Vec<u32> = (0..take)
             .map(|i| {
                 let face = job.page_index + i;
-                let logical = if duplex_job { face / 2 } else { face };
+                let logical = sheet_base + if duplex_job { face / 2 } else { face };
                 match page_order {
                     PageOrder::Forward => logical,
                     PageOrder::Reverse => sheet_total.saturating_sub(1).saturating_sub(logical),
@@ -2588,6 +2954,13 @@ impl World {
                 }
             }
         };
+        // Mid-page fault: the stream is cut part-way, so this page is not delivered.
+        if let Some((entry_id, cut)) = mid_cut {
+            job.last_activity = Instant::now();
+            let snapshot = job.clone();
+            self.plan_fire_mid(entry_id, job_id, snapshot.stack_position() + 1, cut);
+            return Ok((snapshot, bytes));
+        }
         job.page_index += take;
         job.pages_left -= take;
         job.last_activity = Instant::now();
@@ -2816,12 +3189,19 @@ fn input_source_in_profile(wsd: &str, profile: &Profile) -> bool {
     true
 }
 
-/// `true` when no ScanRegion is present, or X/Y/W/H fit inside letter platen (1/1000").
+/// `true` when no ScanRegion is present, or X/Y/W/H fit the selected source (1/1000").
+///
+/// Platen tickets are letter-bounded. ADF / Feeder / ADFDuplex may use the taller
+/// [`image_gen::ADF_MAX_H_THOU`] window that `ADFMaximumSize` advertises; WIA feeder
+/// items often send that full sheet region with MustHonor=true.
 fn scan_region_in_bounds(body: &str) -> bool {
-    let has_region = body.contains("ScanRegionWidth")
-        || body.contains("ScanRegionHeight")
-        || body.contains("ScanRegionXOffset")
-        || body.contains("ScanRegionYOffset");
+    let tree = ticket_tree(body);
+    let has_region = tree.as_ref().is_some_and(|t| {
+        t.descendant("ScanRegionWidth").is_some()
+            || t.descendant("ScanRegionHeight").is_some()
+            || t.descendant("ScanRegionXOffset").is_some()
+            || t.descendant("ScanRegionYOffset").is_some()
+    });
     if !has_region {
         return true;
     }
@@ -2840,8 +3220,16 @@ fn scan_region_in_bounds(body: &str) -> bool {
     if w == 0 || h == 0 {
         return false;
     }
-    x.saturating_add(w) <= image_gen::LETTER_W_THOU
-        && y.saturating_add(h) <= image_gen::LETTER_H_THOU
+    let source = extract_tag(body, "InputSource").unwrap_or_default();
+    let max_h = if source.eq_ignore_ascii_case("ADF")
+        || source.eq_ignore_ascii_case("Feeder")
+        || source.eq_ignore_ascii_case("ADFDuplex")
+    {
+        image_gen::ADF_MAX_H_THOU
+    } else {
+        image_gen::LETTER_H_THOU
+    };
+    x.saturating_add(w) <= image_gen::LETTER_W_THOU && y.saturating_add(h) <= max_h
 }
 
 fn format_in_profile(wsd_format: &str, profile: &Profile) -> bool {
@@ -2897,104 +3285,114 @@ fn color_in_profile(wsd_color: &str, profile: &Profile) -> bool {
     profile.colors.iter().any(|c| ColorMode::parse(c) == mode)
 }
 
-pub(crate) fn extract_tag(xml: &str, local: &str) -> Option<String> {
-    // Match `<prefix:local>` / `<local>` or the same with attributes
-    // (`<sca:Format sca:MustHonor="true">jfif</…>`). Inbox WIA always puts
-    // MustHonor on Format; requiring an immediate `>` missed it and fell back to
-    // preferred_format — so a dib-only profile rewrote a jfif MustHonor ticket to
-    // dib in FinalParams and wsdscdrv aborted before RetrieveImage.
-    let mut idx = 0;
-    while let Some(rel) = xml[idx..].find(local) {
-        let at = idx + rel;
-        let before = xml.as_bytes().get(at.wrapping_sub(1)).copied();
-        let after = xml.get(at + local.len()..).unwrap_or("");
-        if matches!(before, Some(b'<') | Some(b':')) {
-            let gt = if after.starts_with('>') {
-                Some(0usize)
-            } else if after.starts_with(|c: char| c.is_whitespace()) {
-                // Attributes until `>`; reject `FormatValue` / `FormatsSupported`.
-                after.find('>')
-            } else {
-                None
-            };
-            if let Some(gt) = gt {
-                let value_start = &after[gt + 1..];
-                if let Some(end) = value_start.find('<') {
-                    let value = value_start[..end].trim();
-                    if !value.is_empty() {
-                        return Some(value.to_string());
-                    }
-                }
-            }
-        }
-        idx = at + local.len();
+fn ticket_tree(body: &str) -> Option<Element> {
+    let t = body.trim();
+    if t.is_empty() {
+        return None;
     }
-    None
+    let env = Envelope::parse(body);
+    if env.root.as_deref() == Some("Envelope") {
+        if let Some(bt) = env.body_tree() {
+            return Some(bt.clone());
+        }
+        let b = env.body.trim();
+        if !b.is_empty() {
+            return wrap_ticket_fields(b);
+        }
+        return None;
+    }
+    wrap_ticket_fields(t)
+}
+
+fn wrap_ticket_fields(ticket: &str) -> Option<Element> {
+    const SCAN_NS: &str = "http://schemas.microsoft.com/windows/2006/01/wdp/scan";
+    xml::parse(&format!(
+        r#"<ticket xmlns:wscn="{SCAN_NS}" xmlns:sca="{SCAN_NS}">{ticket}</ticket>"#
+    ))
+    .or_else(|| xml::parse(ticket))
+}
+
+pub(crate) fn extract_tag(xml: &str, local: &str) -> Option<String> {
+    let tree = ticket_tree(xml)?;
+    tree.descendant(local).and_then(|el| {
+        let value = el.text.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
 }
 
 /// `MustHonor` on the named element's start tag. Absent → **false** (Common.xsd default).
-///
-/// Matches `MustHonor="true"` / `wscn:MustHonor='1'` (and `false` / `0`).
 fn extract_must_honor(xml: &str, local: &str) -> bool {
-    let mut idx = 0;
-    while let Some(rel) = xml[idx..].find(local) {
-        let at = idx + rel;
-        let before = xml.as_bytes().get(at.wrapping_sub(1)).copied();
-        let after = xml.get(at + local.len()..).unwrap_or("");
-        if matches!(before, Some(b'<') | Some(b':')) {
-            let gt = if after.starts_with('>') {
-                Some(0usize)
-            } else if after.starts_with(|c: char| c.is_whitespace()) {
-                after.find('>')
-            } else {
-                None
-            };
-            if let Some(gt) = gt {
-                let attrs = &after[..gt];
-                return attr_bool(attrs, "MustHonor").unwrap_or(false);
-            }
-        }
-        idx = at + local.len();
-    }
-    false
+    let Some(tree) = ticket_tree(xml) else {
+        return false;
+    };
+    let Some(el) = tree.descendant(local) else {
+        return false;
+    };
+    el.attr("MustHonor")
+        .map(|v| matches!(v.trim(), "true" | "1" | "TRUE"))
+        .unwrap_or(false)
 }
 
-fn attr_bool(attrs: &str, name: &str) -> Option<bool> {
-    let mut search_from = 0;
-    while let Some(rel) = attrs[search_from..].find(name) {
-        let at = search_from + rel;
-        let before = attrs.as_bytes().get(at.wrapping_sub(1)).copied();
-        let after = attrs.get(at + name.len()..).unwrap_or("");
-        let boundary_ok = matches!(
-            before,
-            None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b':')
-        ) && after.starts_with(|c: char| c == '=' || c.is_whitespace());
-        if boundary_ok {
-            let rest = after.trim_start();
-            let rest = rest.strip_prefix('=')?.trim_start();
-            let quote = rest.chars().next()?;
-            if quote != '"' && quote != '\'' {
-                return None;
-            }
-            let inner = rest.get(1..)?;
-            let end = inner.find(quote)?;
-            let raw = inner[..end].trim();
-            return Some(matches!(raw.to_ascii_lowercase().as_str(), "true" | "1"));
+/// `InputMediaSize` Width/Height (1/1000 inch) from a ticket, when present.
+fn input_media_size(xml: &str) -> Option<(u32, u32)> {
+    let tree = ticket_tree(xml)?;
+    let el = tree.descendant("InputMediaSize")?;
+    let w = el.find_text("Width")?.trim().parse().ok()?;
+    let h = el.find_text("Height")?.trim().parse().ok()?;
+    Some((w, h))
+}
+
+/// Ticket fields the parser finds, as JSON (only the ones present).
+pub(crate) fn ticket_parsed(xml: &str) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::Value;
+    let mut m = serde_json::Map::new();
+    let val = |s: String| match s.parse::<i64>() {
+        Ok(n) => Value::from(n),
+        Err(_) => Value::from(s),
+    };
+    for (key, tag) in [
+        ("input_source", "InputSource"),
+        ("format", "Format"),
+        ("color_processing", "ColorProcessing"),
+        ("images_to_transfer", "ImagesToTransfer"),
+        ("content_type", "ContentType"),
+        ("compression_quality", "CompressionQualityFactor"),
+        ("scan_region_width", "ScanRegionWidth"),
+        ("scan_region_height", "ScanRegionHeight"),
+    ] {
+        if let Some(v) = extract_tag(xml, tag) {
+            m.insert(key.into(), val(v));
         }
-        search_from = at + name.len();
     }
-    None
+    if let Some(tree) = ticket_tree(xml) {
+        if let Some(res) = tree.descendant("Resolution") {
+            if let Some(w) = res.find_text("Width") {
+                m.insert("resolution_x".into(), val(w.trim().to_string()));
+            }
+            if let Some(h) = res.find_text("Height") {
+                m.insert("resolution_y".into(), val(h.trim().to_string()));
+            }
+        }
+    }
+    if let Some((w, h)) = input_media_size(xml) {
+        m.insert("width".into(), w.into());
+        m.insert("height".into(), h.into());
+    }
+    m
 }
 
 fn extract_resolution(xml: &str) -> Option<u32> {
-    // Prefer Width inside Resolution.
-    if let Some(res) = xml.find("Resolution") {
-        let slice = &xml[res..].get(..400).unwrap_or(&xml[res..]);
-        if let Some(w) = extract_tag(slice, "Width") {
-            return w.trim().parse().ok();
+    let tree = ticket_tree(xml)?;
+    if let Some(res) = tree.descendant("Resolution") {
+        if let Some(w) = res.find_text("Width") {
+            return w.parse().ok();
         }
     }
-    extract_tag(xml, "Width")?.parse().ok()
+    tree.find_text("Width")?.parse().ok()
 }
 
 #[cfg(test)]
@@ -3005,6 +3403,14 @@ mod tests {
     fn brother_wsd() -> World {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
         let profile = Profile::load(&dir, "brother-wsd").expect("profile");
+        World::new(dir, profile)
+    }
+
+    /// brother-wsd with the hardware ADF duplex bit on (the shipped lab profile is single-sided).
+    fn brother_wsd_duplex() -> World {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        let mut profile = Profile::load(&dir, "brother-wsd").expect("profile");
+        profile.feeder.duplex = true;
         World::new(dir, profile)
     }
 
@@ -3547,6 +3953,26 @@ mod tests {
     }
 
     #[test]
+    fn adf_legal_scan_region_is_in_bounds() {
+        // WIA feeder items advertise ADF max height 14000; MustHonor region tickets
+        // must not be platen-bounded or Validate faults before CreateScanJob.
+        let w = brother_wsd();
+        let body = r#"
+          <wscn:Format>jfif</wscn:Format>
+          <wscn:InputSource>ADF</wscn:InputSource>
+          <wscn:Resolution><wscn:Width>100</wscn:Width><wscn:Height>100</wscn:Height></wscn:Resolution>
+          <wscn:ScanRegion>
+            <wscn:ScanRegionXOffset>0</wscn:ScanRegionXOffset>
+            <wscn:ScanRegionYOffset>0</wscn:ScanRegionYOffset>
+            <wscn:ScanRegionWidth wscn:MustHonor="true">8500</wscn:ScanRegionWidth>
+            <wscn:ScanRegionHeight wscn:MustHonor="true">14000</wscn:ScanRegionHeight>
+          </wscn:ScanRegion>
+        "#;
+        let v = w.validate_ticket(body);
+        assert!(v.valid, "{v:?}");
+    }
+
+    #[test]
     fn must_honor_false_scan_region_out_of_bounds_ignored() {
         let w = brother_wsd();
         let body = r#"
@@ -4040,12 +4466,16 @@ mod tests {
             empty_mid_job: Some(2),
             offline_after_n: Some(3),
             multi_feed_after_n: Some(4),
+            cover_open_after_n: Some(2),
             abort_retrieve: Some(true),
             abort_retrieve_after_n: Some(5),
             abort_retrieve_bytes: Some(512),
             lamp_warmup_ms: Some(50),
+            empty_feeder_brother: Some(true),
+            empty_feeder_delay_ms: Some(5),
         });
         w.reset();
+        assert!(!w.empty_feeder_brother());
         assert!(!w.offline());
         assert_eq!(w.offline_after_n(), 0);
         assert!(!w.jam());
@@ -4139,6 +4569,81 @@ mod tests {
         assert!(w.status().internal);
     }
 
+    const ADF_ONE: &str = r#"
+          <wscn:Format>jfif</wscn:Format>
+          <wscn:ImagesToTransfer>1</wscn:ImagesToTransfer>
+          <wscn:InputSource>ADF</wscn:InputSource>
+          <wscn:Resolution><wscn:Width>100</wscn:Width><wscn:Height>100</wscn:Height></wscn:Resolution>
+        "#;
+
+    /// A one-page job takes one sheet; the rest stay loaded for the next CreateScanJob.
+    #[test]
+    fn single_page_adf_jobs_consume_one_sheet_each() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        let mut w = World::new(
+            dir.clone(),
+            Profile::load(&dir, "wia-rich").expect("wia-rich"),
+        );
+        w.set_jpeg_com(true);
+        w.set_pages(3);
+        for want_base in 0..3u32 {
+            let job = w.create_job(ADF_ONE).expect("create");
+            assert_eq!(job.pages_left, 1);
+            assert_eq!(job.sheet_base, want_base, "job reads sheet {want_base}");
+            assert_eq!(w.pages_remaining(), 2 - want_base);
+            let (j, bytes) = w.retrieve_image(job.id, &job.token).expect("page");
+            assert_eq!(j.pages_left, 0);
+            // COM marker carries the sheet index the page was rendered from.
+            assert_eq!(
+                image_gen::read_page_marker(&bytes),
+                Some(want_base),
+                "job {want_base} must scan sheet {want_base}"
+            );
+            w.cancel_job(job.id).unwrap();
+        }
+        let err = w.create_job(ADF_ONE).unwrap_err().to_string();
+        assert!(err.contains("feeder empty"), "4th job: {err}");
+    }
+
+    /// ImagesToTransfer 0 / absent still drains whatever is left; N>left clamps to what is left.
+    #[test]
+    fn adf_all_and_overask_take_only_what_is_left() {
+        let mut w = brother_usb();
+        w.set_pages(3);
+        let one = w.create_job(ADF_ONE).expect("one");
+        assert_eq!(w.pages_remaining(), 2);
+        let all = w
+            .create_job(&ADF_ONE.replace("ImagesToTransfer>1<", "ImagesToTransfer>0<"))
+            .expect("rest");
+        assert_eq!((all.pages_left, all.sheet_base), (2, 1));
+        assert_eq!(w.pages_remaining(), 0);
+        w.set_pages(2);
+        let over = w
+            .create_job(&ADF_ONE.replace("ImagesToTransfer>1<", "ImagesToTransfer>9<"))
+            .expect("over-ask");
+        assert_eq!((over.pages_left, over.sheet_base), (2, 0));
+        assert_eq!(w.pages_remaining(), 0);
+        let _ = one;
+    }
+
+    /// Fault-plan page numbers count along the stack, so `page 2` fires on the 2nd one-page job.
+    #[test]
+    fn fault_plan_page_counts_across_one_page_jobs() {
+        let mut w = brother_usb();
+        w.set_pages(3);
+        let b: crate::state::faultplan::PlanBody = serde_json::from_value(serde_json::json!(
+            {"faults":[{"kind":"jam","when":{"after_pages":1}}]}
+        ))
+        .unwrap();
+        w.add_fault_plan(b).unwrap();
+        let j1 = w.create_job(ADF_ONE).unwrap();
+        w.retrieve_image(j1.id, &j1.token)
+            .expect("page 1 delivered");
+        let j2 = w.create_job(ADF_ONE).unwrap();
+        let err = w.retrieve_image(j2.id, &j2.token).unwrap_err().to_string();
+        assert!(err.contains("ClientErrorMediaJam"), "{err}");
+    }
+
     #[test]
     fn sticky_empty_adf_fails_platen_leaves_tray() {
         let mut w = brother_usb();
@@ -4173,7 +4678,7 @@ mod tests {
 
     #[test]
     fn hardware_adfduplex_emits_front_then_back_per_sheet() {
-        let mut w = brother_wsd();
+        let mut w = brother_wsd_duplex();
         assert!(w.status().duplex);
         w.set_pages(2);
         let body = r#"
@@ -4293,10 +4798,14 @@ mod tests {
     #[test]
     fn lamp_warmup_delays_first_image_only() {
         use std::time::Instant;
+        // Wall-clock test: the old 40 ms warm-up was comparable to a (debug-build) page encode
+        // under parallel test load, so `second <= first` flaked whenever the second page was
+        // scheduled late. A warm-up far above any encode makes the contrast unambiguous.
+        const WARMUP_MS: u64 = 400;
         let mut w = brother_wsd();
         w.set_pages(2);
         w.apply_faults(&FaultBody {
-            lamp_warmup_ms: Some(40),
+            lamp_warmup_ms: Some(WARMUP_MS),
             ..Default::default()
         });
         let body = r#"
@@ -4311,14 +4820,13 @@ mod tests {
         let t0 = Instant::now();
         w.retrieve_image(id, &token).expect("first");
         let first_ms = t0.elapsed().as_millis();
-        assert!(first_ms >= 35, "first={first_ms}");
+        assert!(first_ms >= u128::from(WARMUP_MS) - 5, "first={first_ms}");
         let t1 = Instant::now();
         w.retrieve_image(id, &token).expect("second");
         let second_ms = t1.elapsed().as_millis();
-        // Second image skips warm-up (page_index > 0). Encode time dominates under
-        // parallel load, so only require first is not faster than second.
+        // Second image skips warm-up (page_index > 0): it must not pay the 400 ms again.
         assert!(
-            second_ms <= first_ms,
+            second_ms < u128::from(WARMUP_MS) - 50,
             "first={first_ms} second={second_ms}"
         );
     }
@@ -4351,6 +4859,39 @@ mod tests {
             w.get_job(id).expect("still active").state_reason,
             "ScannerStopped"
         );
+        let changes = w.drain_pending_condition_changes();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].id, 1);
+        assert_eq!(changes[0].name, "MediaJam");
+        assert!(changes[0].raised);
+    }
+
+    #[test]
+    fn offline_after_n_enqueues_attention_required_notify() {
+        let mut w = brother_wsd();
+        w.set_pages(2);
+        w.apply_faults(&FaultBody {
+            offline_after_n: Some(1),
+            ..Default::default()
+        });
+        let body = r#"
+          <wscn:Format>jfif</wscn:Format>
+          <wscn:ImagesToTransfer>2</wscn:ImagesToTransfer>
+          <wscn:InputSource>Feeder</wscn:InputSource>
+          <wscn:Resolution><wscn:Width>100</wscn:Width><wscn:Height>100</wscn:Height></wscn:Resolution>
+        "#;
+        let job = w.create_job(body).expect("create");
+        let id = job.id;
+        let token = job.token.clone();
+        w.retrieve_image(id, &token).expect("first page");
+        let err = w.retrieve_image(id, &token).unwrap_err().to_string();
+        assert!(err.contains("ServerErrorNotAcceptingJobs"), "{err}");
+        assert!(w.offline());
+        let changes = w.drain_pending_condition_changes();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].id, 0);
+        assert_eq!(changes[0].name, "AttentionRequired");
+        assert!(changes[0].raised);
     }
 
     #[test]
@@ -5167,5 +5708,114 @@ mod tests {
         let warn = hist.iter().find(|e| e.id == 8).expect("LampWarning hist");
         assert_eq!(warn.name, "LampWarning");
         assert_eq!(warn.severity, "Warning");
+    }
+
+    fn profile_world(id: &str) -> World {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        let profile = Profile::load(&dir, id).expect("profile");
+        World::new(dir, profile)
+    }
+
+    fn adf_ticket(w: u32, h: u32, must_honor: bool) -> String {
+        format!(
+            r#"
+          <wscn:Format>jfif</wscn:Format>
+          <wscn:InputSource>ADF</wscn:InputSource>
+          <wscn:InputSize><wscn:InputMediaSize MustHonor="{must_honor}"><wscn:Width>{w}</wscn:Width><wscn:Height>{h}</wscn:Height></wscn:InputMediaSize></wscn:InputSize>
+          <wscn:Resolution><wscn:Width>200</wscn:Width><wscn:Height>200</wscn:Height></wscn:Resolution>"#
+        )
+    }
+
+    #[test]
+    fn tray_capacity_refuses_capacity_plus_one_and_accepts_capacity() {
+        let mut w = profile_world("feeder-tray5");
+        assert_eq!(w.status().feeder_capacity, Some(5));
+        w.try_set_pages(5).expect("5 fits");
+        assert_eq!(w.status().pages_remaining, 5);
+        let err = w.try_set_pages(6).expect_err("6 does not fit");
+        assert_eq!(
+            err,
+            PagesError::OverCapacity {
+                requested: 6,
+                capacity: 5
+            }
+        );
+        assert!(err.to_string().contains("at most 5"), "{err}");
+        assert_eq!(w.status().pages_remaining, 5, "status unchanged on refusal");
+        let body = PagesBody {
+            count: 6,
+            side: None,
+            order: None,
+        };
+        let e = w.apply_pages(&body).expect_err("apply refused");
+        assert!(e.downcast_ref::<PagesError>().is_some(), "{e}");
+        assert_eq!(w.status().pages_remaining, 5);
+        w.apply_pages(&PagesBody {
+            count: 5,
+            side: None,
+            order: None,
+        })
+        .expect("ok");
+    }
+
+    #[test]
+    fn no_capacity_means_no_limit_for_brother_wsd() {
+        let mut w = brother_wsd();
+        assert_eq!(w.status().feeder_capacity, None);
+        w.try_set_pages(30).expect("30");
+        assert_eq!(w.status().pages_remaining, 30);
+        w.try_set_pages(500)
+            .expect("no capacity: not refused (clamped to pages_max)");
+        assert_eq!(w.status().pages_remaining, 30);
+    }
+
+    #[test]
+    fn tray50_and_duplex30_capacity_in_status() {
+        assert_eq!(
+            profile_world("feeder-tray50").status().feeder_capacity,
+            Some(50)
+        );
+        let d = profile_world("feeder-duplex30");
+        assert_eq!(d.status().feeder_capacity, Some(30));
+        assert!(d.status().duplex);
+        assert_eq!(
+            profile_world("feeder-a4only").status().feeder_capacity,
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn a4_ticket_refused_on_tray5_accepted_on_tray50() {
+        let a4 = adf_ticket(8267, 11692, true);
+        let tray5 = profile_world("feeder-tray5");
+        let v = tray5.validate_ticket(&a4);
+        assert!(!v.valid, "{v:?}");
+        assert!(v.reason.unwrap().contains("InputMediaSize"));
+        assert!(tray5.validate_ticket(&adf_ticket(8500, 11700, true)).valid);
+        assert!(profile_world("feeder-tray50").validate_ticket(&a4).valid);
+        assert!(profile_world("feeder-a4only").validate_ticket(&a4).valid);
+        assert!(
+            !profile_world("feeder-a4only")
+                .validate_ticket(&adf_ticket(8500, 11700, true))
+                .valid
+        );
+        // MustHonor false: soft-accepted like other unsupported values.
+        assert!(tray5.validate_ticket(&adf_ticket(8267, 11692, false)).valid);
+        // Platen is unaffected.
+        let platen = a4.replace("ADF", "Platen");
+        assert!(tray5.validate_ticket(&platen).valid);
+        // Unrestricted profile accepts anything.
+        assert!(brother_wsd().validate_ticket(&a4).valid);
+    }
+
+    #[test]
+    fn a4_create_job_refused_on_tray5() {
+        let mut w = profile_world("feeder-tray5");
+        w.try_set_pages(2).unwrap();
+        let err = w
+            .create_job(&adf_ticket(8267, 11692, true))
+            .expect_err("refused");
+        assert!(err.to_string().contains("InputMediaSize"), "{err}");
+        assert!(w.create_job(&adf_ticket(8500, 11700, true)).is_ok());
     }
 }

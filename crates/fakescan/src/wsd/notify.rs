@@ -2,13 +2,12 @@
 
 use std::time::Duration;
 
+use super::soap;
+use super::xml::Element;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::warn;
-use uuid::Uuid;
-
-use super::soap::{self, SOAP_NS, WSA_NS};
 
 /// WSDL ScanAvailableEvent Action namespace (`2006/08`).
 pub const SCAN_AVAILABLE_NS: &str = soap::SCAN_NS_AIRSCAN;
@@ -23,27 +22,15 @@ pub fn scan_available_event_xml(
     scan_identifier: &str,
     client_context: &str,
 ) -> String {
-    let action = soap::scan_action(scan_ns, "ScanAvailableEvent");
-    let msg = Uuid::new_v4();
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="{SOAP_NS}" xmlns:wsa="{WSA_NS}" xmlns:wscn="{scan_ns}">
-  <soap:Header>
-    <wsa:To>{}</wsa:To>
-    <wsa:Action>{action}</wsa:Action>
-    <wsa:MessageID>uuid:{msg}</wsa:MessageID>
-  </soap:Header>
-  <soap:Body>
-    <wscn:ScanAvailableEvent>
-      <wscn:ClientContext>{}</wscn:ClientContext>
-      <wscn:ScanIdentifier>{}</wscn:ScanIdentifier>
-    </wscn:ScanAvailableEvent>
-  </soap:Body>
-</soap:Envelope>"#,
-        soap::esc(notify_to.trim()),
-        soap::esc(client_context),
-        soap::esc(scan_identifier),
-    )
+    let body = Element::new("wscn:ScanAvailableEvent")
+        .with(Element::text_el("wscn:ClientContext", client_context))
+        .with(Element::text_el("wscn:ScanIdentifier", scan_identifier));
+    soap::Response::new()
+        .scan_ns(scan_ns)
+        .action(&soap::scan_action(scan_ns, "ScanAvailableEvent"))
+        .to(notify_to.trim())
+        .body(body)
+        .to_xml()
 }
 
 /// POST ScanAvailableEvent to `notify_to`. Best-effort: logs and returns Err on failure.

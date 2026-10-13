@@ -43,6 +43,148 @@ impl ColorMode {
     }
 }
 
+/// Photometric polarity of 1-bit (BlackAndWhite1) output.
+///
+/// Real scanners differ: some write BMP palette `[black, white]` / TIFF
+/// `MinIsBlack`, others `[white, black]` / `MinIsWhite`. The visual image is
+/// identical either way; only the stored bit sense and the header flip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BilevelPolarity {
+    /// Bit 0 = black (BMP palette `[black, white]`, TIFF Photometric 1).
+    #[default]
+    BlackIsZero,
+    /// Bit 0 = white (BMP palette `[white, black]`, TIFF Photometric 0).
+    WhiteIsZero,
+}
+
+impl BilevelPolarity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BilevelPolarity::BlackIsZero => "black_is_zero",
+            BilevelPolarity::WhiteIsZero => "white_is_zero",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "black_is_zero" | "blackiszero" | "minisblack" | "min_is_black" | "" => {
+                Ok(BilevelPolarity::BlackIsZero)
+            }
+            "white_is_zero" | "whiteiszero" | "miniswhite" | "min_is_white" => {
+                Ok(BilevelPolarity::WhiteIsZero)
+            }
+            other => Err(format!(
+                "unknown bilevel_polarity {other:?}; expected black_is_zero or white_is_zero"
+            )),
+        }
+    }
+}
+
+/// How a Grayscale8 ticket is answered when the Format is JFIF / JPEG / EXIF.
+///
+/// Live proof (2026-10-12, Windows 11 inbox `wsdscdrv`): answering a gray ticket
+/// with ColorProcessing RGB24 makes Windows accept CreateScanJob and then never
+/// call RetrieveImage ("feeder has no paper"); the consistent gray answer works.
+/// So `Gray8` is the default. This only changes the *answer* (FinalParameters /
+/// ValidScanTicket / delivered bytes); the published ScannerConfiguration never
+/// changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JfifGray {
+    /// Legacy opt-in: ColorProcessing coerced to RGB24 (Override), BytesPerLine =
+    /// width x 3, 3-component JPEG. Known to be rejected by the Windows inbox
+    /// driver; kept for tests of the old coercion.
+    Rgb24,
+    /// Default. Consistent gray: ColorProcessing Grayscale8, BytesPerLine = width,
+    /// and a genuine 1-component 8-bit gray JPEG (EXIF keeps its APP1).
+    #[default]
+    Gray8,
+    /// Gray8 ColorProcessing and gray JPEG, but BytesPerLine = width x 3
+    /// (also accepted by Windows in the live test).
+    Gray8RgbStride,
+    /// Gray ticket asking JFIF/JPEG/EXIF is answered with Format
+    /// `tiff-single-uncompressed` (Override) and an 8-bit gray TIFF. Rejected by
+    /// Windows in the live test (fails like `rgb24`). Needs the profile to offer TIFF.
+    Gray8Tiff,
+}
+
+impl JfifGray {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JfifGray::Rgb24 => "rgb24",
+            JfifGray::Gray8 => "gray8",
+            JfifGray::Gray8RgbStride => "gray8_rgb_stride",
+            JfifGray::Gray8Tiff => "gray8_tiff",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "rgb24" | "rgb" => Ok(JfifGray::Rgb24),
+            "gray8" | "grayscale8" | "gray" | "grey8" | "" => Ok(JfifGray::Gray8),
+            "gray8_rgb_stride" | "gray8rgbstride" => Ok(JfifGray::Gray8RgbStride),
+            "gray8_tiff" | "gray8tiff" | "tiff" => Ok(JfifGray::Gray8Tiff),
+            other => Err(format!(
+                "unknown jfif_gray {other:?}; expected rgb24, gray8, gray8_rgb_stride or gray8_tiff"
+            )),
+        }
+    }
+
+    /// Gray tickets keep ColorProcessing Grayscale8 on the wire in this mode.
+    pub fn keeps_gray_token(self) -> bool {
+        !matches!(self, JfifGray::Rgb24)
+    }
+
+    /// Delivered JFIF/EXIF is a one-component JPEG.
+    pub fn gray_jpeg(self) -> bool {
+        matches!(self, JfifGray::Gray8 | JfifGray::Gray8RgbStride)
+    }
+}
+
+/// How a BlackAndWhite1 ticket is answered when the Format is JFIF / JPEG / EXIF.
+///
+/// JPEG cannot carry 1-bit samples, so the conforming answer (same kind as for
+/// Grayscale8) is a one-component 8-bit image whose samples are the thresholded
+/// 0/255 values. Only the *answer* changes; the published ScannerConfiguration
+/// never does. TIFF/BMP/PNG/DIB BW answers (real 1-bit) are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JfifBw {
+    /// Legacy Brother-style fallback: ColorProcessing coerced to RGB24 (Override),
+    /// BytesPerLine = width x 3, 3-component JPEG with bilevel samples.
+    Rgb24,
+    /// Default. ColorProcessing Grayscale8 (Override), BytesPerLine = width, and a
+    /// genuine 1-component JPEG with thresholded 0/255 samples.
+    #[default]
+    Gray8,
+    /// Spec-faithful: a BlackAndWhite1 ticket with a JPEG-family Format is refused
+    /// with ClientErrorDocumentFormatNotSupported (ValidateScanTicket and
+    /// CreateScanJob) so the Windows driver falls back to another Format.
+    Reject,
+}
+
+impl JfifBw {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JfifBw::Rgb24 => "rgb24",
+            JfifBw::Gray8 => "gray8",
+            JfifBw::Reject => "reject",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "rgb24" | "rgb" => Ok(JfifBw::Rgb24),
+            "gray8" | "grayscale8" | "gray" | "grey8" | "" => Ok(JfifBw::Gray8),
+            "reject" | "refuse" | "fault" => Ok(JfifBw::Reject),
+            other => Err(format!(
+                "unknown jfif_bw {other:?}; expected gray8, rgb24 or reject"
+            )),
+        }
+    }
+}
+
 /// Axis for ADF / glass dust streaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +246,112 @@ pub struct ImageEffects {
     pub show_through: f32,
     /// Halftone-style moiré overlay when true.
     pub moire: bool,
+    /// Bit sense of 1-bit output (BMP palette order / TIFF Photometric). Not a
+    /// pixel defect: the visual stays identical, so it is ignored by `is_clean`.
+    #[serde(default)]
+    pub bilevel_polarity: BilevelPolarity,
+    /// Wire answer for Grayscale8 + JFIF/JPEG/EXIF (see [`JfifGray`]; default `gray8`). Not a pixel
+    /// defect: ignored by `is_clean`, kept across presets, cleared by `clear`.
+    #[serde(default)]
+    pub jfif_gray: JfifGray,
+    /// Wire answer for BlackAndWhite1 + JFIF/JPEG/EXIF (see [`JfifBw`]; default `gray8`).
+    /// Same status as `jfif_gray`: not a pixel defect.
+    #[serde(default)]
+    pub jfif_bw: JfifBw,
+    /// Scan tickets the device refuses (see [`RefuseRule`]). Not a pixel defect: ignored
+    /// by `is_clean`, kept across presets, cleared by `clear`.
+    #[serde(default)]
+    pub refuse_tickets: Vec<RefuseRule>,
+}
+
+/// Default fault for a refused ticket.
+pub const REFUSE_DEFAULT_FAULT: &str = "ClientErrorDocumentFormatNotSupported";
+/// Fault names `refuse_tickets` may use (each has a wire subcode mapping).
+const REFUSE_FAULTS: &[&str] = &[
+    "ClientErrorDocumentFormatNotSupported",
+    "ClientErrorFormatNotSupported",
+    "ClientErrorConflictingRequiredParameters",
+    "ClientErrorNoImagesAvailable",
+];
+
+/// One `refuse_tickets` rule. A ticket is refused when every field present matches
+/// (absent field = wildcard).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefuseRule {
+    /// Wire Format token, e.g. `tiff-single-uncompressed`, `jfif`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// `BlackAndWhite1` | `Grayscale8` | `RGB24`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// `Platen` | `ADF` | `ADFDuplex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<u32>,
+    /// Fault name; default [`REFUSE_DEFAULT_FAULT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<String>,
+}
+
+impl RefuseRule {
+    pub fn fault_name(&self) -> &str {
+        self.fault.as_deref().unwrap_or(REFUSE_DEFAULT_FAULT)
+    }
+
+    /// Parse the JSON value of `refuse_tickets` (null / `[]` = clear).
+    pub fn parse_list(v: &serde_json::Value) -> Result<Vec<RefuseRule>, String> {
+        if v.is_null() {
+            return Ok(Vec::new());
+        }
+        let rules: Vec<RefuseRule> = serde_json::from_value(v.clone()).map_err(|e| {
+            format!(
+                "invalid refuse_tickets (expected a list of {{format?, color?, input_source?, resolution?, fault?}}): {e}"
+            )
+        })?;
+        for r in &rules {
+            if let Some(f) = r.fault.as_deref() {
+                if !REFUSE_FAULTS.contains(&f) {
+                    return Err(format!(
+                        "unknown refuse_tickets fault {f:?}; expected one of {}",
+                        REFUSE_FAULTS.join(", ")
+                    ));
+                }
+            }
+            if let Some(c) = r.color.as_deref() {
+                if !["BlackAndWhite1", "Grayscale8", "RGB24"]
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(c))
+                {
+                    return Err(format!(
+                        "unknown refuse_tickets color {c:?}; expected BlackAndWhite1, Grayscale8 or RGB24"
+                    ));
+                }
+            }
+            if let Some(s) = r.input_source.as_deref() {
+                if !["Platen", "ADF", "ADFDuplex"]
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(s))
+                {
+                    return Err(format!(
+                        "unknown refuse_tickets input_source {s:?}; expected Platen, ADF or ADFDuplex"
+                    ));
+                }
+            }
+            if r.format.as_deref().is_some_and(|f| f.trim().is_empty()) {
+                return Err("refuse_tickets format must not be empty".into());
+            }
+        }
+        Ok(rules)
+    }
+}
+
+fn deserialize_some_value<'de, D>(d: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(serde::Deserialize::deserialize(d)?))
 }
 
 impl Default for ImageEffects {
@@ -126,6 +374,10 @@ impl Default for ImageEffects {
             margin_crop_px: 0,
             show_through: 0.0,
             moire: false,
+            bilevel_polarity: BilevelPolarity::BlackIsZero,
+            jfif_gray: JfifGray::Gray8,
+            jfif_bw: JfifBw::Gray8,
+            refuse_tickets: Vec::new(),
         }
     }
 }
@@ -177,12 +429,30 @@ impl ImageEffects {
             margin_crop_px: self.margin_crop_px,
             show_through: self.show_through,
             moire: self.moire,
+            bilevel_polarity: self.bilevel_polarity.as_str().to_string(),
+            jfif_gray: self.jfif_gray.as_str().to_string(),
+            jfif_bw: self.jfif_bw.as_str().to_string(),
+            refuse_tickets: self.refuse_tickets.clone(),
             clean: self.is_clean(),
         }
     }
 
     pub fn apply_preset(&mut self, name: &str) -> Result<(), String> {
         let seed = self.seed;
+        let polarity = self.bilevel_polarity;
+        let jfif_gray = self.jfif_gray;
+        let jfif_bw = self.jfif_bw;
+        let refuse = std::mem::take(&mut self.refuse_tickets);
+        let res = self.apply_preset_inner(name, seed);
+        self.jfif_bw = jfif_bw;
+        self.refuse_tickets = refuse;
+        // Polarity / jfif_gray are format knobs, not defects: presets never reset them.
+        self.bilevel_polarity = polarity;
+        self.jfif_gray = jfif_gray;
+        res
+    }
+
+    fn apply_preset_inner(&mut self, name: &str, seed: u64) -> Result<(), String> {
         match name.trim().to_ascii_lowercase().as_str() {
             "clean" => {
                 *self = Self::default();
@@ -290,6 +560,10 @@ pub struct EffectsSummary {
     pub margin_crop_px: u32,
     pub show_through: f32,
     pub moire: bool,
+    pub bilevel_polarity: String,
+    pub jfif_gray: String,
+    pub jfif_bw: String,
+    pub refuse_tickets: Vec<RefuseRule>,
     pub clean: bool,
 }
 
@@ -313,6 +587,16 @@ pub struct EffectsBody {
     pub margin_crop_px: Option<u32>,
     pub show_through: Option<f32>,
     pub moire: Option<bool>,
+    /// `black_is_zero` (default) | `white_is_zero`; see [`BilevelPolarity`].
+    pub bilevel_polarity: Option<String>,
+    /// `gray8` (default) | `rgb24` (legacy, Windows rejects) | `gray8_rgb_stride` | `gray8_tiff`; see [`JfifGray`].
+    pub jfif_gray: Option<String>,
+    /// `gray8` (default) | `rgb24` (legacy Brother-style fallback) | `reject`; see [`JfifBw`].
+    pub jfif_bw: Option<String>,
+    /// List of `{format?, color?, input_source?, resolution?, fault?}` rules; `[]` or `null`
+    /// clears. Kept as raw JSON so a malformed rule is a 400 with a clear message.
+    #[serde(default, deserialize_with = "deserialize_some_value")]
+    pub refuse_tickets: Option<serde_json::Value>,
     pub preset: Option<String>,
     #[serde(default)]
     pub clear: bool,
@@ -376,6 +660,18 @@ impl ImageEffects {
         }
         if let Some(v) = body.moire {
             self.moire = v;
+        }
+        if let Some(ref v) = body.bilevel_polarity {
+            self.bilevel_polarity = BilevelPolarity::parse(v)?;
+        }
+        if let Some(ref v) = body.jfif_gray {
+            self.jfif_gray = JfifGray::parse(v)?;
+        }
+        if let Some(ref v) = body.jfif_bw {
+            self.jfif_bw = JfifBw::parse(v)?;
+        }
+        if let Some(ref v) = body.refuse_tickets {
+            self.refuse_tickets = RefuseRule::parse_list(v)?;
         }
         Ok(())
     }

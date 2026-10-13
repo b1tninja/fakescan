@@ -97,7 +97,10 @@ async fn bare_uuid_message_id_is_not_echoed() {
     );
     let (status, body) = post(&xml).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(!body.contains("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"), "{body}");
+    assert!(
+        !body.contains("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        "{body}"
+    );
     assert!(body.contains("<wsa:MessageID>uuid:"), "{body}");
 }
 
@@ -110,7 +113,10 @@ async fn repeated_message_id_is_echoed_and_the_reply_id_is_fresh() {
     );
     let (status, body) = post(&create_ticket(&header)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains(&format!("<wsa:RelatesTo>{id}</wsa:RelatesTo>")), "{body}");
+    assert!(
+        body.contains(&format!("<wsa:RelatesTo>{id}</wsa:RelatesTo>")),
+        "{body}"
+    );
     let reply_id = body
         .split("<wsa:MessageID>")
         .nth(1)
@@ -124,7 +130,9 @@ async fn repeated_message_id_is_echoed_and_the_reply_id_is_fresh() {
 
 #[tokio::test]
 async fn missing_action_uses_the_body_element() {
-    let xml = create_ticket(r#"<wsa:MessageID>uuid:cccccccc-cccc-4ccc-8ccc-cccccccccccc</wsa:MessageID>"#);
+    let xml = create_ticket(
+        r#"<wsa:MessageID>uuid:cccccccc-cccc-4ccc-8ccc-cccccccccccc</wsa:MessageID>"#,
+    );
     let (status, body) = post(&xml).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("CreateScanJobResponse"), "{body}");
@@ -184,7 +192,10 @@ async fn omitted_job_description_still_creates_a_job() {
            <wsa:MessageID>uuid:13131313-1313-4131-8131-131313131313</wsa:MessageID>"#,
     );
     let request = body_problems(&xml);
-    assert!(request.iter().any(|p| p.contains("missing JobDescription")), "{request:?}");
+    assert!(
+        request.iter().any(|p| p.contains("missing JobDescription")),
+        "{request:?}"
+    );
     let (status, body) = post(&xml).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("<wscn:JobId>"), "{body}");

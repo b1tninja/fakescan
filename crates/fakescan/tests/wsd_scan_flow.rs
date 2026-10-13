@@ -385,10 +385,10 @@ async fn airscan_platen_flow_echoes_08_ns_and_jpeg() {
     );
 }
 
-/// Lab 2026-10-12: ticket Grayscale8 + FinalParams Grayscale8 → CreateScanJob Pending
-/// then no RetrieveImage. FinalParams must echo RGB24 and BPL = width×3 for jfif.
+/// Live 2026-10-12 (Windows 11): coercing a Grayscale8 ticket to RGB24 FinalParams
+/// makes wsdscdrv skip RetrieveImage. Default FinalParams must stay Grayscale8, BPL = width.
 #[tokio::test]
-async fn create_scan_job_jfif_grayscale8_final_params_rgb24() {
+async fn create_scan_job_jfif_grayscale8_final_params_stay_gray() {
     let w = world();
     {
         let mut g = w.write().await;
@@ -431,14 +431,13 @@ async fn create_scan_job_jfif_grayscale8_final_params_rgb24() {
 
     let (st, body) = post_soap(app(w), create).await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    // Attribute form: `<wscn:ColorProcessing wscn:Override="true">RGB24</…>`
     assert!(
-        body.contains(">RGB24</wscn:ColorProcessing>"),
-        "jfif FinalParams must coerce Grayscale8 → RGB24: {body}"
+        body.contains(">Grayscale8</wscn:ColorProcessing>"),
+        "jfif FinalParams must echo Grayscale8: {body}"
     );
     assert!(
-        !body.contains(">Grayscale8</wscn:ColorProcessing>"),
-        "FinalParams must not echo ticket Grayscale8 for jfif: {body}"
+        !body.contains(">RGB24</wscn:ColorProcessing>"),
+        "FinalParams must not coerce gray to RGB24: {body}"
     );
     let pixels: u32 = body
         .split("<wscn:PixelsPerLine>")
@@ -453,15 +452,14 @@ async fn create_scan_job_jfif_grayscale8_final_params_rgb24() {
         .and_then(|s| s.parse().ok())
         .expect("BytesPerLine");
     assert_eq!(
-        bpl,
-        pixels.saturating_mul(3),
-        "jfif ImageInformation BPL must be RGB stride (width×3), got pixels={pixels} bpl={bpl}"
+        bpl, pixels,
+        "gray jfif ImageInformation BPL must be width, got pixels={pixels} bpl={bpl}"
     );
 }
 
-/// Validate before Create must accept gray+jfif with RGB BytesPerLine (Brother stride).
+/// Validate before Create must accept gray+jfif with the gray BytesPerLine (= width).
 #[tokio::test]
-async fn validate_scan_ticket_jfif_grayscale8_rgb_stride() {
+async fn validate_scan_ticket_jfif_grayscale8_gray_stride() {
     let w = world();
     let validate = r#"<?xml version="1.0"?>
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
@@ -515,9 +513,8 @@ async fn validate_scan_ticket_jfif_grayscale8_rgb_stride() {
         .and_then(|s| s.parse().ok())
         .expect("BytesPerLine");
     assert_eq!(
-        bpl,
-        pixels.saturating_mul(3),
-        "Validate ImageInformation BPL must be RGB stride for jfif: pixels={pixels} bpl={bpl}"
+        bpl, pixels,
+        "Validate ImageInformation BPL must be width for gray jfif: pixels={pixels} bpl={bpl}"
     );
 }
 
@@ -2184,4 +2181,359 @@ async fn retrieve_image_abort_retrieve_cuts_mtom_stream() {
         "unexpected abort error: {msg}"
     );
     assert!(w.read().await.abort_retrieve(), "abort stays sticky");
+}
+
+// ---- fault plan (mid-scan interruptions) ------------------------------------------------
+
+fn soap_env(action: &str, body: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+  xmlns:wscn="http://schemas.microsoft.com/windows/2006/01/wdp/scan">
+  <soap:Header>
+    <wsa:Action>http://schemas.microsoft.com/windows/2006/01/wdp/scan/{action}</wsa:Action>
+    <wsa:MessageID>uuid:dddddddd-dddd-dddd-dddd-dddddddddddd</wsa:MessageID>
+  </soap:Header>
+  <soap:Body>{body}</soap:Body>
+</soap:Envelope>"#
+    )
+}
+
+async fn plan_create_job(w: &Arc<RwLock<World>>) -> (String, String) {
+    let create = soap_env(
+        "CreateScanJob",
+        r#"<wscn:CreateScanJobRequest><wscn:ScanTicket><wscn:DocumentParameters>
+          <wscn:Format>jfif</wscn:Format><wscn:ImagesToTransfer>0</wscn:ImagesToTransfer>
+          <wscn:InputSource>Feeder</wscn:InputSource>
+          <wscn:Resolution><wscn:Width>100</wscn:Width><wscn:Height>100</wscn:Height></wscn:Resolution>
+          </wscn:DocumentParameters></wscn:ScanTicket></wscn:CreateScanJobRequest>"#,
+    );
+    let (st, b) = post_soap(app(w.clone()), &create).await;
+    assert_eq!(st, StatusCode::OK, "{b}");
+    let pick = |tag: &str| {
+        b.split(&format!("<wscn:{tag}>"))
+            .nth(1)
+            .and_then(|s| s.split('<').next())
+            .expect(tag)
+            .to_string()
+    };
+    (pick("JobId"), pick("JobToken"))
+}
+
+fn retrieve_xml(id: &str, tok: &str) -> String {
+    soap_env(
+        "RetrieveImage",
+        &format!(
+            "<wscn:RetrieveImageRequest><wscn:JobId>{id}</wscn:JobId><wscn:JobToken>{tok}</wscn:JobToken></wscn:RetrieveImageRequest>"
+        ),
+    )
+}
+
+/// Returns (status, declared Content-Length, bytes received, stream ended with an error).
+async fn retrieve_stream(
+    w: &Arc<RwLock<World>>,
+    xml: &str,
+) -> (StatusCode, Option<usize>, usize, bool) {
+    use futures_util::StreamExt;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ScannerService")
+        .header("content-type", "application/soap+xml")
+        .body(Body::from(xml.to_string()))
+        .unwrap();
+    let res = app(w.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    let declared = res
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+    let mut stream = res.into_body().into_data_stream();
+    let (mut got, mut errored) = (0usize, false);
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(b) => got += b.len(),
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    (status, declared, got, errored)
+}
+
+async fn scanner_status_xml(w: &Arc<RwLock<World>>) -> String {
+    let req = soap_env(
+        "GetScannerElements",
+        "<wscn:GetScannerElementsRequest><wscn:RequestedElements><wscn:Name>wscn:ScannerStatus</wscn:Name></wscn:RequestedElements></wscn:GetScannerElementsRequest>",
+    );
+    post_soap(app(w.clone()), &req).await.1
+}
+
+#[tokio::test]
+async fn soap_cover_open_after_n_serves_exactly_n_pages_then_faults() {
+    use fakescan::state::FaultBody;
+    let w = world();
+    {
+        let mut g = w.write().await;
+        g.set_pages(4);
+        g.apply_faults(&FaultBody {
+            cover_open_after_n: Some(2),
+            ..Default::default()
+        });
+    }
+    let (id, tok) = plan_create_job(&w).await;
+    for n in 1..=2 {
+        let (st, declared, got, errored) = retrieve_stream(&w, &retrieve_xml(&id, &tok)).await;
+        assert_eq!(st, StatusCode::OK, "page {n}");
+        assert!(!errored && declared == Some(got), "page {n} intact");
+    }
+    let (st, body) = post_soap(app(w.clone()), &retrieve_xml(&id, &tok)).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("ClientErrorCoverOpen"), "{body}");
+    let status = scanner_status_xml(&w).await;
+    assert!(
+        status.contains("<wscn:ScannerState>Stopped</wscn:ScannerState>"),
+        "{status}"
+    );
+    assert!(
+        status.contains("<wscn:ScannerStateReason>CoverOpen</wscn:ScannerStateReason>"),
+        "{status}"
+    );
+    assert!(
+        status.contains("<wscn:Name>CoverOpen</wscn:Name>"),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn soap_mid_page_cover_cut_truncates_page_two_and_keeps_page_one() {
+    use fakescan::state::PlanBody;
+    let w = world();
+    {
+        let mut g = w.write().await;
+        g.set_pages(4);
+        let body: PlanBody = serde_json::from_value(serde_json::json!({
+            "faults": [{"kind": "cover_open", "when": {"page": 2, "fraction": 0.5}}]
+        }))
+        .unwrap();
+        g.add_fault_plan(body).unwrap();
+    }
+    let (id, tok) = plan_create_job(&w).await;
+    let (st, declared, got, errored) = retrieve_stream(&w, &retrieve_xml(&id, &tok)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        !errored && declared == Some(got),
+        "page 1 complete: {declared:?} vs {got}"
+    );
+    let full = got;
+
+    let (st, declared, got, errored) = retrieve_stream(&w, &retrieve_xml(&id, &tok)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(errored, "stream must error mid-page");
+    let declared = declared.expect("Content-Length still advertises the whole page");
+    assert!(
+        got > 0 && got < declared,
+        "truncated: got {got} of {declared}"
+    );
+    assert!(
+        got.abs_diff(declared / 2) <= declared / 10 + 8,
+        "cut at about 50%: got {got} of {declared} (page 1 was {full})"
+    );
+    {
+        let g = w.read().await;
+        assert!(g.cover_open(), "condition set");
+        assert_eq!(
+            g.get_job(id.parse().unwrap()).unwrap().page_index,
+            1,
+            "only page 1 counted"
+        );
+    }
+    let status = scanner_status_xml(&w).await;
+    assert!(
+        status.contains("<wscn:ScannerStateReason>CoverOpen</wscn:ScannerStateReason>"),
+        "{status}"
+    );
+    let (st, body) = post_soap(app(w.clone()), &retrieve_xml(&id, &tok)).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("ClientErrorCoverOpen"), "{body}");
+}
+
+#[tokio::test]
+async fn soap_live_jam_now_faults_next_retrieve_of_running_job() {
+    use fakescan::state::PlanBody;
+    let w = world();
+    {
+        w.write().await.set_pages(3);
+    }
+    let (id, tok) = plan_create_job(&w).await;
+    let (st, _, _, errored) = retrieve_stream(&w, &retrieve_xml(&id, &tok)).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!errored);
+    {
+        let mut g = w.write().await;
+        let body: PlanBody =
+            serde_json::from_value(serde_json::json!({"kind": "jam", "when": "now"})).unwrap();
+        g.add_fault_plan(body).unwrap();
+    }
+    let (st, body) = post_soap(app(w.clone()), &retrieve_xml(&id, &tok)).await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("ClientErrorMediaJam"), "{body}");
+}
+
+#[tokio::test]
+async fn soap_timed_cover_shows_in_status_without_any_retrieve() {
+    use fakescan::state::PlanBody;
+    let w = world();
+    {
+        w.write().await.set_pages(2);
+    }
+    let (_id, _tok) = plan_create_job(&w).await;
+    {
+        let mut g = w.write().await;
+        let body: PlanBody = serde_json::from_value(
+            serde_json::json!({"kind": "cover_open", "when": {"after_ms": 3_600_000}}),
+        )
+        .unwrap();
+        g.add_fault_plan(body).unwrap();
+    }
+    let before = scanner_status_xml(&w).await;
+    assert!(!before.contains("CoverOpen"), "{before}");
+    w.write()
+        .await
+        .advance_plan_clock(std::time::Duration::from_secs(3_700));
+    let after = scanner_status_xml(&w).await;
+    assert!(
+        after.contains("<wscn:ScannerStateReason>CoverOpen</wscn:ScannerStateReason>"),
+        "{after}"
+    );
+}
+
+// ---- empty_feeder_brother (real Brother with an empty feeder) -----------------------------
+
+async fn create_with_source(w: &Arc<RwLock<World>>, source: &str) -> (StatusCode, String) {
+    let create = soap_env(
+        "CreateScanJob",
+        &format!(
+            r#"<wscn:CreateScanJobRequest><wscn:ScanTicket><wscn:DocumentParameters>
+          <wscn:Format>jfif</wscn:Format><wscn:ImagesToTransfer>0</wscn:ImagesToTransfer>
+          <wscn:InputSource>{source}</wscn:InputSource>
+          <wscn:Resolution><wscn:Width>100</wscn:Width><wscn:Height>100</wscn:Height></wscn:Resolution>
+          </wscn:DocumentParameters></wscn:ScanTicket></wscn:CreateScanJobRequest>"#
+        ),
+    );
+    post_soap(app(w.clone()), &create).await
+}
+
+async fn arm_empty_feeder(w: &Arc<RwLock<World>>, delay_ms: u64) {
+    w.write().await.apply_faults(&fakescan::state::FaultBody {
+        empty_feeder_brother: Some(true),
+        empty_feeder_delay_ms: Some(delay_ms),
+        ..Default::default()
+    });
+}
+
+fn assert_idle_no_conditions(body: &str) {
+    assert!(
+        body.contains("<wscn:ScannerState>Idle</wscn:ScannerState>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<wscn:ScannerStateReason>None</wscn:ScannerStateReason>"),
+        "{body}"
+    );
+    assert!(!body.contains("InputTrayEmpty"), "{body}");
+    assert!(!body.contains("<wscn:DeviceCondition>"), "{body}");
+}
+
+#[tokio::test]
+async fn empty_feeder_brother_refuses_feeder_job_busy_after_delay() {
+    let w = world();
+    w.write().await.set_feeder(false);
+    arm_empty_feeder(&w, 150).await;
+    let (st, body) = post_soap(app(w.clone()), scanner_status_request()).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_idle_no_conditions(&body);
+
+    let t0 = std::time::Instant::now();
+    let (st, body) = create_with_source(&w, "Feeder").await;
+    assert!(t0.elapsed() >= std::time::Duration::from_millis(150));
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("ServerErrorNotAcceptingJobs"), "{body}");
+    assert_eq!(w.read().await.status().active_jobs, 0);
+
+    // Status after the refusal is still Idle with no conditions.
+    let (_, body) = post_soap(app(w.clone()), scanner_status_request()).await;
+    assert_idle_no_conditions(&body);
+}
+
+#[tokio::test]
+async fn empty_feeder_brother_does_not_block_other_requests_during_delay() {
+    let w = world();
+    arm_empty_feeder(&w, 400).await;
+    let w2 = w.clone();
+    let slow = tokio::spawn(async move { create_with_source(&w2, "Feeder").await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let t0 = std::time::Instant::now();
+    let (st, body) = post_soap(app(w.clone()), scanner_status_request()).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(250),
+        "status poll blocked by the delay"
+    );
+    let (st, _) = slow.await.unwrap();
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn empty_feeder_brother_with_sheets_scans_normally() {
+    let w = world();
+    arm_empty_feeder(&w, 150).await;
+    w.write().await.set_pages(2);
+    let t0 = std::time::Instant::now();
+    let (st, body) = create_with_source(&w, "Feeder").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(t0.elapsed() < std::time::Duration::from_millis(150));
+}
+
+#[tokio::test]
+async fn empty_feeder_brother_glass_job_is_normal() {
+    let w = world();
+    arm_empty_feeder(&w, 150).await;
+    let t0 = std::time::Instant::now();
+    let (st, body) = create_with_source(&w, "Platen").await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(t0.elapsed() < std::time::Duration::from_millis(150));
+}
+
+#[tokio::test]
+async fn empty_feeder_unarmed_keeps_quick_generic_failure() {
+    let w = world();
+    w.write().await.set_feeder(false);
+    let t0 = std::time::Instant::now();
+    let (st, body) = create_with_source(&w, "Feeder").await;
+    assert!(t0.elapsed() < std::time::Duration::from_millis(100));
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("feeder empty"), "{body}");
+    assert!(!body.contains("ServerErrorNotAcceptingJobs"), "{body}");
+}
+
+#[tokio::test]
+async fn empty_feeder_brother_reset_clears_and_status_field_present() {
+    let w = world();
+    arm_empty_feeder(&w, 150).await;
+    let st = w.read().await.status();
+    assert!(st.empty_feeder_brother);
+    assert_eq!(st.empty_feeder_delay_ms, 150);
+    let json = serde_json::to_value(&st).unwrap();
+    assert_eq!(json["empty_feeder_brother"], true);
+    assert_eq!(json["empty_feeder_delay_ms"], 150);
+    w.write().await.reset();
+    let json = serde_json::to_value(w.read().await.status()).unwrap();
+    assert_eq!(json["empty_feeder_brother"], false);
+    assert_eq!(json["empty_feeder_delay_ms"], 10000);
+    let (st, body) = create_with_source(&w, "Feeder").await;
+    assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(body.contains("feeder empty"), "{body}");
 }

@@ -19,8 +19,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use super::xml::{self, Element};
 
 const SCAN_NS_SUFFIX: &str = "/wdp/scan";
 
@@ -29,7 +28,7 @@ const JOB_STATUS_LAB_EXTENSIONS: &[&str] = &["ImagesCompleted", "ImagesToTransfe
 
 pub fn body_problems(soap_xml: &str) -> Vec<String> {
     let schema = schema();
-    let root = match parse_tree(xml_document(soap_xml)) {
+    let root = match xml::parse(xml_document(soap_xml)).map(|el| element_to_node(&el)) {
         Some(root) => root,
         None => return vec!["body is not XML".into()],
     };
@@ -117,7 +116,14 @@ fn check_model(
         return;
     }
     if !model.particles.is_empty() || model.simple.is_none() {
-        walk_particles(&model.particles, &node.children, schema, path, ctx, problems);
+        walk_particles(
+            &model.particles,
+            &node.children,
+            schema,
+            path,
+            ctx,
+            problems,
+        );
     }
 }
 
@@ -125,9 +131,10 @@ fn validation_ctx(node: &Node, ctx: Ctx) -> Ctx {
     if node.local != "ValidationInfo" {
         return ctx;
     }
-    let invalid = node.children.iter().any(|child| {
-        child.local == "ValidTicket" && matches!(child.text.trim(), "false" | "0")
-    });
+    let invalid = node
+        .children
+        .iter()
+        .any(|child| child.local == "ValidTicket" && matches!(child.text.trim(), "false" | "0"));
     Ctx {
         invalid_ticket: invalid,
     }
@@ -657,7 +664,7 @@ fn load_schema() -> Schema {
         }
         let text =
             fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        if let Some(root) = parse_tree(&text) {
+        if let Some(root) = xml::parse(&text).map(|el| element_to_node(&el)) {
             roots.push(root);
         }
     }
@@ -967,108 +974,25 @@ fn xml_document(input: &str) -> &str {
     }
 }
 
-fn parse_tree(input: &str) -> Option<Node> {
-    let mut reader = Reader::from_str(input);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    let mut stack: Vec<Node> = Vec::new();
-    let mut prefixes: Vec<HashMap<String, String>> = vec![HashMap::new()];
-    while let Ok(event) = reader.read_event_into(&mut buf) {
-        match event {
-            Event::Start(el) => {
-                let mut map = prefixes.last().cloned().unwrap_or_default();
-                take_xmlns(&el, &mut map);
-                let node = start_node(&el, &map);
-                prefixes.push(map);
-                stack.push(node);
-            }
-            Event::Empty(el) => {
-                let mut map = prefixes.last().cloned().unwrap_or_default();
-                take_xmlns(&el, &mut map);
-                push_child(&mut stack, start_node(&el, &map));
-            }
-            Event::Text(text) => {
-                if let Some(parent) = stack.last_mut() {
-                    if let Ok(value) = text.unescape() {
-                        parent.text.push_str(&value);
-                    }
-                }
-            }
-            Event::End(_) => {
-                prefixes.pop();
-                let node = stack.pop()?;
-                if stack.is_empty() {
-                    return Some(node);
-                }
-                push_child(&mut stack, node);
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    stack.pop()
-}
-
-fn start_node(el: &quick_xml::events::BytesStart<'_>, prefixes: &HashMap<String, String>) -> Node {
-    let raw = String::from_utf8_lossy(el.name().as_ref()).into_owned();
-    let (prefix, local) = split_name(&raw);
-    let ns = prefix
-        .and_then(|name| prefixes.get(name))
-        .map(String::as_str);
-    let in_scan = ns.is_some_and(|uri| uri.contains(SCAN_NS_SUFFIX));
-    let mut attrs = Vec::new();
-    for attr in el.attributes().flatten() {
-        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        if key == "xmlns" || key.starts_with("xmlns:") {
-            continue;
-        }
-        let (attr_prefix, name) = split_name(&key);
-        let attr_ns = attr_prefix
-            .and_then(|item| prefixes.get(item))
-            .map(String::as_str);
-        let Ok(value) = attr.unescape_value() else {
-            continue;
-        };
-        attrs.push(Attr {
-            name: name.to_string(),
-            in_scan: attr_ns.is_some_and(|uri| uri.contains(SCAN_NS_SUFFIX)),
-            value: value.into_owned(),
-        });
-    }
+fn element_to_node(el: &Element) -> Node {
     Node {
-        local: local.to_string(),
-        in_scan,
-        attrs,
-        children: Vec::new(),
-        text: String::new(),
-    }
-}
-
-fn take_xmlns(el: &quick_xml::events::BytesStart<'_>, map: &mut HashMap<String, String>) {
-    for attr in el.attributes().flatten() {
-        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        let Ok(value) = attr.unescape_value() else {
-            continue;
-        };
-        if key == "xmlns" {
-            map.insert(String::new(), value.into_owned());
-        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
-            map.insert(prefix.to_string(), value.into_owned());
-        }
-    }
-}
-
-fn push_child(stack: &mut [Node], node: Node) {
-    if let Some(parent) = stack.last_mut() {
-        parent.children.push(node);
-    }
-}
-
-fn split_name(name: &str) -> (Option<&str>, &str) {
-    match name.split_once(':') {
-        Some((prefix, local)) => (Some(prefix), local),
-        None => (None, name),
+        local: el.local.clone(),
+        in_scan: el.in_scan_ns(),
+        attrs: el
+            .attrs
+            .iter()
+            .filter(|a| a.local != "xmlns")
+            .map(|a| Attr {
+                name: a.local.clone(),
+                in_scan: a
+                    .ns
+                    .as_deref()
+                    .is_some_and(|uri| uri.contains(SCAN_NS_SUFFIX)),
+                value: a.value.clone(),
+            })
+            .collect(),
+        children: el.children.iter().map(element_to_node).collect(),
+        text: el.text.clone(),
     }
 }
 
@@ -1197,7 +1121,9 @@ mod tests {
         </soap:Envelope>"#;
         let problems = body_problems(xml);
         assert!(
-            problems.iter().any(|p| p.contains("PixelsPerLine") && p.contains("'0'")),
+            problems
+                .iter()
+                .any(|p| p.contains("PixelsPerLine") && p.contains("'0'")),
             "{problems:?}"
         );
     }

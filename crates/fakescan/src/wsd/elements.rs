@@ -3,26 +3,31 @@
 use crate::image_gen::{LETTER_H_THOU, LETTER_W_THOU};
 use crate::profile::Profile;
 use crate::state::{encodable_formats, ConditionHistoryEntry, ScanJob};
-use crate::wsd::soap;
+use crate::wsd::soap::Envelope;
+use crate::wsd::xml::{self, Element};
 
 pub fn requested_names(body: &str) -> Vec<String> {
+    let tree = Envelope::parse(body)
+        .body_tree()
+        .cloned()
+        .or_else(|| xml::parse(body.trim()));
+    let Some(tree) = tree else {
+        return Vec::new();
+    };
     let mut names = Vec::new();
-    let mut idx = 0;
-    while let Some(rel) = body[idx..].find("Name>") {
-        let at = idx + rel;
-        let before = body.as_bytes().get(at.wrapping_sub(1)).copied();
-        // `<…:Name>` or `<Name>` — not ElementData Name= attribute
-        if matches!(before, Some(b'<') | Some(b':')) {
-            let after = &body[at + "Name>".len()..];
-            if let Some(end) = after.find('<') {
-                let v = after[..end].trim();
-                if !v.is_empty() && !v.contains('=') {
-                    names.push(v.to_string());
-                }
+    tree.walk(&mut |el, _| {
+        if el.local == "ElementData" {
+            if let Some(n) = el.attr("Name").or_else(|| el.attr("wscn:Name")) {
+                names.push(n.to_string());
             }
         }
-        idx = at + 5;
-    }
+        if el.local == "Name" {
+            let v = el.text.trim();
+            if !v.is_empty() && !v.contains('=') {
+                names.push(v.to_string());
+            }
+        }
+    });
     names
 }
 
@@ -62,7 +67,7 @@ pub struct ScannerView<'a> {
 pub fn get_scanner_elements(view: ScannerView<'_>, body: &str) -> String {
     let names = requested_names(body);
     let want_all = names.is_empty();
-    let mut parts = String::new();
+    let mut parts: Vec<Element> = Vec::new();
 
     // Echo the client's QName (e.g. sca:ScannerDescription) on ElementData/@Name —
     // WIA asks with the 2006/08 prefix and rejects a mismatched Name.
@@ -81,51 +86,48 @@ pub fn get_scanner_elements(view: ScannerView<'_>, body: &str) -> String {
     };
 
     if want("ScannerDescription") {
-        parts.push_str(&element_data(
+        parts.push(element_data_from_element(
             &client_name("ScannerDescription"),
-            &scanner_description(view.profile),
+            scanner_description(view.profile),
         ));
     }
     if want("ScannerStatus") {
-        parts.push_str(&element_data(
+        parts.push(element_data_from_element(
             &client_name("ScannerStatus"),
-            &scanner_status(&view),
+            scanner_status(&view),
         ));
     }
     if want("ScannerConfiguration") {
-        parts.push_str(&element_data(
+        parts.push(element_data_from_element(
             &client_name("ScannerConfiguration"),
-            &scanner_configuration(view.profile),
+            scanner_configuration(view.profile),
         ));
     }
     if want("DefaultScanTicket") {
-        parts.push_str(&element_data(
+        parts.push(element_data_from_element(
             &client_name("DefaultScanTicket"),
-            &default_scan_ticket(view.profile),
+            default_scan_ticket(view.profile),
         ));
     }
 
     if parts.is_empty() {
         // Unknown names → Valid=false stubs + full config so clients still progress.
         for n in &names {
-            parts.push_str(&format!(
-                r#"      <wscn:ElementData wscn:Name="{}" wscn:Valid="false"/>
-"#,
-                soap::esc(n)
-            ));
+            parts.push(element_data_invalid(n));
         }
-        parts.push_str(&element_data(
+        parts.push(element_data_from_element(
             "wscn:ScannerConfiguration",
-            &scanner_configuration(view.profile),
+            scanner_configuration(view.profile),
         ));
     }
 
-    format!(
-        r#"    <wscn:GetScannerElementsResponse>
-      <wscn:ScannerElements>
-{parts}      </wscn:ScannerElements>
-    </wscn:GetScannerElementsResponse>"#
-    )
+    let mut scanner_elements = Element::new("wscn:ScannerElements");
+    for part in parts {
+        scanner_elements = scanner_elements.with(part);
+    }
+    Element::new("wscn:GetScannerElementsResponse")
+        .with(scanner_elements)
+        .to_xml()
 }
 
 pub fn get_job_elements(job: &ScanJob, body: &str) -> String {
@@ -138,16 +140,19 @@ pub fn get_job_elements(job: &ScanJob, body: &str) -> String {
                 .any(|n| n.ends_with(suffix) || n == suffix || n.ends_with(&format!(":{suffix}")))
     };
 
-    let mut parts = String::new();
+    let mut parts: Vec<Element> = Vec::new();
     if want("JobStatus") || want_all {
-        parts.push_str(&element_data("wscn:JobStatus", &job_status_xml(job)));
+        parts.push(element_data_from_element(
+            "wscn:JobStatus",
+            job_status_element(job),
+        ));
     }
     if want("JobToken") || want_all {
         // JobElementsEntry is JobStatus, ScanTicket, or Document. JobToken is not one of them.
-        parts.push_str(
-            r#"      <wscn:ElementData Name="wscn:JobToken" Valid="false">
-      </wscn:ElementData>
-"#,
+        parts.push(
+            Element::new("wscn:ElementData")
+                .with_attr("Name", "wscn:JobToken")
+                .with_attr("Valid", "false"),
         );
     }
     // Documents / DocumentFinalParameters: Format, dpi, pages_left from ScanJob.
@@ -160,80 +165,69 @@ pub fn get_job_elements(job: &ScanJob, body: &str) -> String {
         } else {
             "wscn:Documents"
         };
-        let inner = if name.ends_with("DocumentFinalParameters") {
-            document_final_parameters_xml(job)
+        let child = if name.ends_with("DocumentFinalParameters") {
+            document_final_parameters(job)
         } else {
-            format!(
-                r#"        <wscn:Documents>
-{}
-        </wscn:Documents>"#,
-                document_final_parameters_xml(job)
-            )
+            Element::new("wscn:Documents").with(document_final_parameters(job))
         };
-        parts.push_str(&element_data(name, &inner));
+        parts.push(element_data_from_element(name, child));
     }
 
     if parts.is_empty() {
         for n in &names {
-            parts.push_str(&format!(
-                r#"      <wscn:ElementData wscn:Name="{}" wscn:Valid="false"/>
-"#,
-                soap::esc(n)
-            ));
+            parts.push(element_data_invalid(n));
         }
         // Always include status so clients can progress.
-        parts.push_str(&element_data("wscn:JobStatus", &job_status_xml(job)));
+        parts.push(element_data_from_element(
+            "wscn:JobStatus",
+            job_status_element(job),
+        ));
     }
 
-    format!(
-        r#"    <wscn:GetJobElementsResponse>
-      <wscn:JobElements>
-{parts}      </wscn:JobElements>
-    </wscn:GetJobElementsResponse>"#
-    )
+    let mut job_elements = Element::new("wscn:JobElements");
+    for part in parts {
+        job_elements = job_elements.with(part);
+    }
+    Element::new("wscn:GetJobElementsResponse")
+        .with(job_elements)
+        .to_xml()
 }
 
-fn job_status_xml(job: &ScanJob) -> String {
+fn job_status_element(job: &ScanJob) -> Element {
     // JobStatusType: JobId, JobState, JobStateReasons, ScansCompleted. `xs:any` is another namespace.
-    format!(
-        r#"        <wscn:JobStatus>
-          <wscn:JobId>{id}</wscn:JobId>
-          <wscn:JobState>{state}</wscn:JobState>
-          <wscn:JobStateReasons>
-            <wscn:JobStateReason>{reason}</wscn:JobStateReason>
-          </wscn:JobStateReasons>
-          <wscn:ScansCompleted>{done}</wscn:ScansCompleted>
-        </wscn:JobStatus>"#,
-        id = job.id,
-        state = job.job_state(),
-        reason = soap::esc(&job.state_reason),
-        done = job.page_index,
-    )
+    Element::new("wscn:JobStatus")
+        .with(Element::text_el("wscn:JobId", job.id.to_string()))
+        .with(Element::text_el("wscn:JobState", job.job_state()))
+        .with(Element::new("wscn:JobStateReasons").with(Element::text_el(
+            "wscn:JobStateReason",
+            job.state_reason.clone(),
+        )))
+        .with(Element::text_el(
+            "wscn:ScansCompleted",
+            job.page_index.to_string(),
+        ))
 }
 
-fn document_final_parameters_xml(job: &ScanJob) -> String {
-    format!(
-        r#"        <wscn:DocumentFinalParameters>
-          <wscn:Format>{fmt}</wscn:Format>
-          <wscn:ImagesToTransfer>{left}</wscn:ImagesToTransfer>
-          <wscn:InputSource>{src}</wscn:InputSource>
-          <wscn:MediaSides>
-            <wscn:MediaFront>
-              <wscn:Resolution>
-                <wscn:Width>{dpi}</wscn:Width>
-                <wscn:Height>{dpi}</wscn:Height>
-              </wscn:Resolution>
-            </wscn:MediaFront>
-          </wscn:MediaSides>
-        </wscn:DocumentFinalParameters>"#,
-        fmt = soap::esc(&job.format),
-        left = job.pages_left,
-        src = soap::esc(&job.input_source),
-        dpi = job.dpi,
-    )
+fn document_final_parameters(job: &ScanJob) -> Element {
+    let media_front = Element::new("wscn:MediaFront").with(
+        Element::new("wscn:Resolution")
+            .with(Element::text_el("wscn:Width", job.dpi.to_string()))
+            .with(Element::text_el("wscn:Height", job.dpi.to_string())),
+    );
+    Element::new("wscn:DocumentFinalParameters")
+        .with(Element::text_el("wscn:Format", job.format.clone()))
+        .with(Element::text_el(
+            "wscn:ImagesToTransfer",
+            job.pages_left.to_string(),
+        ))
+        .with(Element::text_el(
+            "wscn:InputSource",
+            job.input_source.clone(),
+        ))
+        .with(Element::new("wscn:MediaSides").with(media_front))
 }
 
-fn scanner_status(view: &ScannerView<'_>) -> String {
+fn scanner_status(view: &ScannerView<'_>) -> Element {
     let jam = view.jam;
     let cover_open = view.cover_open;
     let multi_feed = view.multi_feed;
@@ -302,20 +296,20 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
     } else {
         "Idle"
     };
-    let reason_xml = reasons
-        .iter()
-        .map(|r| format!("            <wscn:ScannerStateReason>{r}</wscn:ScannerStateReason>\n"))
-        .collect::<String>();
+    let mut reason_el = Element::new("wscn:ScannerStateReasons");
+    for r in &reasons {
+        reason_el = reason_el.with(Element::text_el("wscn:ScannerStateReason", *r));
+    }
     // ConditionName enum has no AttentionRequired / Paused / LampWarming — those stay reasons only.
     // Stable Ids: 1 MediaJam, 2 CoverOpen, 3 MultipleFeedError, 4 LampError, 5 Calibrating,
     // 6 InterlockOpen, 7 InternalStorageFull, 8 LampWarning, 9 InputTrayEmpty (derived).
     let time = now_iso();
-    let mut conditions = String::new();
+    let mut condition_els: Vec<Element> = Vec::new();
     if jam {
-        conditions.push_str(&device_condition(1, &time, "MediaJam", "ADF", "Critical"));
+        condition_els.push(device_condition(1, &time, "MediaJam", "ADF", "Critical"));
     }
     if cover_open {
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             2,
             &time,
             "CoverOpen",
@@ -324,7 +318,7 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
         ));
     }
     if multi_feed {
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             3,
             &time,
             "MultipleFeedError",
@@ -333,7 +327,7 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
         ));
     }
     if lamp_error {
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             4,
             &time,
             "LampError",
@@ -342,7 +336,7 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
         ));
     }
     if calibrating {
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             5,
             &time,
             "Calibrating",
@@ -351,7 +345,7 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
         ));
     }
     if interlock_open {
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             6,
             &time,
             "InterlockOpen",
@@ -360,7 +354,7 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
         ));
     }
     if storage_full {
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             7,
             &time,
             "InternalStorageFull",
@@ -369,7 +363,7 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
         ));
     }
     if lamp_warning {
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             8,
             &time,
             "LampWarning",
@@ -381,7 +375,7 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
     let input_tray_empty = has_feeder && !view.feeder_ready && view.pages_remaining == 0;
     if input_tray_empty {
         // Derived only — do not emit AttentionRequired for empty ADF (Brother WIA).
-        conditions.push_str(&device_condition(
+        condition_els.push(device_condition(
             9,
             &time,
             "InputTrayEmpty",
@@ -389,78 +383,62 @@ fn scanner_status(view: &ScannerView<'_>) -> String {
             "Warning",
         ));
     }
-    let active = if conditions.is_empty() {
-        "          <wscn:ActiveConditions/>\n".to_string()
-    } else {
-        format!(
-            "          <wscn:ActiveConditions>\n{conditions}          </wscn:ActiveConditions>\n"
-        )
-    };
+    let mut active = Element::new("wscn:ActiveConditions");
+    for c in condition_els {
+        active = active.with(c);
+    }
+    let mut status = Element::new("wscn:ScannerStatus")
+        .with(Element::text_el("wscn:ScannerCurrentTime", time))
+        .with(Element::text_el("wscn:ScannerState", state))
+        .with(reason_el)
+        .with(active);
     // ConditionHistory is minOccurs=0 — omit the element when the ring is empty.
-    let history = if condition_history.is_empty() {
-        String::new()
-    } else {
-        let mut entries = String::new();
+    if !condition_history.is_empty() {
+        let mut history = Element::new("wscn:ConditionHistory");
         for e in condition_history {
-            entries.push_str(&condition_history_entry(e));
+            history = history.with(condition_history_entry(e));
         }
-        format!("          <wscn:ConditionHistory>\n{entries}          </wscn:ConditionHistory>\n")
-    };
-    format!(
-        r#"        <wscn:ScannerStatus>
-          <wscn:ScannerCurrentTime>{time}</wscn:ScannerCurrentTime>
-          <wscn:ScannerState>{state}</wscn:ScannerState>
-          <wscn:ScannerStateReasons>
-{reason_xml}          </wscn:ScannerStateReasons>
-{active}{history}        </wscn:ScannerStatus>"#
-    )
+        status = status.with(history);
+    }
+    status
 }
 
-fn device_condition(id: u32, time: &str, name: &str, component: &str, severity: &str) -> String {
-    format!(
-        r#"            <wscn:DeviceCondition Id="{id}">
-              <wscn:Time>{time}</wscn:Time>
-              <wscn:Name>{name}</wscn:Name>
-              <wscn:Component>{component}</wscn:Component>
-              <wscn:Severity>{severity}</wscn:Severity>
-            </wscn:DeviceCondition>
-"#
-    )
+fn device_condition(id: u32, time: &str, name: &str, component: &str, severity: &str) -> Element {
+    Element::new("wscn:DeviceCondition")
+        .with_attr("Id", id.to_string())
+        .with(Element::text_el("wscn:Time", time))
+        .with(Element::text_el("wscn:Name", name))
+        .with(Element::text_el("wscn:Component", component))
+        .with(Element::text_el("wscn:Severity", severity))
 }
 
-fn condition_history_entry(e: &ConditionHistoryEntry) -> String {
-    format!(
-        r#"            <wscn:ConditionHistoryEntry Id="{id}">
-              <wscn:Time>{time}</wscn:Time>
-              <wscn:Name>{name}</wscn:Name>
-              <wscn:Component>{component}</wscn:Component>
-              <wscn:Severity>{severity}</wscn:Severity>
-              <wscn:ClearTime>{clear}</wscn:ClearTime>
-            </wscn:ConditionHistoryEntry>
-"#,
-        id = e.id,
-        time = soap::esc(&e.time_iso),
-        name = soap::esc(e.name),
-        component = soap::esc(e.component),
-        severity = soap::esc(e.severity),
-        clear = soap::esc(&e.clear_time_iso),
-    )
+fn condition_history_entry(e: &ConditionHistoryEntry) -> Element {
+    Element::new("wscn:ConditionHistoryEntry")
+        .with_attr("Id", e.id.to_string())
+        .with(Element::text_el("wscn:Time", e.time_iso.clone()))
+        .with(Element::text_el("wscn:Name", e.name))
+        .with(Element::text_el("wscn:Component", e.component))
+        .with(Element::text_el("wscn:Severity", e.severity))
+        .with(Element::text_el("wscn:ClearTime", e.clear_time_iso.clone()))
 }
 
-fn element_data(name: &str, inner: &str) -> String {
-    // Live wsdscdrv: unprefixed Name/Valid + client QName (sca:…). Prefixed
-    // wscn:Name stops Connect after Description (no Ticket/Config).
-    format!(
-        r#"      <wscn:ElementData Name="{name}" Valid="true">
-{inner}
-      </wscn:ElementData>
-"#
-    )
+/// Live wsdscdrv: unprefixed `Name`/`Valid` + client QName (sca:…).
+fn element_data_from_element(name: &str, child: Element) -> Element {
+    Element::new("wscn:ElementData")
+        .with_attr("Name", name)
+        .with_attr("Valid", "true")
+        .with(child)
+}
+
+fn element_data_invalid(name: &str) -> Element {
+    Element::new("wscn:ElementData")
+        .with_attr("wscn:Name", name)
+        .with_attr("wscn:Valid", "false")
 }
 
 /// WSD `ColorEntry` list from profile `colors` (canonical wsd_token order).
 /// Empty allow-list → Brother-shaped BW → Gray → RGB.
-fn color_entries_xml(profile: &Profile, indent: &str) -> String {
+fn color_entries(profile: &Profile) -> Vec<Element> {
     use crate::effects::ColorMode;
     let tokens: Vec<String> = if profile.colors.is_empty() {
         vec![
@@ -481,8 +459,16 @@ fn color_entries_xml(profile: &Profile, indent: &str) -> String {
     };
     tokens
         .into_iter()
-        .map(|t| format!("{indent}<wscn:ColorEntry>{t}</wscn:ColorEntry>\n"))
+        .map(|t| Element::text_el("wscn:ColorEntry", t))
         .collect()
+}
+
+fn color_container(name: &str, entries: Vec<Element>) -> Element {
+    let mut el = Element::new(name);
+    for entry in entries {
+        el = el.with(entry);
+    }
+    el
 }
 
 fn default_color_processing(profile: &Profile) -> &'static str {
@@ -494,26 +480,33 @@ fn default_color_processing(profile: &Profile) -> &'static str {
     }
 }
 
-fn scanner_configuration(profile: &Profile) -> String {
+fn dpi_widths_heights(profile: &Profile) -> (Element, Element) {
+    let mut widths = Element::new("wscn:Widths");
+    let mut heights = Element::new("wscn:Heights");
+    for d in &profile.dpi {
+        widths = widths.with(Element::text_el("wscn:Width", d.to_string()));
+        heights = heights.with(Element::text_el("wscn:Height", d.to_string()));
+    }
+    (widths, heights)
+}
+
+fn scanner_configuration(profile: &Profile) -> Element {
     // Shape matches a live Brother MFC-9330CDW GetScannerElements capture
     // (`D:\temp\brother-gse-config.xml`): 0/1 booleans, Auto-only content type,
     // CompressionQuality 100–100, Scaling 100–100, color order BW→Gray→RGB,
     // min size 556, platen max height LETTER_H_THOU (11700).
-    let formats = encodable_formats(profile)
-        .into_iter()
-        .map(|v| format!("            <wscn:FormatValue>{v}</wscn:FormatValue>\n"))
-        .collect::<String>();
+    let mut formats_supported = Element::new("wscn:FormatsSupported");
+    for v in encodable_formats(profile) {
+        formats_supported = formats_supported.with(Element::text_el("wscn:FormatValue", v));
+    }
 
-    let widths = profile
-        .dpi
-        .iter()
-        .map(|d| format!("              <wscn:Width>{d}</wscn:Width>\n"))
-        .collect::<String>();
-    let heights = profile
-        .dpi
-        .iter()
-        .map(|d| format!("              <wscn:Height>{d}</wscn:Height>\n"))
-        .collect::<String>();
+    let (widths, heights) = dpi_widths_heights(profile);
+    let platen_resolutions = Element::new("wscn:PlatenResolutions")
+        .with(widths.clone())
+        .with(heights.clone());
+    let adf_resolutions = Element::new("wscn:ADFResolutions")
+        .with(widths.clone())
+        .with(heights.clone());
 
     let (ox, oy) = match &profile.optical {
         Some(o) => (o.x_dpi, o.y_dpi),
@@ -525,118 +518,122 @@ fn scanner_configuration(profile: &Profile) -> String {
 
     let has_feeder = profile.sources.iter().any(|s| s == "feeder");
     let has_glass = profile.sources.iter().any(|s| s == "glass");
-    let platen_colors = color_entries_xml(profile, "            ");
-    let adf_colors = color_entries_xml(profile, "              ");
+    let color_list = color_entries(profile);
 
-    let platen = if has_glass {
-        format!(
-            r#"        <wscn:Platen>
-          <wscn:PlatenOpticalResolution>
-            <wscn:Width>{ox}</wscn:Width>
-            <wscn:Height>{oy}</wscn:Height>
-          </wscn:PlatenOpticalResolution>
-          <wscn:PlatenResolutions>
-            <wscn:Widths>
-{widths}            </wscn:Widths>
-            <wscn:Heights>
-{heights}            </wscn:Heights>
-          </wscn:PlatenResolutions>
-          <wscn:PlatenColor>
-{platen_colors}          </wscn:PlatenColor>
-          <wscn:PlatenMinimumSize>
-            <wscn:Width>556</wscn:Width>
-            <wscn:Height>556</wscn:Height>
-          </wscn:PlatenMinimumSize>
-          <wscn:PlatenMaximumSize>
-            <wscn:Width>{LETTER_W_THOU}</wscn:Width>
-            <wscn:Height>{LETTER_H_THOU}</wscn:Height>
-          </wscn:PlatenMaximumSize>
-        </wscn:Platen>
-"#
+    let device_settings = Element::new("wscn:DeviceSettings")
+        .with(formats_supported)
+        .with(
+            Element::new("wscn:CompressionQualityFactorSupported")
+                .with(Element::text_el("wscn:MinValue", "100"))
+                .with(Element::text_el("wscn:MaxValue", "100")),
         )
-    } else {
-        String::new()
-    };
+        .with(
+            Element::new("wscn:ContentTypesSupported")
+                .with(Element::text_el("wscn:ContentTypeValue", "Auto")),
+        )
+        .with(Element::text_el(
+            "wscn:DocumentSizeAutoDetectSupported",
+            "0",
+        ))
+        .with(Element::text_el("wscn:AutoExposureSupported", "0"))
+        .with(Element::text_el("wscn:BrightnessSupported", "1"))
+        .with(Element::text_el("wscn:ContrastSupported", "1"))
+        .with(
+            Element::new("wscn:ScalingRangeSupported")
+                .with(
+                    Element::new("wscn:ScalingWidth")
+                        .with(Element::text_el("wscn:MinValue", "100"))
+                        .with(Element::text_el("wscn:MaxValue", "100")),
+                )
+                .with(
+                    Element::new("wscn:ScalingHeight")
+                        .with(Element::text_el("wscn:MinValue", "100"))
+                        .with(Element::text_el("wscn:MaxValue", "100")),
+                ),
+        )
+        .with(
+            Element::new("wscn:RotationsSupported")
+                .with(Element::text_el("wscn:RotationValue", "0")),
+        );
 
-    let adf = if has_feeder {
+    let mut config = Element::new("wscn:ScannerConfiguration").with(device_settings);
+
+    if has_glass {
+        let platen = Element::new("wscn:Platen")
+            .with(
+                Element::new("wscn:PlatenOpticalResolution")
+                    .with(Element::text_el("wscn:Width", ox.to_string()))
+                    .with(Element::text_el("wscn:Height", oy.to_string())),
+            )
+            .with(platen_resolutions)
+            .with(color_container("wscn:PlatenColor", color_list.clone()))
+            .with(
+                Element::new("wscn:PlatenMinimumSize")
+                    .with(Element::text_el("wscn:Width", "556"))
+                    .with(Element::text_el("wscn:Height", "556")),
+            )
+            .with(
+                Element::new("wscn:PlatenMaximumSize")
+                    .with(Element::text_el("wscn:Width", LETTER_W_THOU.to_string()))
+                    .with(Element::text_el("wscn:Height", LETTER_H_THOU.to_string())),
+            );
+        config = config.with(platen);
+    }
+
+    if has_feeder {
         let duplex = if profile.feeder.duplex { "1" } else { "0" };
         // ADFBack mirrors ADFFront when duplex is offered (WSD: back optional but
         // clients treat Front+Back as duplex even if SupportsDuplex is wrong).
+        // WS-Scan has no media-size list element; the ADF envelope is the only standard way
+        // to publish the tray's sizes. Unrestricted profiles keep the legacy 8500x14000.
+        let (adf_max_w, adf_max_h) = match profile.feeder.media_size_list() {
+            Some(list) if !list.is_empty() => list.iter().fold((0, 0), |(w, h), m| {
+                let (mw, mh) = m.dims_thou();
+                (w.max(mw), h.max(mh))
+            }),
+            _ => (LETTER_W_THOU, 14000),
+        };
         let adf_side = |tag: &str| {
-            format!(
-                r#"          <wscn:{tag}>
-            <wscn:ADFOpticalResolution>
-              <wscn:Width>{ox}</wscn:Width>
-              <wscn:Height>{oy}</wscn:Height>
-            </wscn:ADFOpticalResolution>
-            <wscn:ADFResolutions>
-              <wscn:Widths>
-{widths}              </wscn:Widths>
-              <wscn:Heights>
-{heights}              </wscn:Heights>
-            </wscn:ADFResolutions>
-            <wscn:ADFColor>
-{colors}            </wscn:ADFColor>
-            <wscn:ADFMinimumSize>
-              <wscn:Width>556</wscn:Width>
-              <wscn:Height>556</wscn:Height>
-            </wscn:ADFMinimumSize>
-            <wscn:ADFMaximumSize>
-              <wscn:Width>{LETTER_W_THOU}</wscn:Width>
-              <wscn:Height>14000</wscn:Height>
-            </wscn:ADFMaximumSize>
-          </wscn:{tag}>
-"#,
-                colors = adf_colors,
-            )
+            Element::new(tag)
+                .with(
+                    Element::new("wscn:ADFOpticalResolution")
+                        .with(Element::text_el("wscn:Width", ox.to_string()))
+                        .with(Element::text_el("wscn:Height", oy.to_string())),
+                )
+                .with(adf_resolutions.clone())
+                .with(color_container("wscn:ADFColor", color_list.clone()))
+                .with(
+                    Element::new("wscn:ADFMinimumSize")
+                        .with(Element::text_el("wscn:Width", "556"))
+                        .with(Element::text_el("wscn:Height", "556")),
+                )
+                .with(
+                    Element::new("wscn:ADFMaximumSize")
+                        .with(Element::text_el("wscn:Width", adf_max_w.to_string()))
+                        .with(Element::text_el("wscn:Height", adf_max_h.to_string())),
+                )
         };
-        let back = if profile.feeder.duplex {
-            adf_side("ADFBack")
-        } else {
-            String::new()
-        };
-        format!(
-            r#"        <wscn:ADF>
-          <wscn:ADFSupportsDuplex>{duplex}</wscn:ADFSupportsDuplex>
-{front}{back}        </wscn:ADF>
-"#,
-            front = adf_side("ADFFront"),
-        )
-    } else {
-        String::new()
-    };
+        let mut adf = Element::new("wscn:ADF")
+            .with(Element::text_el("wscn:ADFSupportsDuplex", duplex))
+            .with(adf_side("wscn:ADFFront"));
+        if profile.feeder.duplex {
+            adf = adf.with(adf_side("wscn:ADFBack"));
+        }
+        config = config.with(adf);
+    }
 
+    config
+}
+
+/// The capability XML Windows caches at Add time: `ScannerConfiguration` + `DefaultScanTicket`
+/// (profile-only; no runtime status, no tray capacity). Hashed by the registry to decide when a
+/// reconfigured device needs a re-Add.
+pub(crate) fn published_capability_xml(profile: &Profile) -> String {
     format!(
-        r#"        <wscn:ScannerConfiguration>
-          <wscn:DeviceSettings>
-            <wscn:FormatsSupported>
-{formats}            </wscn:FormatsSupported>
-            <wscn:CompressionQualityFactorSupported>
-              <wscn:MinValue>100</wscn:MinValue>
-              <wscn:MaxValue>100</wscn:MaxValue>
-            </wscn:CompressionQualityFactorSupported>
-            <wscn:ContentTypesSupported>
-              <wscn:ContentTypeValue>Auto</wscn:ContentTypeValue>
-            </wscn:ContentTypesSupported>
-            <wscn:DocumentSizeAutoDetectSupported>0</wscn:DocumentSizeAutoDetectSupported>
-            <wscn:AutoExposureSupported>0</wscn:AutoExposureSupported>
-            <wscn:BrightnessSupported>1</wscn:BrightnessSupported>
-            <wscn:ContrastSupported>1</wscn:ContrastSupported>
-            <wscn:ScalingRangeSupported>
-              <wscn:ScalingWidth>
-                <wscn:MinValue>100</wscn:MinValue>
-                <wscn:MaxValue>100</wscn:MaxValue>
-              </wscn:ScalingWidth>
-              <wscn:ScalingHeight>
-                <wscn:MinValue>100</wscn:MinValue>
-                <wscn:MaxValue>100</wscn:MaxValue>
-              </wscn:ScalingHeight>
-            </wscn:ScalingRangeSupported>
-            <wscn:RotationsSupported>
-              <wscn:RotationValue>0</wscn:RotationValue>
-            </wscn:RotationsSupported>
-          </wscn:DeviceSettings>
-{platen}{adf}        </wscn:ScannerConfiguration>"#
+        "{}
+{}",
+        scanner_configuration(profile).to_xml(),
+        default_scan_ticket(profile).to_xml()
     )
 }
 
@@ -644,17 +641,24 @@ fn now_iso() -> String {
     crate::timeutil::utc_now_iso()
 }
 
+fn lang_text_el(name: &str, s: impl Into<String>) -> Element {
+    Element::new(name)
+        .with_attr("xml:lang", "en-US")
+        .with_text(s)
+}
+
+fn scanner_info_text(profile: &Profile) -> String {
+    let mut s = String::from("fakescan profile ");
+    s.push_str(&profile.id);
+    s
+}
+
 /// Same Description block as GetScannerElements (`ScannerName` / Info / Location).
-fn scanner_description(profile: &Profile) -> String {
-    format!(
-        r#"        <wscn:ScannerDescription>
-          <wscn:ScannerName xml:lang="en-US">{label}</wscn:ScannerName>
-          <wscn:ScannerInfo xml:lang="en-US">fakescan profile {id}</wscn:ScannerInfo>
-          <wscn:ScannerLocation xml:lang="en-US">lab</wscn:ScannerLocation>
-        </wscn:ScannerDescription>"#,
-        label = soap::esc(&profile.label),
-        id = soap::esc(&profile.id),
-    )
+fn scanner_description(profile: &Profile) -> Element {
+    Element::new("wscn:ScannerDescription")
+        .with(lang_text_el("wscn:ScannerName", profile.label.clone()))
+        .with(lang_text_el("wscn:ScannerInfo", scanner_info_text(profile)))
+        .with(lang_text_el("wscn:ScannerLocation", "lab"))
 }
 
 /// ElementChanges children for ScannerElementsChangeEvent.
@@ -663,15 +667,22 @@ fn scanner_description(profile: &Profile) -> String {
 /// [`default_scan_ticket`] — same shapes as GetScannerElements — so a NotifyTo
 /// subscriber sees the advertised identity and capability set without re-polling.
 pub(crate) fn element_changes_xml(profile: &Profile) -> String {
-    format!(
-        "{}\n{}\n{}",
-        scanner_description(profile),
-        scanner_configuration(profile),
-        default_scan_ticket(profile)
-    )
+    element_changes_elements(profile)
+        .into_iter()
+        .map(|el| el.to_xml())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn default_scan_ticket(profile: &Profile) -> String {
+pub(crate) fn element_changes_elements(profile: &Profile) -> Vec<Element> {
+    vec![
+        scanner_description(profile),
+        scanner_configuration(profile),
+        default_scan_ticket(profile),
+    ]
+}
+
+fn default_scan_ticket(profile: &Profile) -> Element {
     // Brother default ticket (live): jfif @ 300, InputMediaSize 8500×11700,
     // Exposure/Scaling/Rotation/ScanRegion filled — not DocumentSizeAutoDetect.
     let dpi = profile
@@ -689,65 +700,90 @@ fn default_scan_ticket(profile: &Profile) -> String {
         .or_else(|| formats.into_iter().next())
         .unwrap_or_else(|| "jfif".into());
     let color = default_color_processing(profile);
-    format!(
-        r#"        <wscn:DefaultScanTicket>
-          <wscn:JobDescription>
-            <wscn:JobName>fakescan</wscn:JobName>
-            <wscn:JobOriginatingUserName>fakescan</wscn:JobOriginatingUserName>
-            <wscn:JobInformation>fakescan</wscn:JobInformation>
-          </wscn:JobDescription>
-          <wscn:DocumentParameters>
-            <wscn:Format>{format}</wscn:Format>
-            <wscn:CompressionQualityFactor>100</wscn:CompressionQualityFactor>
-            <wscn:ImagesToTransfer>1</wscn:ImagesToTransfer>
-            <wscn:InputSource>Platen</wscn:InputSource>
-            <wscn:ContentType>Auto</wscn:ContentType>
-            <wscn:InputSize>
-              <wscn:InputMediaSize>
-                <wscn:Width>{LETTER_W_THOU}</wscn:Width>
-                <wscn:Height>{LETTER_H_THOU}</wscn:Height>
-              </wscn:InputMediaSize>
-            </wscn:InputSize>
-            <wscn:Exposure>
-              <wscn:ExposureSettings>
-                <wscn:Contrast>0</wscn:Contrast>
-                <wscn:Brightness>0</wscn:Brightness>
-                <wscn:Sharpness>0</wscn:Sharpness>
-              </wscn:ExposureSettings>
-            </wscn:Exposure>
-            <wscn:Scaling>
-              <wscn:ScalingWidth>100</wscn:ScalingWidth>
-              <wscn:ScalingHeight>100</wscn:ScalingHeight>
-            </wscn:Scaling>
-            <wscn:Rotation>0</wscn:Rotation>
-            <wscn:MediaSides>
-              <wscn:MediaFront>
-                <wscn:ScanRegion>
-                  <wscn:ScanRegionXOffset>0</wscn:ScanRegionXOffset>
-                  <wscn:ScanRegionYOffset>0</wscn:ScanRegionYOffset>
-                  <wscn:ScanRegionWidth>{LETTER_W_THOU}</wscn:ScanRegionWidth>
-                  <wscn:ScanRegionHeight>{LETTER_H_THOU}</wscn:ScanRegionHeight>
-                </wscn:ScanRegion>
-                <wscn:ColorProcessing>{color}</wscn:ColorProcessing>
-                <wscn:Resolution>
-                  <wscn:Width>{dpi}</wscn:Width>
-                  <wscn:Height>{dpi}</wscn:Height>
-                </wscn:Resolution>
-              </wscn:MediaFront>
-            </wscn:MediaSides>
-          </wscn:DocumentParameters>
-        </wscn:DefaultScanTicket>"#
-    )
+    let media_front = Element::new("wscn:MediaFront")
+        .with(
+            Element::new("wscn:ScanRegion")
+                .with(Element::text_el("wscn:ScanRegionXOffset", "0"))
+                .with(Element::text_el("wscn:ScanRegionYOffset", "0"))
+                .with(Element::text_el(
+                    "wscn:ScanRegionWidth",
+                    LETTER_W_THOU.to_string(),
+                ))
+                .with(Element::text_el(
+                    "wscn:ScanRegionHeight",
+                    LETTER_H_THOU.to_string(),
+                )),
+        )
+        .with(Element::text_el("wscn:ColorProcessing", color))
+        .with(
+            Element::new("wscn:Resolution")
+                .with(Element::text_el("wscn:Width", dpi.to_string()))
+                .with(Element::text_el("wscn:Height", dpi.to_string())),
+        );
+    Element::new("wscn:DefaultScanTicket")
+        .with(
+            Element::new("wscn:JobDescription")
+                .with(Element::text_el("wscn:JobName", "fakescan"))
+                .with(Element::text_el("wscn:JobOriginatingUserName", "fakescan"))
+                .with(Element::text_el("wscn:JobInformation", "fakescan")),
+        )
+        .with(
+            Element::new("wscn:DocumentParameters")
+                .with(Element::text_el("wscn:Format", format))
+                .with(Element::text_el("wscn:CompressionQualityFactor", "100"))
+                .with(Element::text_el("wscn:ImagesToTransfer", "1"))
+                .with(Element::text_el("wscn:InputSource", "Platen"))
+                .with(Element::text_el("wscn:ContentType", "Auto"))
+                .with(
+                    Element::new("wscn:InputSize").with(
+                        Element::new("wscn:InputMediaSize")
+                            .with(Element::text_el("wscn:Width", LETTER_W_THOU.to_string()))
+                            .with(Element::text_el("wscn:Height", LETTER_H_THOU.to_string())),
+                    ),
+                )
+                .with(
+                    Element::new("wscn:Exposure").with(
+                        Element::new("wscn:ExposureSettings")
+                            .with(Element::text_el("wscn:Contrast", "0"))
+                            .with(Element::text_el("wscn:Brightness", "0"))
+                            .with(Element::text_el("wscn:Sharpness", "0")),
+                    ),
+                )
+                .with(
+                    Element::new("wscn:Scaling")
+                        .with(Element::text_el("wscn:ScalingWidth", "100"))
+                        .with(Element::text_el("wscn:ScalingHeight", "100")),
+                )
+                .with(Element::text_el("wscn:Rotation", "0"))
+                .with(Element::new("wscn:MediaSides").with(media_front)),
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::Profile;
+    use crate::wsd::soap::{SCAN_NS_AIRSCAN, SOAP_NS};
     use std::path::PathBuf;
+
+    fn soap_wrap_for_schema(body_xml: &str) -> String {
+        let body = xml::parse(body_xml).expect("parse scan body");
+        Element::new("soap:Envelope")
+            .with_attr("xmlns:soap", SOAP_NS)
+            .with_attr("xmlns:wscn", SCAN_NS_AIRSCAN)
+            .with(Element::new("soap:Body").with(body))
+            .to_xml()
+    }
 
     fn profile() -> Profile {
         load_profile("brother-wsd")
+    }
+
+    /// brother-wsd with the hardware ADF duplex bit on (the shipped lab profile is single-sided).
+    fn duplex_profile() -> Profile {
+        let mut profile = profile();
+        profile.feeder.duplex = true;
+        profile
     }
 
     fn load_profile(id: &str) -> Profile {
@@ -762,15 +798,28 @@ mod tests {
         let ask = r#"<wscn:Name>wscn:ScannerConfiguration</wscn:Name>"#;
         let brother_xml = get_scanner_elements(idle_view(&brother), ask);
         let dib_xml = get_scanner_elements(idle_view(&dib), ask);
-        assert!(brother_xml.contains("<wscn:FormatValue>jfif</wscn:FormatValue>"), "{brother_xml}");
-        assert!(brother_xml.contains("tiff-single-uncompressed"), "{brother_xml}");
-        assert!(!brother_xml.contains("<wscn:FormatValue>dib</wscn:FormatValue>"), "{brother_xml}");
-        assert!(dib_xml.contains("<wscn:FormatValue>dib</wscn:FormatValue>"), "{dib_xml}");
-        assert!(!dib_xml.contains("<wscn:FormatValue>jfif</wscn:FormatValue>"), "{dib_xml}");
+        assert!(
+            brother_xml.contains("<wscn:FormatValue>jfif</wscn:FormatValue>"),
+            "{brother_xml}"
+        );
+        assert!(
+            brother_xml.contains("tiff-single-uncompressed"),
+            "{brother_xml}"
+        );
+        assert!(
+            !brother_xml.contains("<wscn:FormatValue>dib</wscn:FormatValue>"),
+            "{brother_xml}"
+        );
+        assert!(
+            dib_xml.contains("<wscn:FormatValue>dib</wscn:FormatValue>"),
+            "{dib_xml}"
+        );
+        assert!(
+            !dib_xml.contains("<wscn:FormatValue>jfif</wscn:FormatValue>"),
+            "{dib_xml}"
+        );
         for xml in [&brother_xml, &dib_xml] {
-            let wrapped = format!(
-                r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wscn="http://schemas.microsoft.com/windows/2006/08/wdp/scan"><soap:Body>{xml}</soap:Body></soap:Envelope>"#
-            );
+            let wrapped = soap_wrap_for_schema(xml);
             let problems = crate::wsd::scan_schema::body_problems(&wrapped);
             assert!(problems.is_empty(), "{problems:?}\n{xml}");
         }
@@ -1234,7 +1283,7 @@ mod tests {
     fn configuration_matches_brother_device_settings() {
         let xml = get_scanner_elements(
             ScannerView {
-                profile: &profile(),
+                profile: &duplex_profile(),
                 jam: false,
                 cover_open: false,
                 multi_feed: false,
@@ -1365,6 +1414,8 @@ mod tests {
             height_px: 2200,
             pages_left: 2,
             page_index: 1,
+            sheet_base: 0,
+            stack_total: 0,
             duplex: false,
             created_at: Instant::now(),
             last_activity: Instant::now(),
@@ -1414,5 +1465,51 @@ mod tests {
             "{xml}"
         );
         assert!(!xml.contains("JobStatus"), "{xml}");
+    }
+
+    fn adf_max(profile: &Profile) -> (String, String) {
+        let ask = r#"<wscn:Name>wscn:ScannerConfiguration</wscn:Name>"#;
+        let xml = get_scanner_elements(idle_view(profile), ask);
+        let wrapped = soap_wrap_for_schema(&xml);
+        let problems = crate::wsd::scan_schema::body_problems(&wrapped);
+        assert!(problems.is_empty(), "{problems:?}\n{xml}");
+        let tree = xml::parse(&xml).expect("parse");
+        let max = tree.descendant("ADFMaximumSize").expect("ADFMaximumSize");
+        (
+            max.find_text("Width").unwrap().to_string(),
+            max.find_text("Height").unwrap().to_string(),
+        )
+    }
+
+    #[test]
+    fn adf_max_size_follows_media_sizes_per_profile() {
+        assert_eq!(
+            adf_max(&load_profile("brother-wsd")),
+            ("8500".into(), "14000".into())
+        );
+        assert_eq!(
+            adf_max(&load_profile("feeder-tray5")),
+            ("8500".into(), "11700".into())
+        );
+        assert_eq!(
+            adf_max(&load_profile("feeder-tray50")),
+            ("8500".into(), "14000".into())
+        );
+        assert_eq!(
+            adf_max(&load_profile("feeder-duplex30")),
+            ("8500".into(), "14000".into())
+        );
+        assert_eq!(
+            adf_max(&load_profile("feeder-a4only")),
+            ("8267".into(), "11692".into())
+        );
+    }
+
+    #[test]
+    fn capacity_is_not_published_in_wsd_xml() {
+        let p = load_profile("feeder-tray5");
+        let ask = r#"<wscn:Name>wscn:ScannerConfiguration</wscn:Name>"#;
+        let xml = get_scanner_elements(idle_view(&p), ask);
+        assert!(!xml.to_ascii_lowercase().contains("capacity"), "{xml}");
     }
 }

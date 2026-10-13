@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fakescan device manager</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8; --panel: #ffffff; --text: #1b1f24; --muted: #5a6370; --border: #c9ced6;
+  --accent: #0b5cd5; --accent-text: #ffffff; --danger: #b3261e;
+  --new: #5a6370; --probed: #8a5a00; --installed: #1b6e2e; --stale: #b3261e;
+  --warn-bg: #fff4d6; --err-bg: #fde7e5; --ok-bg: #e3f4e6; --focus: #0b5cd5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b; --panel: #1d2127; --text: #e6e9ee; --muted: #a0a8b4; --border: #3a414b;
+    --accent: #6ea8ff; --accent-text: #08111f; --danger: #ff8a80;
+    --new: #a0a8b4; --probed: #f2c04d; --installed: #6fd488; --stale: #ff8a80;
+    --warn-bg: #3a2f10; --err-bg: #3d1a18; --ok-bg: #16301c; --focus: #9cc4ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 system-ui, "Segoe UI", sans-serif; }
+header, main { max-width: 1100px; margin: 0 auto; padding: 12px 16px; }
+h1 { font-size: 1.35rem; margin: 0 0 4px; }
+h2 { font-size: 1.1rem; margin: 0; }
+h3 { font-size: .95rem; margin: 12px 0 4px; }
+p { margin: 4px 0; }
+.muted { color: var(--muted); }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+button, select, input { font: inherit; color: var(--text); }
+button { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; cursor: pointer; min-height: 34px; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button.danger { color: var(--danger); border-color: var(--danger); }
+button[aria-pressed="true"] { background: var(--err-bg); border-color: var(--danger); font-weight: 600; }
+button:disabled { opacity: .55; cursor: default; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+input, select { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; min-height: 34px; max-width: 100%; }
+label { display: block; font-weight: 600; margin-top: 10px; }
+label.inline { display: inline-flex; gap: 6px; align-items: center; font-weight: 400; }
+.banner { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.banner.error { background: var(--err-bg); border-color: var(--danger); }
+.banner.info { background: var(--ok-bg); }
+.banner.warn { background: var(--warn-bg); }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin: 12px 0; }
+.card header { padding: 0; max-width: none; display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.badge { display: inline-block; border: 2px solid currentColor; border-radius: 12px; padding: 0 10px; font-size: .8rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+.badge.new { color: var(--new); } .badge.probed { color: var(--probed); }
+.badge.installed { color: var(--installed); } .badge.stale { color: var(--stale); }
+.badge.new::before { content: "\25CB\00a0"; } .badge.probed::before { content: "\25D0\00a0"; }
+.badge.installed::before { content: "\2713\00a0"; } .badge.stale::before { content: "\26A0\00a0"; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; margin: 8px 0; }
+dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
+code { font-family: ui-monospace, Consolas, monospace; font-size: .9em; }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+.ep { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 2px 0; }
+.ep button { min-height: 28px; padding: 2px 8px; }
+details { margin-top: 8px; }
+summary { cursor: pointer; font-weight: 600; }
+dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 16px; width: min(520px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0, 0, 0, .5); }
+dialog form > .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; flex-wrap: wrap; }
+.err { color: var(--danger); font-weight: 600; min-height: 1.2em; margin-top: 8px; overflow-wrap: anywhere; }
+.sr { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+.profinfo { margin-top: 6px; font-size: .9rem; color: var(--muted); }
+@media (max-width: 560px) { dl { grid-template-columns: 1fr; } dt { margin-top: 6px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>fakescan device manager</h1>
+  <p class="muted">Operator console for the fake scanners this daemon hosts. Loopback only.</p>
+  <div class="toolbar">
+    <button type="button" class="primary" id="btn-add">Add device</button>
+    <button type="button" id="btn-win">Add device in Windows</button>
+    <span id="poll-state" class="muted" aria-live="off"></span>
+  </div>
+  <div id="banner-error" class="banner error" role="alert" hidden></div>
+  <div id="banner-msg" class="banner info" role="status" hidden></div>
+  <p class="muted">Reconcile (matching Windows scanners to these devices) is run with
+    <code>lab reconcile</code> or the Python <code>fakescan.registry.reconcile()</code>; the daemon does not enumerate WIA.</p>
+</header>
+<main id="main" aria-label="Devices">
+  <p id="empty" class="muted" hidden>No devices. Use "Add device".</p>
+  <div id="devices"></div>
+</main>
+<div class="sr" id="live" role="status" aria-live="polite"></div>
+
+<dialog id="dlg-add" aria-labelledby="dlg-add-t">
+  <form method="dialog" id="form-add">
+    <h2 id="dlg-add-t">Add device</h2>
+    <label for="add-profile">Profile</label>
+    <select id="add-profile" required></select>
+    <div class="profinfo" id="add-profinfo"></div>
+    <label for="add-id">Device id (optional)</label>
+    <input id="add-id" autocomplete="off" placeholder="letters, digits, - and _">
+    <label for="add-uuid">UUID (optional)</label>
+    <input id="add-uuid" autocomplete="off" placeholder="generated from the id when empty" size="40">
+    <label for="add-name">Friendly name (optional)</label>
+    <input id="add-name" autocomplete="off" placeholder="fakescan &lt;id&gt;">
+    <div class="err" id="add-err" role="alert"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit" class="primary" id="add-submit">Add</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-remove" aria-labelledby="dlg-remove-t">
+  <form method="dialog" id="form-remove">
+    <h2 id="dlg-remove-t">Remove device</h2>
+    <p id="remove-text"></p>
+    <label class="inline"><input type="checkbox" id="remove-forget"> Also forget the registry row (drops install state)</label>
+    <div class="err" id="remove-err" role="alert"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit" class="danger" id="remove-submit">Remove</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-reconf" aria-labelledby="dlg-reconf-t">
+  <form method="dialog" id="form-reconf">
+    <h2 id="dlg-reconf-t">Reconfigure profile</h2>
+    <p id="reconf-text"></p>
+    <label for="reconf-profile">New profile</label>
+    <select id="reconf-profile"></select>
+    <div class="profinfo" id="reconf-profinfo"></div>
+    <div class="banner warn" id="reconf-warn" hidden>Windows caches the capabilities; this may require removing and re-Adding the device.</div>
+    <div class="err" id="reconf-err" role="alert"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit" class="primary" id="reconf-submit">Reconfigure</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-pages" aria-labelledby="dlg-pages-t">
+  <form method="dialog" id="form-pages">
+    <h2 id="dlg-pages-t">Set pages</h2>
+    <p id="pages-text"></p>
+    <label for="pages-n">Sheets loaded in the feeder</label>
+    <input id="pages-n" type="number" min="0" step="1" required>
+    <div class="err" id="pages-err" role="alert"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit" class="primary" id="pages-submit">Set pages</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+(function () {
+  var POLL_MS = 2000;
+  var FAULTS = ["jam", "cover_open", "multi_feed", "lamp_error", "busy", "offline", "empty_feeder_brother"];
+  var FAULT_LABEL = { jam: "Jam", cover_open: "Cover open", multi_feed: "Multi-feed", lamp_error: "Lamp error", busy: "Busy", offline: "Offline", empty_feeder_brother: "Empty feeder (Brother: busy after delay)" };
+  var devices = [], statuses = {}, profiles = [], lastSig = "", timer = null, inflight = false;
+  var openDetails = {};
+  var INJECT_KINDS = ["cover_open", "jam", "multi_feed", "interlock_open", "empty", "offline", "lamp_error", "busy", "abort"];
+  var injectForm = {};
+  var dialogTarget = null;
+
+  function $(id) { return document.getElementById(id); }
+  function h(tag, attrs) {
+    var el = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach(function (k) {
+      var v = attrs[k];
+      if (v === false || v == null) return;
+      if (k === "class") el.className = v;
+      else if (k === "text") el.textContent = v;
+      else if (k.slice(0, 2) === "on") el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v === true ? "" : String(v));
+    });
+    for (var i = 2; i < arguments.length; i++) {
+      var c = arguments[i];
+      if (c == null || c === false) continue;
+      el.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    }
+    return el;
+  }
+
+  // All server-provided strings reach the DOM through textContent / createTextNode / setAttribute
+  // on fixed attributes only; there is no HTML string building anywhere in this file.
+  function api(method, path, body) {
+    var opt = { method: method, cache: "no-store", headers: {} };
+    if (body !== undefined) { opt.body = JSON.stringify(body); opt.headers["Content-Type"] = "application/json"; }
+    return fetch(path, opt).then(function (r) {
+      return r.text().then(function (t) {
+        var data = null;
+        try { data = t ? JSON.parse(t) : null; } catch (e) { data = null; }
+        var msg = "";
+        if (!r.ok) msg = (data && typeof data === "object" && data.error) ? String(data.error) : (t || (r.status + " " + r.statusText));
+        return { ok: r.ok, status: r.status, data: data, error: msg };
+      });
+    });
+  }
+  function dpath(id, tail) { return "/d/" + encodeURIComponent(id) + tail; }
+  function say(text) { $("live").textContent = text; }
+  function flash(text) {
+    var b = $("banner-msg");
+    b.textContent = text; b.hidden = false; say(text);
+    clearTimeout(flash.t);
+    flash.t = setTimeout(function () { b.hidden = true; }, 6000);
+  }
+  function showError(text) {
+    var b = $("banner-error");
+    if (text) { b.textContent = text; b.hidden = false; } else { b.hidden = true; b.textContent = ""; }
+  }
+
+  // ---- data ----
+  function refresh() {
+    if (inflight) return Promise.resolve();
+    inflight = true;
+    return api("GET", "/v1/devices").then(function (r) {
+      if (!r.ok || !Array.isArray(r.data)) throw new Error("GET /v1/devices failed: " + (r.error || r.status));
+      var list = r.data;
+      return Promise.all(list.map(function (d) {
+        return api("GET", dpath(d.id, "/v1/status")).then(function (s) { return s.ok ? s.data : null; }, function () { return null; });
+      })).then(function (st) {
+        var map = {};
+        list.forEach(function (d, i) { map[d.id] = st[i]; });
+        devices = list; statuses = map;
+        showError("");
+        $("poll-state").textContent = "Updated " + new Date().toLocaleTimeString();
+        var sig = JSON.stringify([list, map]);
+        if (sig !== lastSig) { lastSig = sig; render(); }
+      });
+    }).catch(function (e) {
+      showError("Cannot reach the fakescan daemon (" + (e && e.message ? e.message : e) + "). Retrying every 2 s.");
+      $("poll-state").textContent = "Disconnected";
+    }).then(function () { inflight = false; });
+  }
+  function loadProfiles() {
+    return api("GET", "/v1/profiles").then(function (r) {
+      if (r.ok && Array.isArray(r.data)) profiles = r.data;
+    }, function () {});
+  }
+  function startPolling() {
+    stopPolling();
+    refresh();
+    timer = setInterval(refresh, POLL_MS);
+  }
+  function stopPolling() { if (timer) { clearInterval(timer); timer = null; } }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) stopPolling(); else startPolling();
+  });
+
+  // ---- rendering ----
+  function describeProfile(p) {
+    var f = p.feeder || {};
+    var parts = [];
+    parts.push("capacity " + (f.capacity == null ? "unlimited" : f.capacity));
+    parts.push("media " + ((f.media_sizes && f.media_sizes.length) ? f.media_sizes.join(", ") : "any"));
+    parts.push("duplex " + (f.duplex ? "yes" : "no"));
+    return p.id + ": " + parts.join("; ");
+  }
+  function fillProfileSelect(sel, info, current) {
+    sel.textContent = "";
+    profiles.forEach(function (p) {
+      sel.appendChild(h("option", { value: p.id, text: describeProfile(p) }));
+    });
+    if (current) sel.value = current;
+    function upd() {
+      var p = profiles.filter(function (x) { return x.id === sel.value; })[0];
+      info.textContent = p ? (p.description ? p.description + " (" + p.connection + ")" : p.connection) : "";
+    }
+    sel.onchange = upd; upd();
+  }
+  function copyBtn(text, label) {
+    return h("button", { type: "button", "aria-label": "Copy " + label, text: "Copy", onclick: function () {
+      function done() { say("Copied " + label); flash("Copied " + label); }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text); done(); });
+      } else { legacyCopy(text); done(); }
+    } });
+  }
+  function legacyCopy(text) {
+    var ta = h("textarea", { "aria-hidden": "true" });
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+  function epRow(label, url) {
+    if (!url) return h("div", { class: "ep" }, h("span", { class: "muted", text: label + ": n/a (WSD off)" }));
+    return h("div", { class: "ep" }, h("span", { class: "muted", text: label + ":" }), h("code", { text: url }), copyBtn(url, label));
+  }
+  function dd(dl, k, v) {
+    dl.appendChild(h("dt", { text: k }));
+    var d = h("dd");
+    if (v instanceof Node) d.appendChild(v); else d.textContent = v == null || v === "" ? "-" : String(v);
+    dl.appendChild(d);
+  }
+  function activeFaults(st) {
+    if (!st) return null;
+    var extra = ["calibrating", "interlock_open", "storage_full", "paused", "lamp_warning", "lamp_warming", "temporary", "internal"];
+    return FAULTS.concat(extra).filter(function (k) { return st[k] === true; });
+  }
+
+  function planList(st) {
+    var plan = st && st.fault_plan ? st.fault_plan : [];
+    var box = h("div", { class: "muted", "aria-label": "Fault plan" });
+    if (!plan.length) { box.textContent = "No scheduled faults."; return box; }
+    var ul = h("ul");
+    plan.forEach(function (e) {
+      var t = e.kind + " " + e.trigger + (e.sticky ? "" : " (transient)") + (e.legacy ? " [legacy counter]" : "") +
+        ": " + (e.fired ? "fired" + (e.last_fired ? " (" + e.last_fired + ")" : "") : "pending");
+      ul.appendChild(h("li", { text: t }));
+    });
+    box.appendChild(ul);
+    return box;
+  }
+
+  function injectRow(d, st) {
+    var f = injectForm[d.id] || (injectForm[d.id] = { kind: "cover_open", when: "now", n: "2" });
+    var kind = h("select", { "aria-label": "Fault kind for " + d.id });
+    INJECT_KINDS.forEach(function (k) {
+      var o = h("option", { value: k, text: k }); if (k === f.kind) o.selected = true; kind.appendChild(o);
+    });
+    var when = h("select", { "aria-label": "When for " + d.id });
+    [["now", "now (live)"], ["pages", "after N pages"], ["mid", "mid page P at X%"], ["ms", "after T ms"]].forEach(function (w) {
+      var o = h("option", { value: w[0], text: w[1] }); if (w[0] === f.when) o.selected = true; when.appendChild(o);
+    });
+    var n = h("input", { type: "number", min: "0", step: "1", value: f.n, "aria-label": "N pages, page number or ms", size: "6" });
+    var pct = h("input", { type: "number", min: "1", max: "99", step: "1", value: f.pct || "50", "aria-label": "Percent of the page", size: "4" });
+    function sync() {
+      f.kind = kind.value; f.when = when.value; f.n = n.value; f.pct = pct.value;
+      n.hidden = f.when === "now"; pct.hidden = f.when !== "mid";
+    }
+    kind.addEventListener("change", sync); when.addEventListener("change", sync);
+    n.addEventListener("input", sync); pct.addEventListener("input", sync);
+    sync();
+    var apply = h("button", { type: "button", class: "primary", disabled: !st, text: "Apply", onclick: function () {
+      sync();
+      var num = parseInt(f.n, 10); if (isNaN(num) || num < 0) num = 0;
+      var w;
+      if (f.when === "now") w = "now";
+      else if (f.when === "pages") w = { after_pages: num };
+      else if (f.when === "ms") w = { after_ms: num };
+      else w = { page: Math.max(1, num), fraction: Math.min(99, Math.max(1, parseInt(f.pct, 10) || 50)) / 100 };
+      injectFault(d.id, { faults: [{ kind: f.kind, when: w }] });
+    } });
+    var clear = h("button", { type: "button", disabled: !st, text: "Clear plan", onclick: function () { clearPlan(d.id); } });
+    return h("div", { class: "row", role: "group", "aria-label": "Inject fault for " + d.id },
+      kind, when, n, h("span", { class: "muted", text: "(mid page: page number, then %)" }), pct, apply, clear);
+  }
+
+  function injectFault(id, body) {
+    api("POST", dpath(id, "/v1/faults/plan"), body).then(function (r) {
+      if (!r.ok) showError("Inject fault failed on " + id + " (" + r.status + "): " + r.error);
+      else flash("Fault scheduled on " + id);
+      lastSig = ""; refresh();
+    }, function (e) { showError("Daemon unreachable: " + e.message); });
+  }
+  function clearPlan(id) {
+    api("DELETE", dpath(id, "/v1/faults/plan")).then(function (r) {
+      if (!r.ok) showError("Clear plan failed on " + id + " (" + r.status + "): " + r.error);
+      else flash("Cleared fault plan on " + id);
+      lastSig = ""; refresh();
+    }, function (e) { showError("Daemon unreachable: " + e.message); });
+  }
+
+  function renderDevice(d) {
+    var st = statuses[d.id];
+    var inst = d.install || {};
+    var state = inst.state || "new";
+    var card = h("section", { class: "card", "aria-label": "Device " + d.id });
+    card.appendChild(h("header", null,
+      h("h2", { text: d.id }),
+      h("span", { class: "badge " + state, text: state }),
+      h("span", { class: "muted", text: d.friendly_name })));
+    if (d.needs_readd) {
+      card.appendChild(h("div", { class: "banner warn", role: "note" },
+        h("strong", { text: "Needs re-Add: " }), d.needs_readd_reason || "the profile changed since Windows installed this device"));
+    } else if (state === "stale" && inst.reason) {
+      card.appendChild(h("div", { class: "banner warn", role: "note", text: "Stale: " + inst.reason }));
+    }
+    var dl = h("dl");
+    dd(dl, "UUID", h("code", { text: d.uuid }));
+    dd(dl, "Profile", d.profile);
+    dd(dl, "Pages remaining", st ? st.pages_remaining : "(status unavailable)");
+    var cap = st ? st.feeder_capacity : (d.config && d.config.feeder ? d.config.feeder.capacity : null);
+    dd(dl, "Feeder capacity", st || d.config ? (cap == null ? "unlimited" : cap) : "-");
+    var af = activeFaults(st);
+    dd(dl, "Active faults", af === null ? "(status unavailable)" : (af.length ? af.join(", ") : "none"));
+    dd(dl, "Last peer", inst.last_peer || "never");
+    dd(dl, "Last seen", inst.last_seen_at || "never");
+    if (inst.installed_at) dd(dl, "Installed at", inst.installed_at);
+    card.appendChild(dl);
+    card.appendChild(epRow("Scan endpoint", d.scan_endpoint));
+    card.appendChild(epRow("Device endpoint", d.device_endpoint));
+
+    card.appendChild(h("h3", { text: "Faults" }));
+    var fr = h("div", { class: "row", role: "group", "aria-label": "Toggle faults for " + d.id });
+    FAULTS.forEach(function (f) {
+      var on = !!(st && st[f]);
+      fr.appendChild(h("button", { type: "button", "aria-pressed": on ? "true" : "false", disabled: !st,
+        text: FAULT_LABEL[f] + (on ? ": on" : ": off"), onclick: function () { toggleFault(d.id, f, !on); } }));
+    });
+    card.appendChild(fr);
+
+    card.appendChild(h("h3", { text: "Inject fault" }));
+    card.appendChild(injectRow(d, st));
+    card.appendChild(planList(st));
+
+    card.appendChild(h("h3", { text: "Actions" }));
+    card.appendChild(h("div", { class: "row" },
+      h("button", { type: "button", text: "Set pages", onclick: function () { openPages(d); } }),
+      h("button", { type: "button", text: "Reconfigure profile", onclick: function () { openReconf(d); } }),
+      h("button", { type: "button", text: "Reset runtime state", onclick: function () { resetDev(d.id); } }),
+      h("button", { type: "button", class: "danger", text: "Remove", onclick: function () { openRemove(d); } })));
+
+    var det = h("details", { "data-key": d.id });
+    if (openDetails[d.id]) det.open = true;
+    det.addEventListener("toggle", function () { openDetails[d.id] = det.open; });
+    det.appendChild(h("summary", { text: "Add instructions for Windows" }));
+    det.appendChild(h("p", { text: "In Windows open Printers & scanners, choose Add device, then pick this scanner when it appears, or add it manually using the device URL. Details to match:" }));
+    var il = h("dl");
+    dd(il, "Friendly name", h("span", null, d.friendly_name, " ", copyBtn(d.friendly_name, "friendly name")));
+    dd(il, "UUID", h("span", null, h("code", { text: d.uuid }), " ", copyBtn(d.uuid, "UUID")));
+    dd(il, "Device URL", d.device_endpoint ? h("span", null, h("code", { text: d.device_endpoint }), " ", copyBtn(d.device_endpoint, "device URL")) : "n/a");
+    dd(il, "Scan URL", d.scan_endpoint ? h("span", null, h("code", { text: d.scan_endpoint }), " ", copyBtn(d.scan_endpoint, "scan URL")) : "n/a");
+    det.appendChild(il);
+    det.appendChild(h("div", { class: "row" }, h("button", { type: "button", text: "Add device in Windows", onclick: openWindowsSettings })));
+    card.appendChild(det);
+    return card;
+  }
+
+  function render() {
+    var active = document.activeElement;
+    var keep = active && active.dataset ? active.dataset.focus : null; // optional focus restore key
+    var root = $("devices");
+    root.textContent = "";
+    devices.forEach(function (d) { root.appendChild(renderDevice(d)); });
+    $("empty").hidden = devices.length > 0;
+    if (keep) { var el = document.querySelector('[data-focus="' + keep.replace(/"/g, "") + '"]'); if (el) el.focus(); }
+  }
+
+  // ---- dialogs ----
+  function openDlg(dlg) {
+    stopPolling();
+    if (dlg.showModal) dlg.showModal(); else dlg.setAttribute("open", "");
+  }
+  function closeDlg(dlg) {
+    if (dlg.close) dlg.close(); else dlg.removeAttribute("open");
+  }
+  Array.prototype.forEach.call(document.querySelectorAll("dialog"), function (dlg) {
+    dlg.addEventListener("close", function () { if (!document.hidden) startPolling(); });
+    Array.prototype.forEach.call(dlg.querySelectorAll("[data-close]"), function (b) {
+      b.addEventListener("click", function () { closeDlg(dlg); });
+    });
+  });
+  function busy(btn, on) { btn.disabled = on; }
+
+  function openAdd() {
+    loadProfiles().then(function () {
+      fillProfileSelect($("add-profile"), $("add-profinfo"), "");
+      ["add-id", "add-uuid", "add-name"].forEach(function (i) { $(i).value = ""; });
+      $("add-err").textContent = "";
+      openDlg($("dlg-add"));
+      $("add-profile").focus();
+    });
+  }
+  $("btn-add").addEventListener("click", openAdd);
+  $("form-add").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var id = $("add-id").value.trim(), uuid = $("add-uuid").value.trim(), name = $("add-name").value.trim();
+    var profile = $("add-profile").value;
+    if (!profile) { $("add-err").textContent = "No profile available."; return; }
+    var body = { profile: profile, id: id || (profile.replace(/[^A-Za-z0-9_-]/g, "-") + "-" + Math.random().toString(36).slice(2, 6)) };
+    if (uuid) body.device_uuid = uuid;
+    if (name) body.friendly_name = name;
+    busy($("add-submit"), true);
+    api("POST", "/v1/devices", body).then(function (r) {
+      busy($("add-submit"), false);
+      if (!r.ok) { $("add-err").textContent = "Add failed (" + r.status + "): " + r.error; return; }
+      closeDlg($("dlg-add")); flash("Added device " + body.id); lastSig = ""; refresh();
+    }, function (e) { busy($("add-submit"), false); $("add-err").textContent = "Daemon unreachable: " + e.message; });
+  });
+
+  function openRemove(d) {
+    dialogTarget = d;
+    $("remove-text").textContent = "Remove device " + d.id + " (" + d.friendly_name + ")? It stops answering immediately and sends WS-Discovery Bye.";
+    $("remove-forget").checked = false; $("remove-err").textContent = "";
+    openDlg($("dlg-remove"));
+  }
+  $("form-remove").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var d = dialogTarget; if (!d) return;
+    var path = "/v1/devices/" + encodeURIComponent(d.id) + ($("remove-forget").checked ? "?forget=true" : "");
+    busy($("remove-submit"), true);
+    api("DELETE", path).then(function (r) {
+      busy($("remove-submit"), false);
+      if (!r.ok) { $("remove-err").textContent = "Remove failed (" + r.status + "): " + r.error; return; }
+      closeDlg($("dlg-remove")); flash("Removed device " + d.id); lastSig = ""; refresh();
+    }, function (e) { busy($("remove-submit"), false); $("remove-err").textContent = "Daemon unreachable: " + e.message; });
+  });
+
+  function openReconf(d) {
+    dialogTarget = d;
+    loadProfiles().then(function () {
+      $("reconf-text").textContent = "Device " + d.id + " currently uses " + d.profile + ".";
+      fillProfileSelect($("reconf-profile"), $("reconf-profinfo"), d.profile);
+      $("reconf-warn").hidden = !(d.install && d.install.state === "installed");
+      $("reconf-err").textContent = "";
+      openDlg($("dlg-reconf"));
+    });
+  }
+  $("form-reconf").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var d = dialogTarget; if (!d) return;
+    busy($("reconf-submit"), true);
+    api("POST", "/v1/devices/" + encodeURIComponent(d.id) + "/reconfigure", { profile: $("reconf-profile").value }).then(function (r) {
+      busy($("reconf-submit"), false);
+      if (!r.ok) { $("reconf-err").textContent = "Reconfigure failed (" + r.status + "): " + r.error; return; }
+      closeDlg($("dlg-reconf"));
+      flash(r.data && r.data.needs_readd ? "Reconfigured " + d.id + ": needs re-Add in Windows" : "Reconfigured " + d.id);
+      lastSig = ""; refresh();
+    }, function (e) { busy($("reconf-submit"), false); $("reconf-err").textContent = "Daemon unreachable: " + e.message; });
+  });
+
+  function openPages(d) {
+    dialogTarget = d;
+    var st = statuses[d.id];
+    var cap = st && st.feeder_capacity != null ? " The tray holds at most " + st.feeder_capacity + " sheets." : "";
+    $("pages-text").textContent = "Device " + d.id + "." + cap;
+    $("pages-n").value = st ? st.pages_remaining : 0;
+    if (st && st.feeder_capacity != null) $("pages-n").max = st.feeder_capacity; else $("pages-n").removeAttribute("max");
+    $("pages-err").textContent = "";
+    openDlg($("dlg-pages"));
+    $("pages-n").focus();
+  }
+  $("form-pages").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var d = dialogTarget; if (!d) return;
+    var n = parseInt($("pages-n").value, 10);
+    if (isNaN(n) || n < 0) { $("pages-err").textContent = "Enter a whole number, 0 or more."; return; }
+    busy($("pages-submit"), true);
+    api("POST", dpath(d.id, "/v1/pages"), { count: n }).then(function (r) {
+      busy($("pages-submit"), false);
+      if (r.status === 409) { $("pages-err").textContent = "Over capacity: " + r.error; return; }
+      if (!r.ok) { $("pages-err").textContent = "Set pages failed (" + r.status + "): " + r.error; return; }
+      closeDlg($("dlg-pages")); flash("Loaded " + n + " sheets in " + d.id); lastSig = ""; refresh();
+    }, function (e) { busy($("pages-submit"), false); $("pages-err").textContent = "Daemon unreachable: " + e.message; });
+  });
+
+  // ---- direct actions ----
+  function toggleFault(id, fault, value) {
+    var body = {}; body[fault] = value;
+    api("POST", dpath(id, "/v1/fault"), body).then(function (r) {
+      if (!r.ok) showError("Fault change failed on " + id + " (" + r.status + "): " + r.error);
+      else flash(FAULT_LABEL[fault] + " " + (value ? "on" : "off") + " for " + id);
+      lastSig = ""; refresh();
+    }, function (e) { showError("Daemon unreachable: " + e.message); });
+  }
+  function resetDev(id) {
+    api("POST", dpath(id, "/v1/reset"), {}).then(function (r) {
+      if (!r.ok) showError("Reset failed on " + id + " (" + r.status + "): " + r.error);
+      else flash("Reset runtime state of " + id);
+      lastSig = ""; refresh();
+    }, function (e) { showError("Daemon unreachable: " + e.message); });
+  }
+  function openWindowsSettings() {
+    api("POST", "/v1/ctl", { cmd: "open_settings", page: "printers" }).then(function (r) {
+      if (!r.ok) { showError("Could not open Windows settings: " + r.error); return; }
+      flash(r.data && r.data.opened ? "Opened Printers & scanners on the daemon's desktop." : "Windows settings did not open.");
+    }, function (e) { showError("Daemon unreachable: " + e.message); });
+  }
+  $("btn-win").addEventListener("click", openWindowsSettings);
+
+  loadProfiles();
+  startPolling();
+})();
+</script>
+</body>
+</html>

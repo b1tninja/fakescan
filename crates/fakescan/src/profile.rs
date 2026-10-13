@@ -59,6 +59,96 @@ pub struct FeederCaps {
     /// Distinct from manual duplex (`POST /v1/pages` side/order + pdfcraft `--reverse`).
     #[serde(default)]
     pub duplex: bool,
+    /// Sheets the tray physically holds. Absent = no tray limit beyond `pages_max`.
+    /// Loading more via `POST /v1/pages` is refused (see `PagesError`).
+    #[serde(default)]
+    pub capacity: Option<u32>,
+    /// Sheet sizes the ADF accepts (`letter`, `a4`, `legal`). Absent/empty = unrestricted
+    /// (today's behavior: ADF max 8500x14000, any InputMediaSize).
+    #[serde(default)]
+    pub media_sizes: Option<Vec<String>>,
+}
+
+/// Sheet sizes a feeder profile may list in `feeder.media_sizes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaSize {
+    Letter,
+    A4,
+    Legal,
+}
+
+impl MediaSize {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "letter" => Some(Self::Letter),
+            "a4" => Some(Self::A4),
+            "legal" => Some(Self::Legal),
+            _ => None,
+        }
+    }
+
+    /// (width, height) in 1/1000 inch (WSD InputMediaSize units). Letter height matches
+    /// [`crate::image_gen::LETTER_H_THOU`] (live Brother 11700).
+    pub fn dims_thou(self) -> (u32, u32) {
+        match self {
+            Self::Letter => (
+                crate::image_gen::LETTER_W_THOU,
+                crate::image_gen::LETTER_H_THOU,
+            ),
+            Self::A4 => (8267, 11692),
+            Self::Legal => (
+                crate::image_gen::LETTER_W_THOU,
+                crate::image_gen::ADF_MAX_H_THOU,
+            ),
+        }
+    }
+
+    /// True when a ticket InputMediaSize is this size (width +-100, height +-800).
+    pub fn matches(self, w: u32, h: u32) -> bool {
+        let (sw, sh) = self.dims_thou();
+        w.abs_diff(sw) <= 100 && h.abs_diff(sh) <= 800
+    }
+}
+
+impl FeederCaps {
+    /// Parsed `media_sizes`; `None` = unrestricted.
+    pub fn media_size_list(&self) -> Option<Vec<MediaSize>> {
+        let list = self.media_sizes.as_ref()?;
+        if list.is_empty() {
+            return None;
+        }
+        Some(list.iter().filter_map(|s| MediaSize::parse(s)).collect())
+    }
+
+    /// True when `w`x`h` (1/1000 inch) is acceptable to the ADF.
+    pub fn accepts_media(&self, w: u32, h: u32) -> bool {
+        match self.media_size_list() {
+            None => true,
+            Some(list) => list.iter().any(|m| m.matches(w, h)),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(cap) = self.capacity {
+            if cap == 0 {
+                bail!("feeder.capacity must be > 0 (omit it for no tray limit)");
+            }
+            if self.pages_max > cap {
+                bail!(
+                    "feeder.pages_max ({}) exceeds feeder.capacity ({cap})",
+                    self.pages_max
+                );
+            }
+        }
+        if let Some(list) = &self.media_sizes {
+            for s in list {
+                if MediaSize::parse(s).is_none() {
+                    bail!("feeder.media_sizes: unknown size {s:?} (allowed: letter, a4, legal)");
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Profile {
@@ -77,6 +167,10 @@ impl Profile {
                 profile.id
             );
         }
+        profile
+            .feeder
+            .validate()
+            .with_context(|| format!("profile {}", path.display()))?;
         Ok(profile)
     }
 
@@ -97,5 +191,66 @@ impl Profile {
         }
         ids.sort();
         Ok(ids)
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::*;
+
+    fn dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles")
+    }
+
+    #[test]
+    fn shipped_tray_profiles_load() {
+        for (id, cap, n_sizes, duplex) in [
+            ("feeder-tray5", 5, 1, false),
+            ("feeder-tray50", 50, 3, false),
+            ("feeder-duplex30", 30, 3, true),
+            ("feeder-a4only", 20, 1, false),
+        ] {
+            let p = Profile::load(&dir(), id).expect(id);
+            assert_eq!(p.feeder.capacity, Some(cap), "{id}");
+            assert_eq!(p.feeder.media_size_list().unwrap().len(), n_sizes, "{id}");
+            assert_eq!(p.feeder.duplex, duplex, "{id}");
+            assert_eq!(p.connection, "wsd");
+            assert!(p.formats.iter().any(|f| f == "jfif"));
+        }
+    }
+
+    #[test]
+    fn brother_wsd_has_no_tray_limit() {
+        let p = Profile::load(&dir(), "brother-wsd").unwrap();
+        assert_eq!(p.feeder.capacity, None);
+        assert!(p.feeder.media_size_list().is_none());
+        assert!(!p.feeder.duplex);
+    }
+
+    #[test]
+    fn invalid_feeder_blocks_are_rejected() {
+        let tmp = std::env::temp_dir().join(format!("fakescan-prof-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let base = std::fs::read_to_string(dir().join("brother-wsd.json")).unwrap();
+        for (name, feeder, needle) in [
+            (
+                "bad-cap",
+                r#"{"sticky_ready":false,"pages_min":0,"pages_max":30,"capacity":10}"#,
+                "exceeds",
+            ),
+            (
+                "bad-size",
+                r#"{"sticky_ready":false,"pages_min":0,"pages_max":3,"media_sizes":["a3"]}"#,
+                "unknown size",
+            ),
+        ] {
+            let mut v: serde_json::Value = serde_json::from_str(&base).unwrap();
+            v["id"] = name.into();
+            v["feeder"] = serde_json::from_str(feeder).unwrap();
+            std::fs::write(tmp.join(format!("{name}.json")), v.to_string()).unwrap();
+            let err = format!("{:#}", Profile::load(&tmp, name).unwrap_err());
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
