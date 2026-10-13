@@ -10,7 +10,7 @@
 
 A **fake scanner** for testing acquire paths: scriptable glass/feeder, synthetic page patterns, image defects, and capability profiles that look like real WIA / WSD devices — without a physical MFP.
 
-Built for [pdfcraft](https://github.com/storytold/pdfcraft) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). Companion **[fakeprint](https://github.com/b1tninja/fakeprint)** covers WSD Print on `:3921`. How the two labs differ: [docs/siblings.md](docs/siblings.md).
+Built for [pdfcraft](https://github.com/storytold/pdfcraft) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). **pdfcraft** implements WIA/UI; **fakescan** implements the fake device and control API; end-to-end pdfcraft exerciser tests live in **pdfcraft-fakescan** ([stack](https://github.com/storytold/pdfcraft-fakescan/blob/main/docs/stack.md) when published, or `../pdfcraft-fakescan/docs/stack.md` in a monorepo). Companion **[fakeprint](https://github.com/b1tninja/fakeprint)** covers WSD Print on `:3921`. How the two scan/print labs differ: [docs/siblings.md](docs/siblings.md).
 
 ## Docs
 
@@ -88,7 +88,7 @@ Read-only, in this tree (they show up after the next start): `GET /v1/jobs` (sca
 
 | Piece | State |
 |-------|--------|
-| Control API `/v1/*` (pages, pattern, effects, scenario, fault, slow, **loopback**) | working |
+| Control API `/v1/*` (pages, pattern, effects, scenario, fault, **fault plan** (`/v1/faults/plan`: between pages / mid page / timed / now), slow, **loopback**) | working |
 | Python lab client (`python/`, optional) | working — [lab-harness.md](docs/lab-harness.md) |
 | Profiles `brother-usb` / `brother-wsd` | working |
 | WS-Discovery Hello (+ ProbeMatch when port free) | working |
@@ -106,9 +106,9 @@ Read-only, in this tree (they show up after the next start): `GET /v1/jobs` (sca
 For WIA / pdfcraft developers only — not a default app dependency:
 
 ```bash
-pip install -e "./python[dev]"
+pip install -e "../fakescan-python[dev]"
 fakescan-lab loopback-soap page0.jpg page1.jpg   # SOAP exact-echo (no WIA)
-pytest python/tests -m live                      # needs fakescan running
+pytest ../fakescan-python/tests -m live                      # needs fakescan running
 ```
 
 See [docs/lab-harness.md](docs/lab-harness.md).
@@ -135,8 +135,8 @@ See [docs/windows.md](docs/windows.md) for soap-only vs on-wire-discoverable vs 
 cargo fmt --all -- --check
 cargo clippy -p fakescan --all-targets -- -D warnings
 cargo test -p fakescan
-pip install -e "./python[dev]"
-pytest python/tests -m "not live and not local"
+pip install -e "../fakescan-python[dev]"
+pytest ../fakescan-python/tests -m "not live and not local"
 ```
 
 ## CI
