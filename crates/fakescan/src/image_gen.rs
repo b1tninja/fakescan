@@ -265,7 +265,7 @@ pub fn page_pixels(dpi: u32) -> (u32, u32) {
     (w.max(1), h.max(1))
 }
 
-/// Brother MFC-9330CDW live deliverable width in 1/1000 inch (Transfer @200 → 1648 px).
+/// A real device's live deliverable width in 1/1000 inch (Transfer @200 → 1648 px).
 /// Platen / WIA item extent stays [`LETTER_W_THOU`]; ImageInformation + SOF use this crop.
 const OPTICAL_W_THOU: u32 = 8240;
 /// Brother live deliverable height in 1/1000 inch (Transfer @200 → 2289 px).
@@ -4480,7 +4480,7 @@ mod tests {
 
     #[test]
     fn jfif_encode_matches_brother_structure() {
-        // Brother MFC-9330CDW WSD JPEG: SOF0 4:2:0 (Y 2×2), APP0 units=dpi,
+        // A real device's WSD JPEG: SOF0 4:2:0 (Y 2×2), APP0 units=dpi,
         // DRI = MCU columns, component ids 1/2/3. Prior image-crate encode was
         // 4:4:4 + aspect density 1×1 + no DRI (CancelJob after RetrieveImage).
         let dpi = std::env::var("FAKESCAN_DUMP_DPI")

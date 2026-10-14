@@ -67,7 +67,7 @@ fakescan-lab --base-url http://127.0.0.1:3920 profile wia-lossless
 fakescan-lab --base-url http://127.0.0.1:3920 profile brother-wsd
 ```
 
-Mirrored from a Brother MFC-9330CDW dump, not product UI strings.
+Mirrored from a dump of a real network multifunction device, not product UI strings.
 
 ## Control plane (examples)
 

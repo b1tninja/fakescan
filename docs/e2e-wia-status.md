@@ -148,7 +148,7 @@ Samples (same host). Brother via WIA.Transfer JPEG GUID `{B96B3CAE-0728-11D3-9D7
 
 | Path | Notes |
 |------|-------|
-| `D:\temp\brother-wia.jpg` | Brother MFC-9330CDW WSD, ShowTransfer OK ~9.9s, **33620 B**, 100 dpi, SOF 816×1144 |
+| `D:\temp\brother-wia.jpg` | a real device over WSD, ShowTransfer OK ~9.9s, **33620 B**, 100 dpi, SOF 816×1144 |
 | `D:\temp\fakescan-wia-100dpi.jpg` | `wia_plain` after reshape @100, **28811 B**, SOF 850×1100 |
 | `D:\temp\fakescan-wia.jpg` | `wia_plain` after reshape @200, **86316 B**, SOF 1700×2200 (= live `image_bytes`) |
 | Prior MTOM extract | Pre-fix: 189620 B @200, 4:4:4, dens 1×1, no DRI |

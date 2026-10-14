@@ -491,7 +491,7 @@ fn dpi_widths_heights(profile: &Profile) -> (Element, Element) {
 }
 
 fn scanner_configuration(profile: &Profile) -> Element {
-    // Shape matches a live Brother MFC-9330CDW GetScannerElements capture
+    // Shape matches a live GetScannerElements capture of a real device
     // (`D:\temp\brother-gse-config.xml`): 0/1 booleans, Auto-only content type,
     // CompressionQuality 100–100, Scaling 100–100, color order BW→Gray→RGB,
     // min size 556, platen max height LETTER_H_THOU (11700).
