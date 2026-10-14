@@ -19,6 +19,16 @@ pub struct DeviceConfig {
 pub struct ServerConfig { /* existing fields */ pub devices: Vec<DeviceConfig> }
 ```
 
+**Identity is the UUID, never the name.** Every fake device UUID (fakescan and fakeprint) starts with
+`lab::FAKE_UUID_PREFIX = "00000000-0000-4000-8000-"` (`fakescan::FAKE_UUID_PREFIX`, `fakescan::is_fake_uuid`;
+Python `fakescan.FAKE_UUID_PREFIX` / `is_fake_uuid`). This is a lab-safety feature: `DeviceManager::add`
+(and so `serve`, `--device ID=PROFILE@UUID`, `--device-uuid` and `POST /v1/devices`) rejects a device UUID
+outside the prefix (HTTP 400) unless `DeviceConfig::allow_foreign_uuid` is set (CLI `--allow-foreign-uuid`;
+`ServerConfig::allow_foreign_uuid` for `--manage` registry rows, which are otherwise skipped with a warning).
+The override is never reachable over HTTP. The default UUID (`...00f2`) and derived UUIDs satisfy the rule;
+`World`s and the Python binding get random UUIDs inside the prefix when none is given. Friendly names are
+cosmetic and never decide whether a device is ours.
+
 - `ServerConfig::lab(..)` keeps working: it yields one device, id `default`.
 - Each device owns its own `World` (state, jobs, activity ring, loopback, faults). No shared mutable state.
 - Instance lock, named pipe, listener: one per **server**, not per device.

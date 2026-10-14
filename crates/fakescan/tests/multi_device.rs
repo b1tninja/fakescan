@@ -367,6 +367,33 @@ async fn tray_capacity_rejects_overload_with_409() {
 }
 
 #[tokio::test]
+async fn serve_refuses_a_foreign_uuid_unless_allowed() {
+    let foreign = Uuid::parse_str("3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b").unwrap();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+    let mk = |allow: bool| {
+        let mut cfg = ServerConfig::lab(dir.clone(), "brother-wsd");
+        cfg.listen = "127.0.0.1:0".parse().unwrap();
+        cfg.discovery = false;
+        cfg.probe_listen = false;
+        cfg.instance_lock = false;
+        cfg.named_pipe = false;
+        cfg.ctrl_c = false;
+        let mut d = DeviceConfig::new("default", "brother-wsd", foreign);
+        d.allow_foreign_uuid = allow;
+        cfg.devices = vec![d];
+        cfg
+    };
+    let e = serve(mk(false), None, None).await.unwrap_err();
+    assert!(e.to_string().contains("fake namespace"), "{e:#}");
+    let (rtx, rrx) = oneshot::channel();
+    let (stx, srx) = oneshot::channel();
+    let task = tokio::spawn(serve(mk(true), Some(rtx), Some(srx)));
+    rrx.await.expect("allowed foreign UUID starts");
+    let _ = stx.send(());
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn devices_can_be_added_and_removed_at_runtime() {
     let srv = Srv::start(three()).await;
     let (st, _) = srv.json("GET", "/d/late/v1/status", Value::Null).await;
@@ -393,6 +420,20 @@ async fn devices_can_be_added_and_removed_at_runtime() {
         .json("POST", "/v1/devices", json!({"id": "x", "profile": "nope"}))
         .await;
     assert_eq!(st, 400);
+    // identity is the UUID prefix: a foreign UUID is a 400 (no override over HTTP)
+    let (st, v) = srv
+        .json(
+            "POST",
+            "/v1/devices",
+            json!({"id": "foreign", "profile": "feeder-tray5",
+                   "device_uuid": "3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b"}),
+        )
+        .await;
+    assert_eq!(st, 400, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("fake namespace"),
+        "{v}"
+    );
 
     let (st, s) = srv.json("GET", "/d/late/v1/status", Value::Null).await;
     assert_eq!(st, 200);

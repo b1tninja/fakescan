@@ -42,6 +42,10 @@ pub struct DeviceConfig {
     pub device_uuid: Uuid,
     /// Shown in Windows; defaults to `fakescan <id>` (`fakescan` for the default device).
     pub friendly_name: Option<String>,
+    /// Lab-safety override, default `false`: accept a device UUID outside
+    /// [`lab::FAKE_UUID_PREFIX`]. Never reachable from the control plane (`POST /v1/devices`).
+    #[serde(skip)]
+    pub allow_foreign_uuid: bool,
 }
 
 impl DeviceConfig {
@@ -51,6 +55,7 @@ impl DeviceConfig {
             profile: profile.into(),
             device_uuid,
             friendly_name: None,
+            allow_foreign_uuid: false,
         }
     }
 
@@ -105,6 +110,9 @@ pub struct ServerConfig {
     /// Daemon `--manage`: with no `devices`, bring up the registry rows whose `listen` equals
     /// [`ServerConfig::listen`], with their stored UUIDs and profiles. Needs `registry`.
     pub manage: bool,
+    /// Lab-safety override (default `false`): devices restored from the registry (`manage`) may
+    /// use UUIDs outside [`lab::FAKE_UUID_PREFIX`].
+    pub allow_foreign_uuid: bool,
 }
 
 impl ServerConfig {
@@ -129,6 +137,7 @@ impl ServerConfig {
             ctrl_c: true,
             registry: None,
             manage: false,
+            allow_foreign_uuid: false,
         }
     }
 }
@@ -187,7 +196,12 @@ pub async fn serve(
                 tracing::warn!(row = %row.name, profile = %row.profile, "registry row not startable; skipped");
                 continue;
             }
+            if !cfg.allow_foreign_uuid && !lab::uuid_is_fake(&uuid) {
+                tracing::warn!(row = %row.name, "registry row UUID is outside the fake namespace; skipped");
+                continue;
+            }
             let mut dc = DeviceConfig::new(row.name.clone(), row.profile.clone(), uuid);
+            dc.allow_foreign_uuid = cfg.allow_foreign_uuid;
             dc.friendly_name = row.friendly_name.clone();
             devices.push(dc);
         }

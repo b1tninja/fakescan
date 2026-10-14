@@ -101,7 +101,7 @@ async fn new_to_probed_on_soap_get_with_fake_peer_through_dispatcher() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -191,7 +191,7 @@ async fn probe_writes_are_throttled_and_first_contact_always_writes() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -238,7 +238,7 @@ async fn reconfigure_goes_stale_only_when_published_capabilities_change() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -319,7 +319,7 @@ async fn reconcile_matches_by_uuid_only_and_never_touches_foreign() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -426,7 +426,7 @@ async fn concurrent_probe_and_install_on_different_devices_lose_nothing() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -493,6 +493,22 @@ fn base_cfg(devices: Vec<DeviceConfig>, registry: Option<PathBuf>) -> ServerConf
     cfg.devices = devices;
     cfg.registry = registry;
     cfg
+}
+
+#[test]
+fn fake_uuid_prefix_rule() {
+    use fakescan::lab::{is_fake_uuid, uuid_is_fake, FAKE_UUID_PREFIX};
+    assert_eq!(FAKE_UUID_PREFIX, "00000000-0000-4000-8000-");
+    assert!(is_fake_uuid(fakescan::lab::LAB_DEVICE_UUID));
+    assert!(is_fake_uuid("{00000000-0000-4000-8000-0000000000F2}"));
+    assert!(is_fake_uuid(
+        "urn:uuid:00000000-0000-4000-8000-0000000000f2"
+    ));
+    assert!(!is_fake_uuid("3f2b9c1e-7d44-4a55-9e0b-1c2d3e4f5a6b"));
+    assert!(!is_fake_uuid("00000000-0000-0000-0000-0000000000f2"));
+    assert!(!is_fake_uuid("nope"));
+    assert!(uuid_is_fake(&fakescan::lab::random_fake_uuid()));
+    assert!(uuid_is_fake(&DeviceConfig::derived("x", "p").device_uuid));
 }
 
 impl Srv {
@@ -566,7 +582,7 @@ async fn runtime_add_persists_remove_keeps_forget_drops_install() {
         vec![DeviceConfig::new(
             "default",
             "brother-wsd",
-            Uuid::from_u128(0xf2),
+            fakescan::lab::lab_device_uuid(),
         )],
         Some(path.clone()),
     ))
@@ -699,7 +715,7 @@ async fn http_reconcile_and_ctl_commands() {
     let path = reg_path("httprecon");
     let srv = Srv::start(base_cfg(
         vec![
-            DeviceConfig::new("default", "brother-wsd", Uuid::from_u128(0xf2)),
+            DeviceConfig::new("default", "brother-wsd", fakescan::lab::lab_device_uuid()),
             DeviceConfig::derived("g", "glass-wsd"),
         ],
         Some(path.clone()),
@@ -833,7 +849,7 @@ async fn embedded_server_without_registry_path_never_writes_a_registry() {
         vec![DeviceConfig::new(
             "default",
             "brother-wsd",
-            Uuid::from_u128(0xf2),
+            fakescan::lab::lab_device_uuid(),
         )],
         None,
     ))
@@ -891,7 +907,7 @@ async fn post_v1_profile_and_ctl_profile_keep_install_state_correct() {
     let path = reg_path("viaprofile");
     let mut cfg = base_cfg(
         vec![
-            DeviceConfig::new("default", "brother-wsd", Uuid::from_u128(0xf2)),
+            DeviceConfig::new("default", "brother-wsd", fakescan::lab::lab_device_uuid()),
             DeviceConfig::derived("tray", "feeder-tray5"),
         ],
         Some(path.clone()),
@@ -986,7 +1002,7 @@ async fn v1_profile_without_a_registry_row_still_works() {
         vec![DeviceConfig::new(
             "default",
             "brother-wsd",
-            Uuid::from_u128(0xf2),
+            fakescan::lab::lab_device_uuid(),
         )],
         None,
     ))
@@ -1012,7 +1028,7 @@ async fn discovery_probe_and_resolve_mark_only_the_devices_that_answer() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -1099,7 +1115,7 @@ async fn discovery_peer_contact_is_throttled_like_the_http_path() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -1168,7 +1184,7 @@ async fn two_uuid_port_is_refused_by_installed_and_foreign_in_reconcile() {
         vec![DeviceConfig::new(
             "default",
             "brother-wsd",
-            Uuid::from_u128(0xf2),
+            fakescan::lab::lab_device_uuid(),
         )],
         Some(path.clone()),
     ))
@@ -1232,7 +1248,7 @@ async fn switching_profile_away_and_back_restores_installed_with_identical_wia()
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -1316,7 +1332,7 @@ async fn persistent_profile_change_stays_stale_and_survives_reload() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -1340,7 +1356,7 @@ async fn persistent_profile_change_stays_stale_and_survives_reload() {
     m2.add(DeviceConfig::new(
         "default",
         "glass-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -1355,7 +1371,7 @@ async fn stale_not_listed_by_windows_is_never_healed_by_a_profile_change() {
     m.add(DeviceConfig::new(
         "default",
         "brother-wsd",
-        Uuid::from_u128(0xf2),
+        fakescan::lab::lab_device_uuid(),
     ))
     .await
     .unwrap();
@@ -1387,7 +1403,7 @@ async fn http_and_ctl_profile_round_trip_heals() {
         vec![DeviceConfig::new(
             "default",
             "brother-wsd",
-            Uuid::from_u128(0xf2),
+            fakescan::lab::lab_device_uuid(),
         )],
         Some(path.clone()),
     );

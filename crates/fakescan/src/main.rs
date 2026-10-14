@@ -55,6 +55,11 @@ struct Args {
     #[arg(long)]
     device_uuid: Option<Uuid>,
 
+    /// Lab-safety override: accept device UUIDs outside the fake namespace
+    /// (`00000000-0000-4000-8000-*`). Without it such a UUID is refused at start.
+    #[arg(long)]
+    allow_foreign_uuid: bool,
+
     /// Lab instance name — resolves listen/uuid/advertise from devices.json.
     /// Env: `FAKESCAN_NAME`.  Required for `POST /v1/ctl save`.
     #[arg(long, env = "FAKESCAN_NAME")]
@@ -189,6 +194,9 @@ async fn main() -> anyhow::Result<()> {
         for spec in &args.devices {
             devices.push(parse_device(spec)?);
         }
+        for d in &mut devices {
+            d.allow_foreign_uuid = args.allow_foreign_uuid;
+        }
     }
     // The registry is attached in daemon-style runs only (--manage or --lab-name).
     let registry = (args.manage || lab_name.is_some()).then(registry_path);
@@ -237,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
             ctrl_c: true,
             registry,
             manage: args.manage,
+            allow_foreign_uuid: args.allow_foreign_uuid,
         },
         Some(ready_tx),
         Some(stop_rx),

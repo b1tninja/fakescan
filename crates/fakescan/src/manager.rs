@@ -287,6 +287,13 @@ impl DeviceManager {
             "invalid device id {:?} (use [A-Za-z0-9_-]+)",
             dc.id
         );
+        // Identity is the UUID, never the name: only the fake namespace is ours.
+        ensure!(
+            dc.allow_foreign_uuid || crate::lab::uuid_is_fake(&dc.device_uuid),
+            "device UUID {} is outside the fake namespace {}*",
+            dc.device_uuid,
+            crate::lab::FAKE_UUID_PREFIX
+        );
         let mut g = self.inner.write().await;
         ensure!(
             !g.devices.contains_key(&dc.id),

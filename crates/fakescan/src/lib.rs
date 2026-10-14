@@ -22,3 +22,5 @@ pub mod tray;
 pub mod tray_model;
 pub mod ui;
 pub mod wsd;
+
+pub use lab::{is_fake_uuid, FAKE_UUID_PREFIX};

@@ -18,6 +18,29 @@ pub const LAB_PORT: u16 = 3920;
 /// Canonical WS-Discovery / PnP device UUID for the Windows lab host.
 pub const LAB_DEVICE_UUID: &str = "00000000-0000-4000-8000-0000000000f2";
 
+/// Every fake device UUID (fakescan and fakeprint) starts with this prefix. It, and not the
+/// friendly name, is how a device is recognised as ours (lab safety: nothing outside the prefix
+/// is ever created, matched or driven as a fake device unless explicitly allowed).
+pub const FAKE_UUID_PREFIX: &str = "00000000-0000-4000-8000-";
+
+/// True if `value` is a UUID in the fake namespace ([`FAKE_UUID_PREFIX`]). Case-insensitive;
+/// accepts braces and `urn:uuid:` forms; anything unparseable is `false`.
+pub fn is_fake_uuid(value: &str) -> bool {
+    Uuid::parse_str(value.trim()).is_ok_and(|u| uuid_is_fake(&u))
+}
+
+/// [`is_fake_uuid`] for an already parsed [`Uuid`].
+pub fn uuid_is_fake(u: &Uuid) -> bool {
+    u.hyphenated().to_string().starts_with(FAKE_UUID_PREFIX)
+}
+
+/// A random UUID in the fake namespace (`FAKE_UUID_PREFIX` + 12 random hex digits).
+pub fn random_fake_uuid() -> Uuid {
+    let mut bytes = *Uuid::new_v4().as_bytes();
+    bytes[..10].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0]);
+    Uuid::from_bytes(bytes)
+}
+
 pub fn lab_device_uuid() -> Uuid {
     Uuid::parse_str(LAB_DEVICE_UUID).expect("LAB_DEVICE_UUID")
 }

@@ -690,7 +690,7 @@ impl World {
             job_timeout: job_timeout_from_env(),
             device_endpoint: "http://127.0.0.1:3920/WebServices/Device".into(),
             service_endpoint: "http://127.0.0.1:3920/ScannerService".into(),
-            device_uuid: Uuid::new_v4(),
+            device_uuid: crate::lab::random_fake_uuid(),
             discovery,
             trace_seq: 0,
             trace: VecDeque::new(),
