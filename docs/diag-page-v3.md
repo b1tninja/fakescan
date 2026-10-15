@@ -166,8 +166,8 @@ headline figures. Revision-1 additions:
   pixel depending on the edge's sub-pixel phase), a robust (Theil-Sen, then least squares) line per side so one profile that
   crosses a neighbouring feature is dropped, and the corners as the line intersections. The position is re-centred on the fitted
   quad and refined again before the payload is read. On clean renders every marker is found and the worst corner is
-  under 0.3 px at 100-600 dpi on A4 / Letter / A5 (in practice 0.01-0.1 px; exceptions are markers with real ink on their
-  edge, such as the Statement media outline crossing ChArUco markers on Letter). `cv2.aruco` (`CORNER_REFINE_SUBPIX`) is
+  under 0.3 px at 100-600 dpi on A4 / Letter / A5 (in practice 0.01-0.1 px). Media outlines no longer cross markers (see
+  the revision 1 byte change below), so there is no ink on marker edges. `cv2.aruco` (`CORNER_REFINE_SUBPIX`) is
   used instead when `cv2` with the aruco module is importable (`detector="auto"`; `"python"` / `"cv2"` force one).
 * `markers.orientation`: the dihedral state of the received page, one of `upright`, `rot90`, `rot180`, `rot270` (the page
   turned that many degrees clockwise), `flip_h`, `flip_v`, `transpose` (mirrored along the top-left to bottom-right diagonal, PIL
@@ -211,7 +211,7 @@ and a QR from `payload`). The same layout JSON is the analysis ground truth afte
 
 | Pattern | Page | Pin |
 |---------|------|-----|
-| `diag` | layout v3 revision 1 (default) | `diag_v3::tests::pinned_hashes`: FNV-1a 64 of the RGB raster, A4@100 `f8611b691b27e9bc`, Letter@100 `9e2ca63d82d82af6`, A3@50 `6200ed7de6f91e9e` (revision 0 was `f6aa3fda618d9b02`, `beeebc4399ab038c`, `6aaaebb13625058a`) |
+| `diag` | layout v3 revision 1 (default) | `diag_v3::tests::pinned_hashes`: FNV-1a 64 of the RGB raster, A4@100 `8f7ad861b64a829b`, Letter@100 `fa9adfe1d1333322`, A3@50 `c42393fbc08d88c4` (revision 1 before the outline clipping was `f8611b691b27e9bc`, `9e2ca63d82d82af6`, `6200ed7de6f91e9e`; revision 0 was `f6aa3fda618d9b02`, `beeebc4399ab038c`, `6aaaebb13625058a`) |
 | `diag_v2` | layout v2, `lay=2` | `diag_v2_is_byte_identical_and_still_selectable` (100 and 200 dpi) |
 | `diag_v1` | layout v1, no `lay` | `diag_v1_is_byte_identical_to_the_pre_v2_page` |
 | `page_id` | numbered bars (old default) | selectable; `--default-pattern page_id` |
@@ -235,6 +235,12 @@ and a QR from `payload`). The same layout JSON is the analysis ground truth afte
 
 ## Notes for consumers of revision 1
 
+* Revision 1 bytes changed in the commit that clipped the dashed media outlines: a dash is no longer drawn within the quiet
+  zone (one module for ArUco markers, at least 1 mm for everything) of any marker, calibration board, corner bracket, ruler,
+  QR code or side marker, because outlines of other paper sizes (Statement, A5, A6, Legal, A3) used to cross them and put
+  ink on marker edges. The outline stays in the layout JSON (`rect_mm` of the sheet outline, `drawn` true) with the new
+  `expected.clipped` / `clipped_by` keys; its vector primitives are the surviving dashes, so PDF writers reproduce them.
+  Nobody outside the Rust pins used the old revision 1 bytes.
 * Element ids changed or appeared: `marker_tl/tr/bl/br` are now ArUco (ids 0, 1, 3, 2) and `cells` keeps the 6 x 6 format
   (`1` = black), `ruler_metric` / `ruler_inch` are one dual strip (same ids, new `expected` keys: `axis`, `zero_line_mm`,
   `tick_edge_mm`, `ticks`; `origin_mm` is now the zero point on the tick edge, `direction` is `+x` / `+y`), vertical rulers

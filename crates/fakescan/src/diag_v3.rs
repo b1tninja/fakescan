@@ -3360,6 +3360,7 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
     // dashed media outlines
     let landscape = w > h;
     let mut outline_els: Vec<usize> = vec![];
+    let mut pending_outlines: Vec<(usize, f64, f64)> = vec![];
     for (name, pw, ph) in OUTLINES {
         let (ow, oh) = if landscape { (ph, pw) } else { (pw, ph) };
         let fits = ow < w - 0.5 && oh < h - 0.5;
@@ -3372,27 +3373,11 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
             b.els[e].reason = Some("medium does not fit inside the sheet".into());
             continue;
         }
-        let id = format!("outline_{}", name.to_ascii_lowercase());
-        let pts = [
-            [0.1, 0.1],
-            [ow - 0.1, 0.1],
-            [ow - 0.1, oh - 0.1],
-            [0.1, oh - 0.1],
-        ];
-        for i in 0..4 {
-            b.add(
-                &id,
-                Prim::Line {
-                    a: pts[i],
-                    b: pts[(i + 1) % 4],
-                    w: 0.2,
-                    c: OUTLINE_RGB,
-                    dash: Some([4.0, 2.0]),
-                },
-            );
-        }
+        pending_outlines.push((e, ow, oh));
         outline_els.push(e);
     }
+    // the outline primitives are inserted here once every element is placed, so they can be clipped
+    let outline_at = b.prims.len();
 
     // ---- frame, border, ticks ---------------------------------------------------------------------
     let fe = b.el("printable_frame", "frame", "print_marks", frame, 1.0, json!({
@@ -3629,6 +3614,33 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
         notes.push("rows not placed".to_string());
     }
 
+    // ---- media outlines, clipped against every fiducial / board / marker / bracket / ruler -------------
+    let keep_out = outline_keep_out(&b.els);
+    let mut outline_prims: Vec<(String, Prim)> = vec![];
+    for (e, ow, oh) in pending_outlines {
+        let id = b.els[e].id.clone();
+        let pts = [
+            [0.1, 0.1],
+            [ow - 0.1, 0.1],
+            [ow - 0.1, oh - 0.1],
+            [0.1, oh - 0.1],
+        ];
+        let mut clipped_by: Vec<String> = vec![];
+        for i in 0..4 {
+            let (pa, pb) = (pts[i], pts[(i + 1) % 4]);
+            for line in clip_outline_side(pa, pb, 0.2, &keep_out, &mut clipped_by) {
+                outline_prims.push((id.clone(), line));
+            }
+        }
+        clipped_by.sort();
+        clipped_by.dedup();
+        let ex = &mut b.els[e].expected;
+        ex["clipped"] = json!(!clipped_by.is_empty());
+        ex["clipped_by"] = json!(clipped_by);
+        ex["clip_note"] = json!("dashes are not drawn within the quiet zone (>= 1 mm and >= 1 module) of any marker, board, bracket, ruler, QR or side marker, so the outline never touches their edges");
+    }
+    b.prims.splice(outline_at..outline_at, outline_prims);
+
     // ---- outline samples away from content -------------------------------------------------------------
     let rects: Vec<R4> = b
         .els
@@ -3660,7 +3672,12 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
                     && c[1] < q[3] + 2.0
                     && !(q[0] <= 0.0 && q[1] <= 0.0)
             });
-            let touches_other_outline = false;
+            let touches_other_outline = keep_out.iter().any(|k| {
+                c[0] > k.1[0] - 0.6
+                    && c[0] < k.1[2] + 0.6
+                    && c[1] > k.1[1] - 0.6
+                    && c[1] < k.1[3] + 0.6
+            });
             if !near && !touches_other_outline && got < 3 {
                 b.sample(e, c[0], c[1], OUTLINE_RGB, 200);
                 got += 1;
@@ -3681,6 +3698,131 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
         content,
         notes,
     }
+}
+
+/// Elements a media outline must never touch: (id, rect inflated by the quiet zone).
+fn outline_keep_out(els: &[El]) -> Vec<(String, R4)> {
+    const KINDS: [&str; 11] = [
+        "marker",
+        "corner_bracket",
+        "chessboard",
+        "charuco_board",
+        "circle_grid",
+        "ruler",
+        "measure_bar",
+        "registration_cross",
+        "qr",
+        "side_marker",
+        "orientation_glyph",
+    ];
+    els.iter()
+        .filter(|e| {
+            e.drawn
+                && e.rect[2] > e.rect[0]
+                && (KINDS.contains(&e.kind)
+                    || matches!(e.group, "fiducial" | "calibration" | "scale"))
+        })
+        .map(|e| {
+            let r = e.rect;
+            // one module of quiet zone for markers (side / 6), at least 1 mm for everything
+            let m = if e.kind == "marker" {
+                ((r[2] - r[0]) / 6.0).max(1.0)
+            } else {
+                1.0
+            };
+            (e.id.clone(), [r[0] - m, r[1] - m, r[2] + m, r[3] + m])
+        })
+        .collect()
+}
+
+/// One side of an axis-aligned dashed outline (4 mm on, 2 mm off from `a`), minus the parts inside
+/// the keep-out rects. An unclipped side stays one dashed line; a clipped one becomes plain dash lines.
+fn clip_outline_side(
+    a: [f64; 2],
+    b: [f64; 2],
+    w: f64,
+    keep_out: &[(String, R4)],
+    clipped_by: &mut Vec<String>,
+) -> Vec<Prim> {
+    let horiz = (b[1] - a[1]).abs() < 1e-9;
+    let len = (b[0] - a[0]).abs() + (b[1] - a[1]).abs();
+    let dir = if horiz {
+        (b[0] - a[0]).signum()
+    } else {
+        (b[1] - a[1]).signum()
+    };
+    let at = |t: f64| {
+        if horiz {
+            [a[0] + dir * t, a[1]]
+        } else {
+            [a[0], a[1] + dir * t]
+        }
+    };
+    let origin = if horiz { a[0] } else { a[1] };
+    let hw = w / 2.0;
+    // forbidden along-axis intervals (in t) for this side
+    let mut bad: Vec<(f64, f64)> = vec![];
+    for (id, q) in keep_out {
+        let (c, lo_c, hi_c, lo_a, hi_a) = if horiz {
+            (a[1], q[1], q[3], q[0], q[2])
+        } else {
+            (a[0], q[0], q[2], q[1], q[3])
+        };
+        if c + hw <= lo_c || c - hw >= hi_c {
+            continue;
+        }
+        let (t0, t1) = if dir > 0.0 {
+            (lo_a - origin, hi_a - origin)
+        } else {
+            (origin - hi_a, origin - lo_a)
+        };
+        if t1 <= 0.0 || t0 >= len {
+            continue;
+        }
+        bad.push((t0, t1));
+        clipped_by.push(id.clone());
+    }
+    if bad.is_empty() {
+        return vec![Prim::Line {
+            a,
+            b,
+            w,
+            c: OUTLINE_RGB,
+            dash: Some([4.0, 2.0]),
+        }];
+    }
+    bad.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+    let mut out = vec![];
+    let mut t = 0.0;
+    while t < len {
+        let (mut s0, e0) = (t, (t + 4.0).min(len));
+        let mut pieces = vec![];
+        for &(b0, b1) in &bad {
+            if b1 <= s0 || b0 >= e0 {
+                continue;
+            }
+            if b0 > s0 {
+                pieces.push((s0, b0));
+            }
+            s0 = s0.max(b1);
+        }
+        if s0 < e0 {
+            pieces.push((s0, e0));
+        }
+        for (p0, p1) in pieces {
+            if p1 - p0 > 1e-6 {
+                out.push(Prim::Line {
+                    a: at(p0),
+                    b: at(p1),
+                    w,
+                    c: OUTLINE_RGB,
+                    dash: None,
+                });
+            }
+        }
+        t += 6.0;
+    }
+    out
 }
 
 fn place_row(b: &mut B, row: &Row, s: f64, r: R4, dropped: &[bool]) {
@@ -3967,15 +4109,81 @@ mod tests {
     /// Pins: the generator is a pure function of its parameters; a change here is a layout change.
     /// Layout 3 revision 1 (ArUco markers, dual-unit rulers, boards); revision 0 pins were f6aa3fda618d9b02 (A4@100),
     /// beeebc4399ab038c (Letter@100) and 6aaaebb13625058a (A3@50).
+    /// Revision 1 bytes changed once more when media outlines were clipped away from fiducials: before that
+    /// f8611b691b27e9bc (A4@100), 9e2ca63d82d82af6 (Letter@100) and 6200ed7de6f91e9e (A3@50).
     #[test]
     fn pinned_hashes() {
         for (paper, dpi, want) in [
-            ("A4", 100u32, 0xf861_1b69_1b27_e9bcu64),
-            ("LETTER", 100, 0x9e2c_a63d_82d8_2af6),
-            ("A3", 50, 0x6200_ed7d_e6f9_1e9e),
+            ("A4", 100u32, 0x8f7a_d861_b64a_829bu64),
+            ("LETTER", 100, 0xfa9a_dfe1_d133_3322),
+            ("A3", 50, 0xc423_93fb_c08d_88c4),
         ] {
             let (img, _) = render(&spec(paper, false, dpi));
             assert_eq!(fnv64(img.as_raw()), want, "{paper}@{dpi}");
+        }
+    }
+
+    /// Sheet-relative marks (outlines, frames, ticks, bleed probes) never put ink in the quiet zone of a
+    /// marker / board / bracket / ruler, and the outlines still exist in the free areas.
+    #[test]
+    fn sheet_marks_stay_out_of_fiducial_quiet_zones() {
+        for paper in ["A4", "LETTER", "A5", "A3", "LEGAL"] {
+            for dpi in [100u32, 150, 300] {
+                let sp = spec(paper, false, dpi);
+                let lay = build_layout(&sp);
+                let marks: std::collections::HashSet<String> = lay
+                    .els
+                    .iter()
+                    .filter(|e| e.group == "print_marks" || e.group == "frame")
+                    .map(|e| e.id.clone())
+                    .collect();
+                let only: Layout = Layout {
+                    prims: lay
+                        .prims
+                        .iter()
+                        .filter(|(id, _)| marks.contains(id))
+                        .cloned()
+                        .collect(),
+                    ..lay.clone()
+                };
+                let img = rasterize(&only);
+                let ko = outline_keep_out(&lay.els);
+                let k = sp.k();
+                for (id, q) in &ko {
+                    // the element rect itself plus half the quiet zone, minus one pixel of rounding
+                    let e = lay.els.iter().find(|e| &e.id == id).unwrap();
+                    let m = (e.rect[0] - q[0]) * 0.5;
+                    let (x0, y0, x1, y1) = (
+                        ((e.rect[0] - m) * k).ceil().max(0.0) as u32,
+                        ((e.rect[1] - m) * k).ceil().max(0.0) as u32,
+                        ((e.rect[2] + m) * k).floor() as u32,
+                        ((e.rect[3] + m) * k).floor() as u32,
+                    );
+                    for y in y0..y1.min(img.height()) {
+                        for x in x0..x1.min(img.width()) {
+                            assert!(
+                                img.get_pixel(x, y).0 == PAPER,
+                                "{paper}@{dpi}: sheet mark ink at {x},{y} inside quiet zone of {id}"
+                            );
+                        }
+                    }
+                }
+                // the outlines survive away from the fiducials
+                let outlines = Layout {
+                    prims: lay
+                        .prims
+                        .iter()
+                        .filter(|(id, _)| id.starts_with("outline_"))
+                        .cloned()
+                        .collect(),
+                    ..lay.clone()
+                };
+                let drawn = rasterize(&outlines)
+                    .pixels()
+                    .filter(|p| p.0 != PAPER)
+                    .count();
+                assert!(drawn > 100, "{paper}@{dpi}: outlines vanished ({drawn} px)");
+            }
         }
     }
 
