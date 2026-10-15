@@ -20,6 +20,8 @@ pdfcraft must not take a fakescan (or this package) dependency for normal builds
 
 Hard loopback is the “echo this page back” store: upload → CreateScanJob / WIA acquire → compare.
 
+Paper: a fake scanner starts with an empty feeder unless `initial_pages` is set (profile `feeder.initial_pages`, daemon `--initial-pages N`, per-device `initial_pages`; see `docs/multi-device.md` section 4a). It is reloaded on `POST /v1/reset`. Tests should still be explicit: `c.load_paper(6)` (= `set_pages(6)` + `set_feeder(True)`) or `c.empty_tray()` (= `set_pages(0)`).
+
 Modes are mutually exclusive: `POST /v1/loopback` clears pattern/side/scenario; `POST /v1/pages` (with or without side), `pattern`, or `scenario` clears the loopback store. Effects do **not** alter loopback JFIF bytes (exact echo).
 
 ```bash

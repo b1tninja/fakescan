@@ -77,6 +77,7 @@ fn manager_cfg(profiles: &Path, store: Option<Arc<RegistryStore>>) -> ManagerCon
         local_addr: "127.0.0.1:3920".parse().unwrap(),
         listen_key: "127.0.0.1:3920".into(),
         registry: store,
+        initial_pages: None,
     }
 }
 
@@ -1538,4 +1539,189 @@ async fn manage_startup_heals_a_stale_profile_changed_row_whose_profile_matches_
         Some(&json!(7)),
         "unknown fields preserved"
     );
+}
+
+// ── initial_pages: tray preload on create / reset (runtime state, not a capability) ──────────
+
+/// Profiles copy with `tray5-init3`: feeder-tray5 (capacity 5) that starts with 3 sheets.
+fn profiles_with_initial(tag: &str) -> PathBuf {
+    let dst = profiles_copy(tag);
+    let mut v: Value =
+        serde_json::from_str(&std::fs::read_to_string(dst.join("feeder-tray5.json")).unwrap())
+            .unwrap();
+    v["id"] = "tray5-init3".into();
+    v["feeder"]["initial_pages"] = 3.into();
+    std::fs::write(dst.join("tray5-init3.json"), v.to_string()).unwrap();
+    dst
+}
+
+async fn pages_of(srv: &Srv, prefix: &str) -> (u64, bool, u64) {
+    let (st, v) = srv
+        .json("GET", &format!("{prefix}/v1/status"), Value::Null)
+        .await;
+    assert_eq!(st, 200, "{v}");
+    (
+        v["pages_remaining"].as_u64().unwrap(),
+        v["feeder_ready"].as_bool().unwrap(),
+        v["initial_pages"].as_u64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn initial_pages_default_is_empty_and_profile_value_applies_after_reset() {
+    let mut cfg = base_cfg(
+        vec![
+            DeviceConfig::derived("default", "brother-wsd"),
+            DeviceConfig::derived("plain", "feeder-tray5"),
+            DeviceConfig::derived("loaded", "tray5-init3"),
+        ],
+        None,
+    );
+    cfg.profiles = profiles_with_initial("init-profile");
+    let srv = Srv::start(cfg).await;
+    // Nothing opts in: every existing profile still starts empty.
+    assert_eq!(pages_of(&srv, "").await, (0, false, 0));
+    assert_eq!(pages_of(&srv, "/d/plain").await, (0, false, 0));
+    // The opting-in profile starts loaded and ready.
+    assert_eq!(pages_of(&srv, "/d/loaded").await, (3, true, 3));
+    // A run-time POST /v1/pages overrides it ...
+    let (st, _) = srv
+        .json("POST", "/d/loaded/v1/pages", json!({"count": 1}))
+        .await;
+    assert_eq!(st, 200);
+    assert_eq!(pages_of(&srv, "/d/loaded").await.0, 1);
+    // ... and reset restores the initial stack; the other device is still empty after reset.
+    let (st, _) = srv.json("POST", "/d/loaded/v1/reset", Value::Null).await;
+    assert_eq!(st, 200);
+    assert_eq!(pages_of(&srv, "/d/loaded").await, (3, true, 3));
+    srv.json("POST", "/d/plain/v1/reset", Value::Null).await;
+    assert_eq!(pages_of(&srv, "/d/plain").await, (0, false, 0));
+    // The device listing carries it too.
+    let (_, list) = srv.json("GET", "/v1/devices", Value::Null).await;
+    let by = |id: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by("plain")["initial_pages"], 0);
+    assert_eq!(by("loaded")["initial_pages"], 3);
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn initial_pages_device_override_daemon_default_and_capacity_clamp() {
+    let mut own = DeviceConfig::derived("own", "tray5-init3");
+    own.initial_pages = Some(2);
+    let mut zero = DeviceConfig::derived("zero", "tray5-init3");
+    zero.initial_pages = Some(0);
+    let mut cfg = base_cfg(
+        vec![
+            DeviceConfig::derived("default", "feeder-tray5"),
+            own,
+            zero,
+            DeviceConfig::derived("prof", "tray5-init3"),
+        ],
+        None,
+    );
+    cfg.profiles = profiles_with_initial("init-override");
+    cfg.initial_pages = Some(9); // daemon-wide default; the tray holds 5
+    let srv = Srv::start(cfg).await;
+    // No own value: the daemon default, clamped to the 5-sheet tray.
+    assert_eq!(pages_of(&srv, "").await, (5, true, 5));
+    assert_eq!(pages_of(&srv, "/d/prof").await, (5, true, 5));
+    // Own values win over the daemon default and the profile, including an explicit 0.
+    assert_eq!(pages_of(&srv, "/d/own").await, (2, true, 2));
+    assert_eq!(pages_of(&srv, "/d/zero").await, (0, false, 0));
+    srv.json("POST", "/d/own/v1/pages", json!({"count": 0}))
+        .await;
+    srv.json("POST", "/d/own/v1/reset", Value::Null).await;
+    assert_eq!(pages_of(&srv, "/d/own").await, (2, true, 2));
+
+    // POST /v1/devices takes initial_pages; omitting it uses the daemon default.
+    let (st, v) = srv
+        .json(
+            "POST",
+            "/v1/devices",
+            json!({"id": "late", "profile": "feeder-tray50", "initial_pages": 6}),
+        )
+        .await;
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(v["initial_pages"], 6);
+    assert_eq!(pages_of(&srv, "/d/late").await, (6, true, 6));
+    let (st, _) = srv
+        .json(
+            "POST",
+            "/v1/devices",
+            json!({"id": "late2", "profile": "feeder-tray50"}),
+        )
+        .await;
+    assert_eq!(st, 201);
+    assert_eq!(pages_of(&srv, "/d/late2").await, (9, true, 9));
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn initial_pages_is_persisted_and_does_not_touch_fingerprints_or_install_state() {
+    let path = reg_path("init-registry");
+    let mut cfg = base_cfg(
+        vec![DeviceConfig::derived("default", "feeder-tray5")],
+        Some(path.clone()),
+    );
+    cfg.profiles = profiles_with_initial("init-registry-profiles");
+    let srv = Srv::start(cfg.clone()).await;
+    let (_, base) = srv.json("GET", "/v1/devices", Value::Null).await;
+    let base_cfg_info = base[0]["config"].clone();
+    let uuid = base[0]["uuid"].as_str().unwrap().to_string();
+    // Install the device, then add a loaded sibling with the same effective capabilities.
+    let (st, _) = srv
+        .json(
+            "POST",
+            "/v1/devices/default/installed",
+            json!({"wia_id":"{W}","wia_name":"x","wia_port":format!("urn:uuid:{uuid}/uri:{uuid}/ScannerService")}),
+        )
+        .await;
+    assert_eq!(st, 200);
+    let (st, v) = srv
+        .json(
+            "POST",
+            "/v1/devices",
+            json!({"id": "loaded", "profile": "feeder-tray5", "initial_pages": 4}),
+        )
+        .await;
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(
+        v["config"], base_cfg_info,
+        "same fingerprints as the empty twin"
+    );
+    // Switching the installed device to a profile that differs only in initial_pages is not
+    // a capability change: it stays installed, not stale.
+    let (st, v) = srv
+        .json(
+            "POST",
+            "/v1/devices/default/reconfigure",
+            json!({"profile": "tray5-init3"}),
+        )
+        .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["install"]["state"], "installed");
+    assert_eq!(v["needs_readd"], false);
+    assert_eq!(v["config"]["fingerprint"], base_cfg_info["fingerprint"]);
+    assert_eq!(v["initial_pages"], 3);
+    assert_eq!(pages_of(&srv, "").await, (3, true, 3), "reload applies it");
+    srv.stop().await;
+
+    let reg = Registry::load_from(&path).unwrap();
+    assert_eq!(reg.find("loaded").unwrap().initial_pages, Some(4));
+    assert_eq!(reg.find("default").unwrap().initial_pages, None);
+
+    // Restart from the registry alone: the row's own value comes back.
+    let mut cfg2 = base_cfg(vec![], Some(path.clone()));
+    cfg2.manage = true;
+    cfg2.profiles = cfg.profiles.clone();
+    let srv2 = Srv::start(cfg2).await;
+    assert_eq!(pages_of(&srv2, "/d/loaded").await, (4, true, 4));
+    srv2.stop().await;
 }

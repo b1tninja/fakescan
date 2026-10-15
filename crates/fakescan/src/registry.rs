@@ -108,6 +108,10 @@ pub struct DeviceRow {
     /// Shown in Windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub friendly_name: Option<String>,
+    /// This device's own `initial_pages` (tray preload on create/reset); absent = the daemon
+    /// default / the profile's. Runtime state: not part of `config` or any fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_pages: Option<u32>,
     /// What this device was when last started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<ConfigInfo>,
@@ -308,6 +312,7 @@ impl DeviceRow {
             device_uuid: device_uuid.into(),
             profile: profile.into(),
             friendly_name: None,
+            initial_pages: None,
             config: None,
             install: InstallInfo::default(),
             exe: None,
@@ -804,6 +809,29 @@ mod tests {
 
     fn profiles() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles")
+    }
+
+    #[test]
+    fn initial_pages_is_in_no_fingerprint() {
+        let t5 = Profile::load(&profiles(), "feeder-tray5").unwrap();
+        let mut loaded = t5.clone();
+        loaded.feeder.initial_pages = 5;
+        assert_eq!(config_fingerprint(&t5), config_fingerprint(&loaded));
+        assert_eq!(published_fingerprint(&t5), published_fingerprint(&loaded));
+        assert_eq!(config_info(&t5), config_info(&loaded));
+    }
+
+    #[test]
+    fn row_initial_pages_round_trips_and_is_optional() {
+        let mut r = row("a", "0.0.0.0:3920");
+        let plain = serde_json::to_value(&r).unwrap();
+        assert!(plain.get("initial_pages").is_none(), "absent when unset");
+        r.initial_pages = Some(6);
+        let back: DeviceRow = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(back.initial_pages, Some(6));
+        // An old registry file without the field still loads.
+        let old: DeviceRow = serde_json::from_value(plain).unwrap();
+        assert_eq!(old.initial_pages, None);
     }
 
     #[test]

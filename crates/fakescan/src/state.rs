@@ -139,6 +139,9 @@ pub struct World {
     lab_listen: Option<std::net::SocketAddr>,
     /// Synthetic pages available in the feeder (0 = empty / glass-only).
     pages_remaining: u32,
+    /// Per-device override of `profile.feeder.initial_pages` (`DeviceConfig` / daemon flag).
+    /// Survives reset and profile reloads; `None` = use the profile's value.
+    initial_pages_override: Option<u32>,
     /// Sheets in the stack at the last load (`set_pages`); consumed so far =
     /// `feeder_loaded - pages_remaining`. A job takes only the sheets it asked for.
     feeder_loaded: u32,
@@ -372,6 +375,9 @@ pub struct Status {
     pub pages_remaining: u32,
     /// Tray capacity in sheets (`feeder.capacity`); null = no tray limit.
     pub feeder_capacity: Option<u32>,
+    /// Sheets a fresh device, `POST /v1/reset` and a profile reload load into the tray
+    /// (device/daemon override, else `feeder.initial_pages`; clamped to capacity). 0 = empty.
+    pub initial_pages: u32,
     pub jam: bool,
     pub cover_open: bool,
     /// Double-feed / multi-pick sticky flag (`MultipleFeedError`).
@@ -649,6 +655,7 @@ impl World {
             lab_listen: None,
             feeder_ready: sticky,
             pages_remaining: 0,
+            initial_pages_override: None,
             feeder_loaded: 0,
             jam: false,
             cover_open: false,
@@ -1960,6 +1967,7 @@ impl World {
             duplex: self.profile.feeder.duplex,
             pages_remaining: self.pages_remaining,
             feeder_capacity: self.profile.feeder.capacity,
+            initial_pages: self.initial_pages(),
             jam: self.jam,
             cover_open: self.cover_open,
             multi_feed: self.multi_feed,
@@ -2092,11 +2100,43 @@ impl World {
         self.condition_history.clear();
         self.condition_raised_at.clear();
         self.pending_condition_changes.clear();
+        self.load_initial_pages();
         Ok(())
     }
 
     pub fn set_feeder(&mut self, ready: bool) {
         self.feeder_ready = ready;
+    }
+
+    /// Sheets loaded at creation, reset and profile reload: the per-device override if set,
+    /// else the profile's `feeder.initial_pages`, clamped to the tray `capacity` and
+    /// `pages_max`. Runtime state only; never part of a capability fingerprint.
+    pub fn initial_pages(&self) -> u32 {
+        let f = &self.profile.feeder;
+        let n = self.initial_pages_override.unwrap_or(f.initial_pages);
+        n.min(f.capacity.unwrap_or(u32::MAX)).min(f.pages_max)
+    }
+
+    /// Set (or clear with `None`) the per-device initial-pages override and load the tray
+    /// accordingly right away. Used when a device is created.
+    pub fn set_initial_pages_override(&mut self, n: Option<u32>) {
+        self.initial_pages_override = n;
+        self.load_initial_pages();
+    }
+
+    /// The per-device override, if any.
+    pub fn initial_pages_override(&self) -> Option<u32> {
+        self.initial_pages_override
+    }
+
+    /// Load the initial stack (as `set_pages` + `set_feeder(true)` would). A no-op for 0, so
+    /// an empty-by-default device is untouched.
+    fn load_initial_pages(&mut self) {
+        let n = self.initial_pages();
+        if n > 0 {
+            self.set_pages(n);
+            self.feeder_ready = true;
+        }
     }
 
     /// Set feeder page count only (keeps current side/order). Prefer [`Self::apply_pages`]
@@ -2216,6 +2256,7 @@ impl World {
         self.condition_history.clear();
         self.condition_raised_at.clear();
         self.pending_condition_changes.clear();
+        self.load_initial_pages();
         self.note("ctl", "reset", "ok", "cleared");
     }
 
@@ -4441,6 +4482,90 @@ mod tests {
         let t0 = Instant::now();
         let _ = w.retrieve_image(job.id, &job.token).expect("page");
         assert!(t0.elapsed().as_millis() >= 35);
+    }
+
+    /// feeder-tray5 (capacity 5, pages_max 5) with `feeder.initial_pages` set.
+    fn tray5_with_initial(initial: u32) -> World {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        let mut profile = Profile::load(&dir, "feeder-tray5").expect("profile");
+        profile.feeder.initial_pages = initial;
+        World::new(dir, profile)
+    }
+
+    #[test]
+    fn initial_pages_default_is_an_empty_feeder() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        for id in [
+            "brother-wsd",
+            "feeder-tray5",
+            "feeder-tray50",
+            "feeder-duplex30",
+            "feeder-a4only",
+        ] {
+            let mut w = World::new(dir.clone(), Profile::load(&dir, id).unwrap());
+            assert_eq!(w.initial_pages(), 0, "{id}");
+            assert_eq!(w.pages_remaining(), 0, "{id}");
+            w.set_initial_pages_override(None);
+            w.reset();
+            assert_eq!(w.pages_remaining(), 0, "{id}");
+            assert_eq!(w.status().initial_pages, 0, "{id}");
+        }
+    }
+
+    #[test]
+    fn initial_pages_loads_on_override_reset_and_profile_reload() {
+        let mut w = tray5_with_initial(0);
+        w.set_initial_pages_override(Some(4));
+        assert_eq!(w.pages_remaining(), 4);
+        assert!(w.feeder_ready());
+        assert_eq!(w.status().initial_pages, 4);
+        // A run-time set_pages still overrides ...
+        w.set_pages(1);
+        assert_eq!(w.pages_remaining(), 1);
+        // ... until the next reset, which restores the initial stack.
+        w.reset();
+        assert_eq!(w.pages_remaining(), 4);
+        assert!(w.feeder_ready());
+        w.set_pages(0);
+        w.set_feeder(false);
+        w.load_profile("feeder-tray5").unwrap();
+        assert_eq!(w.pages_remaining(), 4, "profile reload reapplies it");
+        assert!(w.feeder_ready());
+        // Clearing the override falls back to the profile's value (0).
+        w.set_initial_pages_override(None);
+        w.reset();
+        assert_eq!(w.pages_remaining(), 0);
+        assert!(!w.feeder_ready());
+    }
+
+    #[test]
+    fn profile_initial_pages_applies_and_override_wins() {
+        let mut w = tray5_with_initial(3);
+        assert_eq!(w.initial_pages(), 3);
+        w.reset();
+        assert_eq!(w.pages_remaining(), 3);
+        assert!(w.feeder_ready());
+        w.set_initial_pages_override(Some(2));
+        assert_eq!(w.pages_remaining(), 2);
+        w.set_initial_pages_override(Some(0));
+        w.reset();
+        assert_eq!(
+            w.pages_remaining(),
+            0,
+            "an explicit 0 beats the profile's 3"
+        );
+    }
+
+    #[test]
+    fn initial_pages_clamps_to_capacity() {
+        let mut w = tray5_with_initial(99);
+        assert_eq!(w.initial_pages(), 5);
+        w.reset();
+        assert_eq!(w.pages_remaining(), 5);
+        w.set_initial_pages_override(Some(6));
+        assert_eq!(w.pages_remaining(), 5);
+        assert_eq!(w.status().initial_pages, 5);
+        assert_eq!(w.status().feeder_capacity, Some(5));
     }
 
     #[test]

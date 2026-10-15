@@ -40,6 +40,12 @@ struct Args {
     #[arg(long)]
     no_wsd: bool,
 
+    /// Load N sheets into every device's feeder at start and on reset (devices that set their
+    /// own `initial_pages` keep it; clamped to tray capacity). Default: each profile's
+    /// `feeder.initial_pages`, which is 0 (empty) in every shipped profile.
+    #[arg(long, value_name = "N")]
+    initial_pages: Option<u32>,
+
     /// Directory of capability profiles (JSON).
     #[arg(long, default_value = "profiles")]
     profiles: PathBuf,
@@ -246,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
             registry,
             manage: args.manage,
             allow_foreign_uuid: args.allow_foreign_uuid,
+            initial_pages: args.initial_pages,
         },
         Some(ready_tx),
         Some(stop_rx),

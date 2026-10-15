@@ -82,6 +82,8 @@ curl -X POST http://127.0.0.1:3920/v1/scenario \
   -H "content-type: application/json" -d '{"id":"order"}'
 ```
 
+A fake scanner starts with an empty feeder, so a feeder scan fails until paper is loaded. Load it per run (`POST /v1/pages`, or `load_paper(n)` in fakescan-python) or start with paper: `fakescan --initial-pages 6` (every device without its own value), per device `initial_pages` in `POST /v1/devices`, or a profile's `feeder.initial_pages`. The default stays 0; see [docs/multi-device.md](docs/multi-device.md) section 4a.
+
 Read-only, in this tree (they show up after the next start): `GET /v1/jobs` (scan-task list), `GET /v1/activity?after=SEQ`, and `GET /v1/log?after=SEQ` (last 64 calls; `after` returns only newer events). `GET /v1/trace` is the activity JSON. `POST /v1/ctl` takes `jobs` and `activity`. An older binary still on `:3920` answers 404 for `/v1/jobs`, `/v1/activity`, and `/v1/log`. Shapes and `.\scripts\fakescan.ps1 jobs`, `activity`, `log`, `wia-trace`: [docs/lab-harness.md](docs/lab-harness.md).
 
 ## Status

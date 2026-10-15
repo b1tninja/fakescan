@@ -63,6 +63,13 @@ pub struct FeederCaps {
     /// Loading more via `POST /v1/pages` is refused (see `PagesError`).
     #[serde(default)]
     pub capacity: Option<u32>,
+    /// Sheets loaded into the tray when the device's world is created and on every reset or
+    /// profile reload (clamped to `capacity` / `pages_max`; a loaded tray also makes the
+    /// feeder ready). Default 0 = start empty. Runtime state, not a published capability: it
+    /// is in neither registry fingerprint. A device or the daemon can override it
+    /// (`--initial-pages`, `DeviceConfig::initial_pages`).
+    #[serde(default)]
+    pub initial_pages: u32,
     /// Sheet sizes the ADF accepts (`letter`, `a4`, `legal`). Absent/empty = unrestricted
     /// (today's behavior: ADF max 8500x14000, any InputMediaSize).
     #[serde(default)]

@@ -26,6 +26,7 @@ Fake example values: name **Fake WSD scanner**, advertise `192.168.1.70:3920`, U
    pdfcraft-cli scan --out DIR --yes --device "Fake WSD scanner" \
      --source glass --pages 1 --dpi 100 --format png
    ```
+   (The feeder starts empty; for a GUI feeder scan either load paper first, or start the daemon with `--initial-pages 6`, which also reloads it on `POST /v1/reset`; see `docs/multi-device.md` section 4a.)
 9. **Control plane** — `/v1` pages, feeder, slow, fault/jam/cover still work without re-install (`.\scripts\fakescan.ps1 pages …`).
 
 ## After fakescan restart

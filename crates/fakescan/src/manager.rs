@@ -46,6 +46,8 @@ pub struct ManagerConfig {
     /// Registry to persist device rows and install state to. `None` = in-memory only (embedded
     /// servers never touch a registry file).
     pub registry: Option<Arc<RegistryStore>>,
+    /// Default `initial_pages` for devices that set none (`--initial-pages`).
+    pub initial_pages: Option<u32>,
 }
 
 /// Reason recorded when a reconfigure (or a changed profile file) alters what Windows cached.
@@ -346,6 +348,8 @@ impl DeviceManager {
             },
             self.cfg.local_addr,
         );
+        // Per-device value, else the daemon-wide default, else the profile's own.
+        w.set_initial_pages_override(dc.initial_pages.or(self.cfg.initial_pages));
         let (dev_exit_tx, mut dev_exit_rx) = tokio::sync::watch::channel(false);
         w.arm_exit(dev_exit_tx);
         let fwd = Arc::clone(&self.exit_tx);
@@ -367,6 +371,7 @@ impl DeviceManager {
             uuid: dc.device_uuid,
             profile: dc.profile.clone(),
             friendly_name: friendly_name.clone(),
+            initial_pages: w.initial_pages(),
             scan_endpoint: scan_ep,
             device_endpoint: device_ep.clone(),
             install: None,
@@ -467,6 +472,7 @@ impl DeviceManager {
                     r.listen = listen;
                     r.profile = dc.profile.clone();
                     r.friendly_name = Some(friendly.to_string());
+                    r.initial_pages = dc.initial_pages;
                     // The profile file may have changed while we were down.
                     apply_published_fingerprint(r, ci);
                     r.config = Some(ci.clone());
@@ -481,6 +487,7 @@ impl DeviceManager {
                         r.harness = old.harness;
                     }
                     r.friendly_name = Some(friendly.to_string());
+                    r.initial_pages = dc.initial_pages;
                     r.config = Some(ci.clone());
                     reg.upsert(r);
                 }
@@ -541,6 +548,7 @@ impl DeviceManager {
         }
         dev.cfg.profile = profile_id.to_string();
         dev.info.profile = profile_id.to_string();
+        dev.info.initial_pages = dev.world.read().await.initial_pages();
         let row = dev.row.clone();
         let pid = profile_id.to_string();
         self.store.update(|reg| {

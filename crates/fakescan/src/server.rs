@@ -42,6 +42,10 @@ pub struct DeviceConfig {
     pub device_uuid: Uuid,
     /// Shown in Windows; defaults to `fakescan <id>` (`fakescan` for the default device).
     pub friendly_name: Option<String>,
+    /// Sheets loaded into this device's tray at creation and on reset / profile reload.
+    /// `None` = the daemon default ([`ServerConfig::initial_pages`]), else the profile's
+    /// `feeder.initial_pages` (0 unless a profile opts in). Runtime state, not a capability.
+    pub initial_pages: Option<u32>,
     /// Lab-safety override, default `false`: accept a device UUID outside
     /// [`lab::FAKE_UUID_PREFIX`]. Never reachable from the control plane (`POST /v1/devices`).
     #[serde(skip)]
@@ -55,6 +59,7 @@ impl DeviceConfig {
             profile: profile.into(),
             device_uuid,
             friendly_name: None,
+            initial_pages: None,
             allow_foreign_uuid: false,
         }
     }
@@ -113,6 +118,9 @@ pub struct ServerConfig {
     /// Lab-safety override (default `false`): devices restored from the registry (`manage`) may
     /// use UUIDs outside [`lab::FAKE_UUID_PREFIX`].
     pub allow_foreign_uuid: bool,
+    /// Daemon-wide default for devices that set no `initial_pages` of their own
+    /// (`--initial-pages N`). `None` = each profile's `feeder.initial_pages` (0 by default).
+    pub initial_pages: Option<u32>,
 }
 
 impl ServerConfig {
@@ -138,6 +146,7 @@ impl ServerConfig {
             registry: None,
             manage: false,
             allow_foreign_uuid: false,
+            initial_pages: None,
         }
     }
 }
@@ -150,6 +159,9 @@ pub struct DeviceInfo {
     pub uuid: Uuid,
     pub profile: String,
     pub friendly_name: String,
+    /// Sheets a reset loads into the tray (device/daemon override, else the profile's
+    /// `feeder.initial_pages`, clamped to capacity). 0 = starts empty. Runtime state.
+    pub initial_pages: u32,
     /// `null` when WSD is off.
     pub scan_endpoint: Option<String>,
     pub device_endpoint: Option<String>,
@@ -203,6 +215,7 @@ pub async fn serve(
             let mut dc = DeviceConfig::new(row.name.clone(), row.profile.clone(), uuid);
             dc.allow_foreign_uuid = cfg.allow_foreign_uuid;
             dc.friendly_name = row.friendly_name.clone();
+            dc.initial_pages = row.initial_pages;
             devices.push(dc);
         }
         info!(count = devices.len(), listen = %cfg.listen, "--manage: brought up registry rows");
@@ -252,6 +265,7 @@ pub async fn serve(
         local_addr,
         listen_key: cfg.listen.to_string(),
         registry: store,
+        initial_pages: cfg.initial_pages,
     });
     for d in &devices {
         manager.add(d.clone()).await?;
@@ -473,6 +487,8 @@ struct AddDeviceBody {
     profile: String,
     device_uuid: Option<Uuid>,
     friendly_name: Option<String>,
+    /// Sheets to load at creation and on reset; omitted = the daemon default / the profile's.
+    initial_pages: Option<u32>,
 }
 
 async fn add_device(
@@ -486,6 +502,7 @@ async fn add_device(
         None => DeviceConfig::derived(body.id, body.profile),
     };
     dc.friendly_name = body.friendly_name;
+    dc.initial_pages = body.initial_pages;
     match manager.add(dc).await {
         Ok(info) => (axum::http::StatusCode::CREATED, Json(info)).into_response(),
         Err(e) => {

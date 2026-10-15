@@ -230,6 +230,7 @@ async fn harness(tag: &str) -> Harness {
         local_addr: addr,
         listen_key: addr.to_string(),
         registry: None,
+        initial_pages: None,
     });
     manager
         .add(DeviceConfig::derived("default", "brother-wsd"))

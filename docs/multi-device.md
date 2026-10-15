@@ -37,7 +37,7 @@ cosmetic and never decide whether a device is ours.
 
 | Path | Meaning |
 |------|---------|
-| `GET /v1/devices` | `[{id, uuid, profile, friendly_name, scan_endpoint, device_endpoint}]` |
+| `GET /v1/devices` | `[{id, uuid, profile, friendly_name, initial_pages, scan_endpoint, device_endpoint, ...}]` |
 | `/v1/*`, `/ScannerService`, `/WebServices/Device` | **legacy aliases of the `default` (first) device**; unchanged behavior |
 | `/d/{id}/v1/*` | the full control plane, scoped to device `{id}` |
 | `/d/{id}/ScannerService`, `/d/{id}/WebServices/Device` (+ trailing-slash and `/WebServices/ScannerService` variants) | that device's WSD endpoints |
@@ -72,6 +72,41 @@ Profile `feeder` block gains (all optional, backwards compatible, defaults = tod
   `feeder-duplex30` (capacity 30, duplex), `feeder-a4only` (capacity 20, a4 only), `glass-wsd` (no feeder, exists).
   All are WSD, jfif, same imaging caps as `brother-wsd`.
 
+### 4a. Initial pages (preloaded tray; runtime state)
+
+Every fake scanner starts with an empty feeder (`pages_remaining` 0), so a feeder scan is refused until
+paper is loaded (`POST /v1/pages`, then the feeder flag). `initial_pages` is an opt-in to start with paper
+instead. It never changes today's behavior unless something sets it.
+
+| Source | Where | Wins over |
+|--------|-------|-----------|
+| Profile | `feeder.initial_pages` (optional, default 0) | nothing (lowest) |
+| Daemon | `fakescan --initial-pages N`, `ServerConfig::initial_pages` | the profile |
+| Device | `DeviceConfig::initial_pages`, `POST /v1/devices {"initial_pages": N}`, registry row `initial_pages` | the daemon flag and the profile (an explicit 0 means "empty") |
+
+- When a device's world is created, and on every `POST /v1/reset` and profile reload, the feeder is
+  loaded with `min(initial_pages, capacity, pages_max)` sheets and `feeder_ready` becomes true, exactly as
+  `POST /v1/pages {count}` plus the feeder flag would. 0 leaves the device untouched.
+- `POST /v1/pages` (or the Python `set_pages`) still overrides it at run time; the next reset restores the
+  initial stack.
+- It is RUNTIME state, not a published capability: it is in neither registry fingerprint and never marks
+  an installed device `stale` (no re-Add in Imaging).
+- `GET /v1/status` and each `GET /v1/devices` row report the effective `initial_pages` (after the
+  capacity clamp). The registry row stores the device's own value only (absent = inherit), so a
+  `--manage` restart brings it back.
+- The shipped profiles (`brother-wsd`, `feeder-tray5`, `feeder-tray50`, `feeder-duplex30`,
+  `feeder-a4only`, ...) keep the default 0. A lab that wants paper loaded sets it explicitly, for example
+  a daemon whose devices all start with six sheets:
+
+```text
+fakescan --manage --initial-pages 6                  # every device without its own value
+fakescan --device tray5=feeder-tray5 --initial-pages 6   # clamped to the 5-sheet tray -> 5
+curl -X POST http://127.0.0.1:3920/v1/devices -d '{"id":"loaded","profile":"feeder-tray50","initial_pages":6}'
+```
+
+or a profile of its own (`profiles/feeder-tray50-loaded.json` = `feeder-tray50` with
+`"feeder": {..., "initial_pages": 6}`).
+
 ## 5. Python (fakescan-python)
 
 ```python
@@ -81,6 +116,9 @@ with Server(devices=[Device("tray5", profile="feeder-tray5"),
     srv.devices["tray5"].client().set_pages(5)      # Client scoped to /d/tray5
     srv.devices["tray5"].scan_endpoint              # http://127.0.0.1:PORT/d/tray5/ScannerService
     srv.devices["tray5"].uuid
+# Preloaded tray / explicit paper (see 4a): Device("tray5", profile="feeder-tray5", initial_pages=5),
+#   client.load_paper(6) == set_pages(6) + set_feeder(True); client.empty_tray() == set_pages(0);
+#   client.status().initial_pages.
 # Server() with no devices == one "default" device (today's behavior); srv.client() is the default device's.
 Client(base_url, device="tray5")                    # explicit scoping against any server
 ```
