@@ -60,9 +60,11 @@ curl -X POST http://127.0.0.1:3920/v1/pattern \
 | `align` | Alignment / registration crosses — centre accent crosshair, corner registration crosses with open-square surrounds, mid-edge marks, and tick marks at regular intervals along all four edges |
 | `grid` | Margin frames + scale rules — inner 0.5-inch margin frame, light inch-grid, and ruler ticks (inch + quarter-inch) along all four edges; page is letter (8.5 × 11 in) so tick spacing scales with DPI |
 | `lines` | Resolution line ladder — six coarse-to-fine horizontal line groups (left half) and the same six frequencies as vertical lines (right half); half-periods 32, 16, 8, 4, 3, 2 px so effective lpi scales with DPI |
-| `diag` | **Self-describing diagnostic page** for blind analysis of image-handling mistakes (flip / mirror / rotate / invert / BGR / bit order / stride shear / scale / crop / threshold); laid out in millimetres — see "diag layout" below |
+| `diag` / `diag_v1` | **Self-describing diagnostic page** for blind analysis of image-handling mistakes (flip / mirror / rotate / invert / BGR / bit order / stride shear / scale / crop / threshold); laid out in millimetres — see "diag layout" below |
 
 ## diag layout
+
+> **Layout v2** (the default `diag`) adds print marks, rulers, resolution / colour targets and geometry on top of everything below, which is unchanged (`diag_v1` renders the old page byte for byte). The QR payload gains `|lay=2`. See [diag-page-v2.md](diag-page-v2.md), the ground-truth layout JSON and the Python analyzer (`fakescan.diag`).
 
 `diag` is a byte-order-mark for pixels: any plausible handling mistake leaves a signature a blind
 analyzer can read from the image alone (analyzer: `pdfcraft_fakescan.pattern_analyzer`, see

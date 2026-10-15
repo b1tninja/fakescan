@@ -2,6 +2,7 @@
 
 pub mod ctl;
 pub mod daemon;
+pub mod diag_v2;
 pub mod discovery;
 pub mod effects;
 pub mod image_charts;

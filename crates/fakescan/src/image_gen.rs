@@ -126,7 +126,10 @@ pub enum PatternId {
     /// Resolution line ladder: coarse-to-fine horizontal and vertical line groups.
     Lines,
     /// Self-describing diagnostic page (fiducials, wedge, strips, position array, QR); see `diag`.
+    /// Renders layout v2 (v1 content plus print marks, resolution, colour; see `diag_v2`).
     Diag,
+    /// The original layout-v1 diag page, byte-identical to what `Diag` rendered before layout v2.
+    DiagV1,
 }
 
 impl PatternId {
@@ -150,6 +153,7 @@ impl PatternId {
         PatternId::Grid,
         PatternId::Lines,
         PatternId::Diag,
+        PatternId::DiagV1,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -173,6 +177,15 @@ impl PatternId {
             PatternId::Grid => "grid",
             PatternId::Lines => "lines",
             PatternId::Diag => "diag",
+            PatternId::DiagV1 => "diag_v1",
+        }
+    }
+
+    /// Name carried on the wire (QR `pat=`, banner): `diag_v1` is still a `diag` page.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            PatternId::DiagV1 => "diag",
+            other => other.as_str(),
         }
     }
 
@@ -197,6 +210,7 @@ impl PatternId {
             "grid" => Ok(PatternId::Grid),
             "lines" => Ok(PatternId::Lines),
             "diag" => Ok(PatternId::Diag),
+            "diag_v1" | "diag-v1" => Ok(PatternId::DiagV1),
             other => bail!(
                 "unknown pattern {other:?}; expected one of: {}",
                 PatternId::ALL
@@ -220,6 +234,8 @@ pub struct QrPayload {
     pub page: u32,
     pub pattern: PatternId,
     pub side: Option<PageSide>,
+    /// Page layout version (`lay=N`); `None` = absent = layout 1 (every page before layout v2).
+    pub layout: Option<u32>,
 }
 
 /// Build the QR text payload for a page.
@@ -227,7 +243,7 @@ pub fn qr_payload(pattern: PatternId, page_index: u32, side: Option<PageSide>) -
     let side = side.map(|s| s.as_str()).unwrap_or("none");
     format!(
         "{QR_SCHEME}|page={page_index}|pat={}|side={side}",
-        pattern.as_str()
+        pattern.wire_name()
     )
 }
 
@@ -240,11 +256,14 @@ pub fn parse_qr_payload(text: &str) -> Option<QrPayload> {
     let mut page = None;
     let mut pattern = None;
     let mut side = None;
+    let mut layout = None;
     for part in text.split('|').skip(2) {
         if let Some(v) = part.strip_prefix("page=") {
             page = v.parse().ok();
         } else if let Some(v) = part.strip_prefix("pat=") {
             pattern = PatternId::parse(v).ok();
+        } else if let Some(v) = part.strip_prefix("lay=") {
+            layout = v.parse().ok();
         } else if let Some(v) = part.strip_prefix("side=") {
             side = match v {
                 "none" | "" => None,
@@ -256,6 +275,7 @@ pub fn parse_qr_payload(text: &str) -> Option<QrPayload> {
         page: page?,
         pattern: pattern?,
         side,
+        layout,
     })
 }
 
@@ -625,7 +645,8 @@ pub fn render_pattern_rgb_ctx(
         PatternId::Align => crate::image_charts::draw_align(w, h, page_index),
         PatternId::Grid => crate::image_charts::draw_grid(w, h, page_index),
         PatternId::Lines => crate::image_charts::draw_lines(w, h, page_index),
-        PatternId::Diag => diag::draw_diag(w, h, diag::effective_dpi(dpi)),
+        PatternId::Diag => diag::draw_diag_v(w, h, diag::effective_dpi(dpi), 2),
+        PatternId::DiagV1 => diag::draw_diag_v(w, h, diag::effective_dpi(dpi), 1),
     };
     if opts.stamp_banner {
         let banner = pattern_banner(pattern, page_index, effective_side);
@@ -634,7 +655,11 @@ pub fn render_pattern_rgb_ctx(
 
     if opts.stamp_qr {
         // Append `|client=<ip>` to the QR when a peer is available (Info/Anac or any pattern).
-        let base = qr_payload(pattern, page_index, effective_side);
+        let mut base = qr_payload(pattern, page_index, effective_side);
+        if pattern == PatternId::Diag {
+            // Layout version rides in the payload; v1 pages (and older builds) omit it.
+            base.push_str(&format!("|lay={}", crate::diag_v2::LAYOUT_VERSION));
+        }
         let payload = match ctx
             .and_then(|c| c.peer.as_deref())
             .filter(|p| !p.is_empty() && *p != "-")
@@ -642,7 +667,7 @@ pub fn render_pattern_rgb_ctx(
             Some(peer) => format!("{base}|client={peer}"),
             None => base,
         };
-        if pattern == PatternId::Diag {
+        if matches!(pattern, PatternId::Diag | PatternId::DiagV1) {
             let e = diag::effective_dpi(dpi);
             stamp_qr(
                 &mut img,
@@ -673,7 +698,7 @@ pub fn pattern_banner(pattern: PatternId, page_index: u32, side: Option<PageSide
         .iter()
         .find(|s| s.pattern == pattern)
         .map(|s| s.title)
-        .unwrap_or(pattern.as_str());
+        .unwrap_or(pattern.wire_name());
     let side = side.map(|s| s.as_str()).unwrap_or("-");
     format!("{step}  P{page_index}  {side}")
 }
@@ -723,7 +748,7 @@ pub(crate) fn draw_glyph(
     5 * scale
 }
 
-fn glyph_rows(ch: char) -> [u8; 7] {
+pub(crate) fn glyph_rows(ch: char) -> [u8; 7] {
     // 5-bit rows, MSB = left pixel.
     match ch.to_ascii_uppercase() {
         ' ' => [0, 0, 0, 0, 0, 0, 0],
@@ -1316,7 +1341,7 @@ fn encode_bmp(img: RgbImage, dpi: u32) -> Result<Vec<u8>> {
 }
 
 /// BT.601-ish luma used by every gray / bilevel conversion here.
-fn luma8(p: &image::Rgb<u8>) -> u8 {
+pub(crate) fn luma8(p: &image::Rgb<u8>) -> u8 {
     ((u32::from(p[0]) * 77 + u32::from(p[1]) * 150 + u32::from(p[2]) * 29) >> 8) as u8
 }
 
@@ -3492,7 +3517,17 @@ pub mod diag {
         (px(COMB_WIDTH_MM, dpi) / 8) * 8 + COMB_TAIL_PX
     }
 
-    /// Render the diag page (no banner / QR; those are stamped by the caller).
+    /// Render the diag page for a layout `version` (1 = original, 2 = v1 plus the
+    /// `diag_v2` elements, which only occupy areas v1 leaves empty).
+    pub fn draw_diag_v(w: u32, h: u32, dpi: u32, version: u32) -> RgbImage {
+        let mut img = draw_diag(w, h, dpi);
+        if version >= 2 {
+            crate::diag_v2::draw(&mut img, dpi);
+        }
+        img
+    }
+
+    /// Render the layout-v1 diag page (no banner / QR; those are stamped by the caller).
     pub fn draw_diag(w: u32, h: u32, dpi: u32) -> RgbImage {
         let mut img: RgbImage = ImageBuffer::from_pixel(w, h, PAPER);
 
@@ -3709,9 +3744,12 @@ pub mod diag {
             let grids = prepared.detect_grids();
             assert!(!grids.is_empty(), "QR not found on thresholded diag page");
             let (_m, text) = grids[0].decode().expect("decode");
-            assert_eq!(text, qr_payload(PatternId::Diag, 7, None));
+            assert_eq!(
+                text,
+                format!("{}|lay=2", qr_payload(PatternId::Diag, 7, None))
+            );
             let p = parse_qr_payload(&text).unwrap();
-            assert_eq!((p.page, p.pattern), (7, PatternId::Diag));
+            assert_eq!((p.page, p.pattern, p.layout), (7, PatternId::Diag, Some(2)));
         }
 
         #[test]
@@ -3981,6 +4019,30 @@ pub mod diag {
                 }
             }
             assert!(lo < 15 && hi > 240);
+        }
+
+        fn fnv64(bytes: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        }
+
+        /// Layout v1 must stay byte-identical to what `diag` rendered before layout v2
+        /// (hashes taken from the pre-v2 build; banner and QR included).
+        #[test]
+        fn diag_v1_is_byte_identical_to_the_pre_v2_page() {
+            for (dpi, want) in [
+                (100u32, 0x56b9_0782_c132_0453u64),
+                (200, 0xa470_196f_51b5_cdd6),
+            ] {
+                let (a, _) = render_pattern_rgb(PatternId::DiagV1, dpi, 0, None).unwrap();
+                assert_eq!(fnv64(a.as_raw()), want, "dpi {dpi}");
+            }
+            let t = parse_qr_payload(&qr_payload(PatternId::DiagV1, 0, None)).unwrap();
+            assert_eq!((t.pattern, t.layout), (PatternId::Diag, None));
         }
 
         #[test]
