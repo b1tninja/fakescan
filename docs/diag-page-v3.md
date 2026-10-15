@@ -158,10 +158,32 @@ headline figures. Revision-1 additions:
 * `markers`: `detector` (`cv2` or `python`), `n_expected` / `n_found`, `missing`, `per_marker[id]` (decoded id, rotation,
   mirror, `corner_err_mm` per corner, `max_err_mm`, `max_err_px`, `centre_err_px`), `rms_corner_err_mm`,
   `affine` (scale x / y, dpi x / y, rotation, `mirrored`, residual in mm from the marker corners alone), `homography`
-  (matrix, `residual_rms_mm`, `residual_max_mm`), `orientation` (`upright`, `rot180`, `flip_h`, `flip_v`, ...). The pure-Python
-  detector decodes the marker under the fitted page affine in a +-3 mm window and refines the outer border to a sub-pixel
-  quad (edge profiles on the four sides, line fits); `cv2.aruco` (`CORNER_REFINE_SUBPIX`) is used instead when `cv2` with the
-  aruco module is importable (`detector="auto"`; `"python"` / `"cv2"` force one).
+  (matrix, `residual_rms_mm`, `residual_max_mm`), `orientation`. The pure-Python
+  detector locates each marker near the fitted page affine (+-3 mm window; the ring-contrast locator returns the centroid
+  of its plateau, which is good to a fraction of a module) and refines the outer border to a sub-pixel quad: edge profiles
+  at quarter-pixel spacing on the four sides, each reduced to the **integral of the ink fraction** along the profile (the
+  exact edge position for an area-averaged raster or any symmetric blur; a mid-level crossing is biased by up to a quarter
+  pixel depending on the edge's sub-pixel phase), a robust (Theil-Sen, then least squares) line per side so one profile that
+  crosses a neighbouring feature is dropped, and the corners as the line intersections. The position is re-centred on the fitted
+  quad and refined again before the payload is read. On clean renders every marker is found and the worst corner is
+  under 0.3 px at 100-600 dpi on A4 / Letter / A5 (in practice 0.01-0.1 px; exceptions are markers with real ink on their
+  edge, such as the Statement media outline crossing ChArUco markers on Letter). `cv2.aruco` (`CORNER_REFINE_SUBPIX`) is
+  used instead when `cv2` with the aruco module is importable (`detector="auto"`; `"python"` / `"cv2"` force one).
+* `markers.orientation`: the dihedral state of the received page, one of `upright`, `rot90`, `rot180`, `rot270` (the page
+  turned that many degrees clockwise), `flip_h`, `flip_v`, `transpose` (mirrored along the top-left to bottom-right diagonal, PIL
+  `Image.TRANSPOSE`) and `anti_transpose` (`Image.TRANSVERSE`); `unknown` when no marker was read. Every decoded marker carries
+  the transform of the page in its own module pattern (the decoder tries the 8 symmetries) and its decoded id says where on
+  an upright sheet it belongs; each state is scored by the markers whose pattern transform equals it plus the markers whose
+  decoded id sits, under that state, where it was found, so a page rotated 180 degrees (every marker decodes as another
+  id) is `rot180`. `fix` is the PIL `Image.Transpose` member that restores the page, `ambiguous` flags a tie.
+  `fakescan.diag_markers.detect_orientation(image, layout)` needs no page fit and so also names the axis-swapping states:
+  the raster is transformed by each of the eight fixes and the fix under which most of the eight edge / corner markers decode
+  as themselves wins. When the page fit fails (a rotated-by-90 raster has no crosses where they belong) `analyze_v3` still sets
+  `summary.marker_orientation` and `markers.orientation` from it.
+* `scan_dpi` (`analyze_v3` / `analyze_diag_page`): the resolution the raster is supposed to have. The page fit's plausibility test
+  (scale within 0.4x..2.5x of nominal, skew under 20 degrees) and all dpi-relative figures use it; without it the layout's
+  `dpi_effective` is assumed. A layout generated at 400 dpi (the fakeprint PDF adapter) analysed on a 150 dpi raster needs
+  `scan_dpi=150`; a raster whose scale is implausible for `scan_dpi` is still refused (`fit: failed`).
 * `rulers`: per axis (`x`, `y`) and unit (`mm`, `in`) the longest ruler: `dpi`, `baseline_mm`, `length_error_mm` (absolute error
   of the outermost ticks over the baseline), `pitch_error_pct`; the same per ruler under `elements`.
 * `elements.chessboard` / `charuco_board` / `circle_grid` (corner count, mean / max error in mm; corner interpolation needs cv2,
