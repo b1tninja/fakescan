@@ -1582,14 +1582,14 @@ pub fn v2_regions(dpi: u32) -> Vec<diag::RectMm> {
 /// Render the diag page for a layout version (banner and QR included) as RGB.
 pub fn render(dpi: u32, page: u32, version: u32) -> anyhow::Result<RgbImage> {
     let pat = if version >= 2 {
-        image_gen::PatternId::Diag
+        image_gen::PatternId::DiagV2
     } else {
         image_gen::PatternId::DiagV1
     };
     Ok(image_gen::render_pattern_rgb(pat, dpi, page, None)?.0)
 }
 
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &b in data {
         crc ^= b as u32;

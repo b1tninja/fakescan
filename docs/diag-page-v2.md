@@ -2,7 +2,7 @@
 
 ![layout v2 at 100 dpi](diag-page-v2.png)
 
-`diag` is the self-describing test page ([patterns.md](patterns.md#diag-layout)). Layout v2 keeps every layout-v1 element
+`diag_v2` is the fixed-size self-describing test page ([patterns.md](patterns.md#diag-layout)); the default `diag` is now the parametric [layout v3](diag-page-v3.md). Layout v2 keeps every layout-v1 element
 exactly where it was (fiducials, correlation strips, wedge, patches, bit comb, 1-px bars, raw strip, position array,
 zone plate, QR) and adds print marks, rulers, resolution, colour and geometry targets in the areas v1 left empty, so one
 page serves scanning, printing and print-then-scan loops. Pixels outside the v2 element boxes are identical to v1 (Rust
@@ -12,7 +12,7 @@ Selecting the layout:
 
 | Pattern id | Page |
 |------------|------|
-| `diag` | layout v2 (default); the QR payload gains `\|lay=2`: `fakescan\|v1\|page=0\|pat=diag\|side=none\|lay=2` |
+| `diag_v2` | layout v2 (selected by `diag` before layout v3 became the default; `diag` now renders [layout v3](diag-page-v3.md)); the QR payload gains `\|lay=2`: `fakescan\|v1\|page=0\|pat=diag\|side=none\|lay=2` |
 | `diag_v1` | the original layout, byte-identical to what `diag` rendered before v2; QR carries no `lay` (a missing `lay` means layout 1, so decoders for old pages keep working) |
 
 ## Coordinate system, determinism, colour
@@ -70,9 +70,9 @@ x and y scale by eye: the 190 mm bar and the 5 in ruler must measure their nomin
 
 ```python
 from fakescan import diag
-layout = diag.diag_page_layout(100)          # dict, same data as fakescan::diag_v2::layout_json
-img = diag.render_diag_page(100)             # PIL image, banner and QR included
-png = diag.render_diag_png(100)              # bytes, sRGB declared
+layout = diag.diag_page_layout(100, version=2)   # dict, same data as fakescan::diag_v2::layout_json
+img = diag.render_diag_page(100, version=2)      # PIL image, banner and QR included
+png = diag.render_diag_png(100, version=2)       # bytes, sRGB declared
 report = diag.analyze_diag_page(scan, layout)  # per-element report (below)
 ```
 

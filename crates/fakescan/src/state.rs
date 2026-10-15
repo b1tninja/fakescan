@@ -5238,7 +5238,7 @@ mod tests {
     #[test]
     fn pattern_selection_affects_retrieve_and_status() {
         let mut w = brother_wsd();
-        assert_eq!(w.status().image_pattern, "page_id");
+        assert_eq!(w.status().image_pattern, "diag");
         w.set_image_pattern_id("wedges").unwrap();
         assert_eq!(w.image_pattern(), PatternId::Wedges);
         assert_eq!(w.status().image_pattern, "wedges");
@@ -5254,7 +5254,7 @@ mod tests {
         let expected = image_gen::jpeg_pattern(PatternId::Wedges, 100, 0).unwrap();
         assert_eq!(bytes, expected);
         w.reset();
-        assert_eq!(w.status().image_pattern, "page_id");
+        assert_eq!(w.status().image_pattern, "diag");
     }
 
     #[test]
@@ -5350,7 +5350,7 @@ mod tests {
         w.set_loopback(&LoopbackBody { pages: vec![b64] }).unwrap();
         assert!(w.loopback_active());
         assert_eq!(w.page_side(), None);
-        assert_eq!(w.image_pattern(), PatternId::PageId);
+        assert_eq!(w.image_pattern(), PatternId::Diag);
 
         w.apply_scenario("order").unwrap();
         assert!(!w.loopback_active());

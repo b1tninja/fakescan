@@ -46,6 +46,12 @@ struct Args {
     #[arg(long, value_name = "N")]
     initial_pages: Option<u32>,
 
+    /// Image pattern a fresh device serves and `POST /v1/reset` restores: `diag` (the parametric
+    /// test page, default), `page_id` (the old numbered-bars page), `diag_v2`, `wedges`, ...
+    /// Env: `FAKESCAN_DEFAULT_PATTERN`.
+    #[arg(long, env = "FAKESCAN_DEFAULT_PATTERN", value_name = "ID")]
+    default_pattern: Option<String>,
+
     /// Directory of capability profiles (JSON).
     #[arg(long, default_value = "profiles")]
     profiles: PathBuf,
@@ -129,6 +135,9 @@ const STARTUP_BANNER: &str = r#"
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(id) = args.default_pattern.as_deref() {
+        fakescan::image_gen::PatternId::set_default(fakescan::image_gen::PatternId::parse(id)?);
+    }
     if let Some(Cmd::Daemon { action }) = &args.command {
         let out = match action {
             DaemonAction::Install => fakescan::daemon::install(

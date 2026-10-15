@@ -83,12 +83,20 @@ pub struct PageContext {
     pub timestamp_secs: u64,
 }
 
+static DEFAULT_PATTERN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+impl Default for PatternId {
+    fn default() -> Self {
+        PatternId::default_pattern()
+    }
+}
+
 /// Named synthetic layout for RetrieveImage JPEGs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PatternId {
-    /// Numbered bars + center block (default; multi-page order cue).
-    #[default]
+    /// Numbered bars + center block (multi-page order cue). The previous default; select it with
+    /// `--default-pattern page_id` / `FAKESCAN_DEFAULT_PATTERN=page_id` or `POST /v1/pattern`.
     PageId,
     /// Gray step wedges for brightness / contrast / threshold tests.
     Wedges,
@@ -125,9 +133,12 @@ pub enum PatternId {
     Grid,
     /// Resolution line ladder: coarse-to-fine horizontal and vertical line groups.
     Lines,
-    /// Self-describing diagnostic page (fiducials, wedge, strips, position array, QR); see `diag`.
-    /// Renders layout v2 (v1 content plus print marks, resolution, colour; see `diag_v2`).
+    /// The default page: parametric diagnostic layout v3 (see `diag_v3`): print marks, rulers, colour
+    /// bars, ColorChecker, ramps, flat fields, resolution targets, orientation / duplex / page-order
+    /// markers and a QR carrying the page parameters. Scales to the sheet.
     Diag,
+    /// Fixed-size layout v2 (v1 content plus print marks, resolution, colour; see `diag_v2`).
+    DiagV2,
     /// The original layout-v1 diag page, byte-identical to what `Diag` rendered before layout v2.
     DiagV1,
 }
@@ -153,8 +164,30 @@ impl PatternId {
         PatternId::Grid,
         PatternId::Lines,
         PatternId::Diag,
+        PatternId::DiagV2,
         PatternId::DiagV1,
     ];
+
+    /// The pattern a fresh device serves: `diag` unless overridden by [`PatternId::set_default`]
+    /// or the `FAKESCAN_DEFAULT_PATTERN` environment variable (read once).
+    pub fn default_pattern() -> PatternId {
+        let v = DEFAULT_PATTERN.load(std::sync::atomic::Ordering::Relaxed);
+        if v != u8::MAX {
+            return PatternId::ALL[v as usize];
+        }
+        let p = std::env::var("FAKESCAN_DEFAULT_PATTERN")
+            .ok()
+            .and_then(|s| PatternId::parse(&s).ok())
+            .unwrap_or(PatternId::Diag);
+        PatternId::set_default(p);
+        p
+    }
+
+    /// Override the process-wide default pattern (daemon `--default-pattern`).
+    pub fn set_default(p: PatternId) {
+        let i = PatternId::ALL.iter().position(|x| *x == p).unwrap_or(0);
+        DEFAULT_PATTERN.store(i as u8, std::sync::atomic::Ordering::Relaxed);
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -177,6 +210,7 @@ impl PatternId {
             PatternId::Grid => "grid",
             PatternId::Lines => "lines",
             PatternId::Diag => "diag",
+            PatternId::DiagV2 => "diag_v2",
             PatternId::DiagV1 => "diag_v1",
         }
     }
@@ -184,7 +218,7 @@ impl PatternId {
     /// Name carried on the wire (QR `pat=`, banner): `diag_v1` is still a `diag` page.
     pub fn wire_name(self) -> &'static str {
         match self {
-            PatternId::DiagV1 => "diag",
+            PatternId::DiagV1 | PatternId::DiagV2 => "diag",
             other => other.as_str(),
         }
     }
@@ -210,6 +244,7 @@ impl PatternId {
             "grid" => Ok(PatternId::Grid),
             "lines" => Ok(PatternId::Lines),
             "diag" => Ok(PatternId::Diag),
+            "diag_v2" | "diag-v2" => Ok(PatternId::DiagV2),
             "diag_v1" | "diag-v1" => Ok(PatternId::DiagV1),
             other => bail!(
                 "unknown pattern {other:?}; expected one of: {}",
@@ -645,7 +680,19 @@ pub fn render_pattern_rgb_ctx(
         PatternId::Align => crate::image_charts::draw_align(w, h, page_index),
         PatternId::Grid => crate::image_charts::draw_grid(w, h, page_index),
         PatternId::Lines => crate::image_charts::draw_lines(w, h, page_index),
-        PatternId::Diag => diag::draw_diag_v(w, h, diag::effective_dpi(dpi), 2),
+        PatternId::Diag => {
+            let mut sp =
+                crate::diag_v3::PageSpec::from_px("custom", w, h, diag::effective_dpi(dpi));
+            sp.page = page_index;
+            sp.side = effective_side;
+            if opts.stamp_banner {
+                sp.banner_px = crate::diag_v3::banner_height_px(w, h);
+            }
+            // No client address in the QR: the default page must be byte-stable across connections.
+            let _ = ctx;
+            crate::diag_v3::render(&sp).0
+        }
+        PatternId::DiagV2 => diag::draw_diag_v(w, h, diag::effective_dpi(dpi), 2),
         PatternId::DiagV1 => diag::draw_diag_v(w, h, diag::effective_dpi(dpi), 1),
     };
     if opts.stamp_banner {
@@ -656,7 +703,7 @@ pub fn render_pattern_rgb_ctx(
     if opts.stamp_qr {
         // Append `|client=<ip>` to the QR when a peer is available (Info/Anac or any pattern).
         let mut base = qr_payload(pattern, page_index, effective_side);
-        if pattern == PatternId::Diag {
+        if pattern == PatternId::DiagV2 {
             // Layout version rides in the payload; v1 pages (and older builds) omit it.
             base.push_str(&format!("|lay={}", crate::diag_v2::LAYOUT_VERSION));
         }
@@ -667,7 +714,9 @@ pub fn render_pattern_rgb_ctx(
             Some(peer) => format!("{base}|client={peer}"),
             None => base,
         };
-        if matches!(pattern, PatternId::Diag | PatternId::DiagV1) {
+        if pattern == PatternId::Diag {
+            // layout v3 draws its own QR (it carries the page parameters)
+        } else if matches!(pattern, PatternId::DiagV2 | PatternId::DiagV1) {
             let e = diag::effective_dpi(dpi);
             stamp_qr(
                 &mut img,
@@ -3680,7 +3729,7 @@ pub mod diag {
                     px(LAYOUT_H_MM, e) <= h,
                     "dpi {dpi}: layout taller than page"
                 );
-                let (img, _) = render_pattern_rgb(PatternId::Diag, dpi, 0, None).unwrap();
+                let (img, _) = render_pattern_rgb(PatternId::DiagV2, dpi, 0, None).unwrap();
                 assert_eq!(img.dimensions(), (w, h));
             }
             assert_eq!(
@@ -3719,19 +3768,19 @@ pub mod diag {
 
         #[test]
         fn render_is_deterministic_and_page_dependent_only_via_qr() {
-            let (a, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
-            let (b, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
+            let (a, _) = render_pattern_rgb(PatternId::DiagV2, 100, 0, None).unwrap();
+            let (b, _) = render_pattern_rgb(PatternId::DiagV2, 100, 0, None).unwrap();
             assert_eq!(a.as_raw(), b.as_raw());
-            let (c, _) = render_pattern_rgb(PatternId::Diag, 100, 1, None).unwrap();
+            let (c, _) = render_pattern_rgb(PatternId::DiagV2, 100, 1, None).unwrap();
             assert_ne!(a.as_raw(), c.as_raw());
-            let j0 = jpeg_pattern(PatternId::Diag, 100, 0).unwrap();
-            assert_eq!(j0, jpeg_pattern(PatternId::Diag, 100, 0).unwrap());
+            let j0 = jpeg_pattern(PatternId::DiagV2, 100, 0).unwrap();
+            assert_eq!(j0, jpeg_pattern(PatternId::DiagV2, 100, 0).unwrap());
             assert_eq!(read_page_marker(&j0), Some(0));
         }
 
         #[test]
         fn qr_decodes_after_thresholding_at_200dpi() {
-            let (img, _) = render_pattern_rgb(PatternId::Diag, 200, 7, None).unwrap();
+            let (img, _) = render_pattern_rgb(PatternId::DiagV2, 200, 7, None).unwrap();
             let mut g = image::GrayImage::new(img.width(), img.height());
             for (x, y, p) in img.enumerate_pixels() {
                 g.put_pixel(
@@ -3801,7 +3850,7 @@ pub mod diag {
 
         #[test]
         fn rendered_position_array_matches_cells_at_100dpi() {
-            let (img, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
+            let (img, _) = render_pattern_rgb(PatternId::DiagV2, 100, 0, None).unwrap();
             let a = position_array();
             for r in 0..POS_N {
                 for c in 0..POS_N {
@@ -3937,7 +3986,7 @@ pub mod diag {
         #[test]
         fn comb_row_packs_to_motif_bytes_with_odd_tail() {
             for dpi in [100u32, 200] {
-                let (img, _) = render_pattern_rgb(PatternId::Diag, dpi, 0, None).unwrap();
+                let (img, _) = render_pattern_rgb(PatternId::DiagV2, dpi, 0, None).unwrap();
                 let x0 = comb_x0_px(dpi);
                 assert_eq!(x0 % 8, 0);
                 let len = comb_len_px(dpi);
@@ -3968,7 +4017,7 @@ pub mod diag {
                     assert!(d.insert(BARS_GOLOMB[j] - BARS_GOLOMB[i]), "repeated gap");
                 }
             }
-            let (img, _) = render_pattern_rgb(PatternId::Diag, 100, 0, None).unwrap();
+            let (img, _) = render_pattern_rgb(PatternId::DiagV2, 100, 0, None).unwrap();
             let x0 = px(BARS_X0_MM, 100);
             let ymid = (px(BARS_Y_MM.0, 100) + px(BARS_Y_MM.1, 100)) / 2;
             let mut ink_cols = vec![];
@@ -3988,7 +4037,7 @@ pub mod diag {
         #[test]
         fn wedge_patches_and_zone_plate_render() {
             let dpi = 200;
-            let (img, _) = render_pattern_rgb(PatternId::Diag, dpi, 0, None).unwrap();
+            let (img, _) = render_pattern_rgb(PatternId::DiagV2, dpi, 0, None).unwrap();
             let ymid = px((WEDGE_BAND.1 + WEDGE_BAND.3) / 2.0, dpi);
             let ix0 = WEDGE_BAND.0 + WEDGE_OUTLINE_MM;
             let at = |x_mm: f64, y: u32| luma8(img.get_pixel(px(x_mm, dpi), y));
@@ -4043,6 +4092,20 @@ pub mod diag {
             }
             let t = parse_qr_payload(&qr_payload(PatternId::DiagV1, 0, None)).unwrap();
             assert_eq!((t.pattern, t.layout), (PatternId::Diag, None));
+        }
+
+        /// Layout v2 stays byte-identical (pinned; `diag` now renders layout v3).
+        #[test]
+        fn diag_v2_is_byte_identical_and_still_selectable() {
+            for (dpi, want) in [
+                (100u32, 0x80da_cf1b_230c_cf86u64),
+                (200, 0x40ce_3a59_8334_9b2e),
+            ] {
+                let (a, _) = render_pattern_rgb(PatternId::DiagV2, dpi, 0, None).unwrap();
+                assert_eq!(fnv64(a.as_raw()), want, "dpi {dpi}");
+            }
+            assert_eq!(PatternId::parse("diag_v2").unwrap(), PatternId::DiagV2);
+            assert_eq!(PatternId::DiagV2.wire_name(), "diag");
         }
 
         #[test]

@@ -11,6 +11,7 @@ Root [README](../README.md) is the quick start.
 | [windows.md](windows.md) | PowerShell helpers, discovery verdicts, elevated helper for Imaging remove, Add device (person required) |
 | [linux-client.md](linux-client.md) | sane-airscan / `scanimage` against `/ScannerService` |
 | [patterns.md](patterns.md) | Synthetic page layouts, QR, tester progression |
+| [diag-page-v3.md](diag-page-v3.md) | The default `diag` test page: parametric layout v3, any sheet size, layout JSON + vector primitives |
 | [defects.md](defects.md) | **Shipped** image effects, presets, Gray8 |
 | [formats.md](formats.md) | WSD/WIA image formats (full catalog except jbig) |
 | [reference/](reference/README.md) | **Official WSD/WS-Scan distillate** — Format fallback, MustHonor, Validate vs Create, faults; checked-in XSD/WSDL |
