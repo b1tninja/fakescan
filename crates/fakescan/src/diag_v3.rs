@@ -17,11 +17,15 @@
 //! Pixel `i` covers `[i / k, (i + 1) / k)` mm with `k = dpi / 25.4`. Colours are 8-bit sRGB code
 //! values, no ICC conversion happens here.
 
+use crate::diag_fid as fid;
 use crate::image_gen::{glyph_rows, PageSide};
 use image::{Rgb, RgbImage};
 use serde_json::{json, Value};
 
 pub const LAYOUT_VERSION: u32 = 3;
+/// Revision inside layout 3. Revision 1 adds dual-unit rulers, OpenCV-compatible ArUco markers, calibration
+/// boards and corner brackets; revision 0 (the first v3 pages) carried the private 4x4 corner markers.
+pub const LAYOUT_REVISION: u32 = 1;
 pub const COLOUR_SPACE: &str = "sRGB";
 pub const SCHEMA: &str = "fakescan.diag.layout/3";
 pub const FRAME_RGB: [u8; 3] = [0, 90, 200];
@@ -104,13 +108,6 @@ pub const ORDER_SLOTS: u32 = 16;
 /// assignment one corner step.
 pub const GLYPHS_FRONT: [char; 4] = ['F', 'R', 'G', 'J'];
 pub const GLYPHS_BACK: [char; 4] = ['J', 'G', 'R', 'F'];
-/// 4x4-bit marker dictionary ("fakescan-4x4-4": own family, not OpenCV ArUco ids).
-pub const MARKER_CODES: [u16; 4] = [
-    0b1011_0010_0110_1001,
-    0b0110_1101_1000_0101,
-    0b1001_0101_1100_0011,
-    0b0101_1010_0011_1110,
-];
 
 const PAPERS: [(&str, f64, f64); 19] = [
     ("A0", 841.0, 1189.0),
@@ -172,6 +169,38 @@ pub fn paper_names() -> Vec<&'static str> {
 // Page specification
 // ------------------------------------------------------------------------------------------------
 
+/// Which ruler scales are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rulers {
+    Metric,
+    Inch,
+    Both,
+}
+
+impl Rulers {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rulers::Metric => "metric",
+            Rulers::Inch => "inch",
+            Rulers::Both => "both",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "metric" | "mm" => Some(Rulers::Metric),
+            "inch" | "in" | "imperial" => Some(Rulers::Inch),
+            "both" | "" => Some(Rulers::Both),
+            _ => None,
+        }
+    }
+    pub fn metric(self) -> bool {
+        self != Rulers::Inch
+    }
+    pub fn inch(self) -> bool {
+        self != Rulers::Metric
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageSpec {
     /// Paper name as given (or `custom`); informational, the pixel size below is authoritative.
@@ -191,6 +220,8 @@ pub struct PageSpec {
     pub banner_px: u32,
     /// `rgb` or `gray` (gray replicates luma into all three channels).
     pub gray: bool,
+    /// Ruler scales drawn: metric, inch or both (default).
+    pub rulers: Rulers,
     /// Extra QR payload suffix (e.g. `client=ip`), appended after `|`.
     pub extra: Option<String>,
 }
@@ -222,6 +253,7 @@ impl PageSpec {
             job: String::new(),
             banner_px: 0,
             gray: false,
+            rulers: Rulers::Both,
             extra: None,
         }
     }
@@ -295,6 +327,11 @@ impl PageSpec {
             .and_then(Value::as_str)
             .map(|c| c.eq_ignore_ascii_case("gray") || c.eq_ignore_ascii_case("grey"))
             .unwrap_or(false);
+        s.rulers = v
+            .get("rulers")
+            .and_then(Value::as_str)
+            .and_then(Rulers::parse)
+            .unwrap_or(Rulers::Both);
         s.extra = v.get("extra").and_then(Value::as_str).map(str::to_string);
         Ok(s)
     }
@@ -303,7 +340,7 @@ impl PageSpec {
     pub fn qr_payload(&self) -> String {
         let side = self.side.map(|s| s.as_str()).unwrap_or("none");
         let mut p = format!(
-            "{}|page={}|pat=diag|side={side}|lay={LAYOUT_VERSION}|paper={}|px={}x{}|dpi={}|m={}|b={}|copy={}|of={}|bn={}|g={}",
+            "{}|page={}|pat=diag|side={side}|lay={LAYOUT_VERSION}|paper={}|px={}x{}|dpi={}|m={}|b={}|copy={}|of={}|bn={}|g={}|rev={}|rl={}|ar={}|id={}",
             crate::image_gen::QR_SCHEME,
             self.page,
             self.paper.replace('|', "-"),
@@ -316,6 +353,10 @@ impl PageSpec {
             self.total,
             self.banner_px,
             self.gray as u8,
+            LAYOUT_REVISION,
+            self.rulers.as_str(),
+            "4x4_50",
+            "0-19",
         );
         if !self.job.is_empty() {
             p.push_str(&format!("|job={}", self.job));
@@ -354,6 +395,8 @@ impl PageSpec {
                 "of" => s.total = v.parse().ok()?,
                 "bn" => s.banner_px = v.parse().ok()?,
                 "g" => s.gray = v == "1",
+                // revision-1 keys; payloads without them are revision 0 and still parse
+                "rl" => s.rulers = Rulers::parse(v).unwrap_or(Rulers::Both),
                 "job" => s.job = v.to_string(),
                 _ => {}
             }
@@ -370,6 +413,7 @@ impl PageSpec {
             "page": self.page, "copy": self.copy, "total": self.total,
             "side": self.side.map(|s| s.as_str()), "job": self.job,
             "banner_px": self.banner_px, "colour": if self.gray { "gray" } else { "rgb" },
+            "rulers": self.rulers.as_str(),
         })
     }
 }
@@ -409,6 +453,12 @@ type R4 = [f64; 4];
 pub enum Prim {
     Rect {
         r: R4,
+        c: C3,
+    },
+    /// Non-overlapping rects painted as one union (no seams between touching modules); exported as
+    /// one `rect` op each.
+    Rects {
+        rs: Vec<R4>,
         c: C3,
     },
     Poly {
@@ -498,9 +548,21 @@ impl Prim {
         )
     }
 
+    /// JSON ops for this primitive (a `Rects` union expands into one `rect` op per member).
+    fn json_all(&self, id: &str) -> Vec<Value> {
+        match self {
+            Prim::Rects { rs, c } => rs
+                .iter()
+                .map(|r| Prim::Rect { r: *r, c: *c }.json(id))
+                .collect(),
+            _ => vec![self.json(id)],
+        }
+    }
+
     fn json(&self, id: &str) -> Value {
         let mut v = match self {
             Prim::Rect { r, c } => json!({"op": "rect", "rect_mm": r, "rgb": c}),
+            Prim::Rects { rs, c } => json!({"op": "rect", "rect_mm": rs.first(), "rgb": c}),
             Prim::Poly { pts, c } => json!({"op": "polygon", "points_mm": pts, "rgb": c}),
             Prim::Line { a, b, w, c, dash } => {
                 json!({"op": "line", "from_mm": a, "to_mm": b, "width_mm": w, "rgb": c, "dash_mm": dash})
@@ -889,6 +951,7 @@ impl Canvas<'_> {
     fn paint(&mut self, p: &Prim) {
         match p {
             Prim::Rect { r, c } => self.rects(&[*r], *c),
+            Prim::Rects { rs, c } => self.rects(rs, *c),
             Prim::Poly { pts, c } => self.poly(pts, *c),
             Prim::Line { a, b, w, c, dash } => self.line(*a, *b, *w, *c, *dash),
             Prim::Circle { c, r, fill, stroke } => self.circle(*c, *r, *fill, *stroke),
@@ -1247,6 +1310,7 @@ impl Layout {
         json!({
             "schema": SCHEMA,
             "layout_version": LAYOUT_VERSION,
+            "layout_revision": LAYOUT_REVISION,
             "colour_space": COLOUR_SPACE,
             "colour_note": "8-bit sRGB code values; no ICC conversion happens in the generator",
             "spec": s.json(),
@@ -1261,7 +1325,7 @@ impl Layout {
             "qr_payload_layout_field": format!("lay={LAYOUT_VERSION}"),
             "notes": self.notes,
             "elements": self.els.iter().map(|e| e.json(s.gray)).collect::<Vec<_>>(),
-            "primitives": self.prims.iter().map(|(id, p)| p.json(id)).collect::<Vec<_>>(),
+            "primitives": self.prims.iter().flat_map(|(id, p)| p.json_all(id)).collect::<Vec<_>>(),
         })
     }
 }
@@ -1766,7 +1830,8 @@ fn blk_ladder(b: &mut B, r: R4, _sc: f64, negative: bool) {
                 if thick { 60 } else { 250 },
             );
         } else {
-            b.sample(e, (r[0] + r[2]) / 2.0, yc, INK, t);
+            // a sub-pixel line may straddle a pixel boundary, so only wide lines are checked tightly
+            b.sample(e, (r[0] + r[2]) / 2.0, yc, INK, if thick { t } else { 250 });
         }
     }
 }
@@ -2016,6 +2081,357 @@ fn blk_pangram(b: &mut B, r: R4, _sc: f64) {
 }
 
 // ---- rulers ---------------------------------------------------------------------------------------------
+// ---- fiducial geometry constants ----------------------------------------------------------------------
+/// Width of the left / right fiducial columns (brackets, vertical ruler, edge-midpoint marker).
+pub const STRIP_COL_MM: f64 = 15.0;
+/// Thickness of a vertical ruler strip inside its column.
+pub const VRULER_W_MM: f64 = 13.0;
+/// Height of the horizontal ruler strip.
+pub const HRULER_H_MM: f64 = 11.0;
+/// Module size of the left / right edge-midpoint ArUco markers.
+pub const SIDE_MARKER_MODULE_MM: f64 = 1.4;
+/// The fiducial columns are drawn when the content box is at least this big (mm).
+pub const STRIP_MIN_CONTENT_MM: [f64; 2] = [120.0, 150.0];
+pub const METRIC_TIERS: [(u32, f64); 3] = [(1, 1.5), (5, 2.5), (10, 3.5)];
+pub const INCH_TIERS: [(u32, f64); 5] = [(1, 1.2), (2, 1.8), (4, 2.4), (8, 3.0), (16, 3.6)];
+pub const TICK_W_MM: f64 = 0.3;
+pub const RULER_LABEL_PT: f64 = 5.0;
+/// ArUco ids: corners clockwise from the top-left, then edge midpoints clockwise from the top.
+pub const ARUCO_ID_TL: usize = 0;
+pub const ARUCO_ID_TR: usize = 1;
+pub const ARUCO_ID_BR: usize = 2;
+pub const ARUCO_ID_BL: usize = 3;
+pub const ARUCO_ID_TM: usize = 4;
+pub const ARUCO_ID_MR: usize = 5;
+pub const ARUCO_ID_BM: usize = 6;
+pub const ARUCO_ID_ML: usize = 7;
+/// ChArUco board: first marker id.
+pub const CHARUCO_FIRST_ID: usize = 8;
+/// 9 x 6 squares = 8 x 5 inner corners: an even x odd pattern has no 180 degree ambiguity for OpenCV.
+pub const CHESS_SQUARES: [usize; 2] = [9, 6];
+pub const CHARUCO_SQUARES: [usize; 2] = [6, 4];
+/// Asymmetric circle grid: points per row, rows.
+pub const CIRCLES_GRID: [usize; 2] = [6, 5];
+/// Board scale at layout scale 1: chessboard square, ChArUco square, circle row pitch (mm).
+pub const CHESS_SQ_MM: f64 = 3.5;
+pub const CHARUCO_SQ_MM: f64 = 5.5;
+pub const CHARUCO_MARKER_RATIO: f64 = 0.7;
+pub const CIRCLES_SP_MM: f64 = 3.0;
+pub const CIRCLES_DIAMETER_RATIO: f64 = 0.55;
+
+fn dropped_el(b: &mut B, id: &str, kind: &'static str, group: &'static str, reason: &str) {
+    let e = b.el(id, kind, group, [0.0, 0.0, 0.0, 0.0], 1.0, json!({}));
+    b.els[e].drawn = false;
+    b.els[e].reason = Some(reason.to_string());
+}
+
+/// Draw ArUco marker `aid` of `DICT_4X4_50` into the square `r` as element `el`.
+fn draw_aruco(b: &mut B, el: &str, aid: usize, r: R4, pos: &str) {
+    let side = r[2] - r[0];
+    let cell = side / 6.0;
+    let e = b.el(
+        el,
+        "marker",
+        "fiducial",
+        r,
+        1.0,
+        json!({
+        "dictionary": fid::ARUCO_DICT_NAME, "marker_id": aid, "position": pos,
+        "modules": 6, "payload_bits": 4, "module_mm": cell, "cell_mm": cell, "side_mm": side,
+        "quiet_zone_mm": cell, "quiet_modules": 1, "min_module_mm": fid::MIN_MODULE_MM,
+        "corners_mm": fid::corners_of(r),
+        "corner_order": "TL, TR, BR, BL of the marker in its canonical (upright) orientation, the order cv2.aruco returns",
+        "cells": fid::aruco_rows(aid), "cells_note": "6x6 modules including the black border, 1 = black",
+        "payload_hex": format!("0x{:04X}", fid::ARUCO_4X4_50[aid]),
+        "opencv": "cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)",
+        "orientation": "the code is not rotation symmetric: the detected corner order gives the page rotation"}),
+    );
+    b.add(
+        el,
+        Prim::Rects {
+            rs: fid::aruco_rects(aid, r),
+            c: INK,
+        },
+    );
+    let cells = fid::aruco_cells(aid);
+    if cell * b.k >= 3.0 {
+        for (ri, row) in cells.iter().enumerate() {
+            for (ci, &black) in row.iter().enumerate() {
+                b.sample(
+                    e,
+                    r[0] + (ci as f64 + 0.5) * cell,
+                    r[1] + (ri as f64 + 0.5) * cell,
+                    if black { INK } else { PAPER },
+                    // paper modules may sit under a dashed grey media outline (value 120)
+                    if black { 90 } else { 140 },
+                );
+            }
+        }
+    } else {
+        b.sample(e, r[0] + cell * 0.5, r[1] + cell * 0.5, INK, 190);
+    }
+}
+
+/// Edge-midpoint marker in a band: returns `(end of the left flow region, start of the right region)`.
+#[allow(clippy::too_many_arguments)]
+fn band_mid_marker(
+    b: &mut B,
+    r: R4,
+    yc: f64,
+    g: &ClusterGeom,
+    x0: f64,
+    x1: f64,
+    el: &str,
+    aid: usize,
+    pos: &str,
+) -> (f64, f64) {
+    let q = g.m / 6.0;
+    let cx = (r[0] + r[2]) / 2.0;
+    if x1 - x0 >= g.m + 2.0 * q + 8.0 {
+        draw_aruco(
+            b,
+            el,
+            aid,
+            [
+                cx - g.m / 2.0,
+                yc - g.m / 2.0,
+                cx + g.m / 2.0,
+                yc + g.m / 2.0,
+            ],
+            pos,
+        );
+        (cx - g.m / 2.0 - q - 0.5, cx + g.m / 2.0 + q + 0.5)
+    } else {
+        dropped_el(b, el, "marker", "fiducial", "no room in the band");
+        (x1, x1)
+    }
+}
+
+// ---- rulers ------------------------------------------------------------------------------------------------
+
+/// One ruler scale. `a0` = zero line position along the axis, `edge` = cross coordinate of the edge the
+/// ticks start from, `d` = +1 / -1 (ticks point towards +cross / -cross).
+struct RulerSpec {
+    id: &'static str,
+    inch: bool,
+    horizontal: bool,
+    a0: f64,
+    edge: f64,
+    d: f64,
+    len: f64,
+    /// strip rect (both scales share it)
+    strip: R4,
+    /// along-axis window left free for a marker (absolute coordinate)
+    mask: Option<[f64; 2]>,
+}
+
+fn ruler_r4(horizontal: bool, a0: f64, a1: f64, c0: f64, c1: f64) -> R4 {
+    let (a0, a1) = (a0.min(a1), a0.max(a1));
+    let (c0, c1) = (c0.min(c1), c0.max(c1));
+    if horizontal {
+        [a0, c0, a1, c1]
+    } else {
+        [c0, a0, c1, a1]
+    }
+}
+
+/// Draw one ruler scale (ticks, labels, element with the per-unit tick table).
+fn draw_ruler(b: &mut B, sp: &RulerSpec) {
+    let (pitch, tiers): (f64, &[(u32, f64)]) = if sp.inch {
+        (25.4 / 16.0, &INCH_TIERS)
+    } else {
+        (1.0, &METRIC_TIERS)
+    };
+    let count = (sp.len / pitch + 1e-9).floor() as u32;
+    let table = fid::ruler_ticks(pitch, count, tiers);
+    let masked = |a: f64| {
+        sp.mask
+            .is_some_and(|m| a > m[0] - TICK_W_MM && a < m[1] + TICK_W_MM)
+    };
+    let lab_every = if sp.inch { 25.4 } else { 10.0 };
+    let max_len = tiers.last().map(|t| t.1).unwrap_or(0.0);
+    let id = sp.id;
+    // ticks
+    if sp.horizontal && sp.mask.is_none() {
+        b.add(
+            id,
+            Prim::Ticks {
+                x: sp.a0,
+                y: sp.edge,
+                horizontal: true,
+                pitch,
+                count,
+                tiers: tiers.to_vec(),
+                w: TICK_W_MM,
+                down: sp.d > 0.0,
+                c: INK,
+            },
+        );
+    } else {
+        let rs: Vec<R4> = table
+            .iter()
+            .filter(|(_, pos, _)| !masked(sp.a0 + pos))
+            .map(|(_, pos, len)| {
+                ruler_r4(
+                    sp.horizontal,
+                    sp.a0 + pos - TICK_W_MM / 2.0,
+                    sp.a0 + pos + TICK_W_MM / 2.0,
+                    sp.edge,
+                    sp.edge + sp.d * len,
+                )
+            })
+            .collect();
+        b.add(id, Prim::Rects { rs, c: INK });
+    }
+    // labels
+    let mut labels: Vec<Value> = vec![];
+    let mut i = 0u32;
+    loop {
+        let pos = i as f64 * lab_every;
+        if pos > sp.len + 1e-9 {
+            break;
+        }
+        let txt = i.to_string();
+        let (tw, th) = text_size_mm(txt.len(), RULER_LABEL_PT);
+        let a = sp.a0 + pos;
+        let (x, y) = if sp.horizontal {
+            let ctop = if sp.d > 0.0 {
+                sp.edge + max_len + 0.45
+            } else {
+                sp.edge - max_len - 0.45 - th
+            };
+            (a + 0.4, ctop)
+        } else {
+            let cleft = if sp.d > 0.0 {
+                sp.edge + max_len + 0.45
+            } else {
+                sp.edge - max_len - 0.45 - tw
+            };
+            // just below the tick: the zero line (horizontal) must not strike through the "0"
+            (cleft, a + 0.35)
+        };
+        let fits_axis = if sp.horizontal {
+            pos + 0.4 + tw <= sp.len
+        } else {
+            pos + 0.35 + th <= sp.len + 0.5
+        };
+        let in_mask = sp.mask.is_some_and(|m| {
+            let (lo, hi) = if sp.horizontal {
+                (x, x + tw)
+            } else {
+                (y, y + th)
+            };
+            hi > m[0] && lo < m[1]
+        });
+        if fits_axis && !in_mask {
+            b.text(id, x, y, &txt, RULER_LABEL_PT, INK, false);
+            labels.push(json!({"text": txt, "x_mm": x, "y_mm": y, "value": i}));
+        }
+        i += 1;
+    }
+    let keep: Vec<&(u32, f64, f64)> = table.iter().filter(|t| !masked(sp.a0 + t.1)).collect();
+    let ticks = json!({
+        "index": keep.iter().map(|t| t.0).collect::<Vec<_>>(),
+        "pos_mm": keep.iter().map(|t| t.1).collect::<Vec<_>>(),
+        "length_mm": keep.iter().map(|t| t.2).collect::<Vec<_>>(),
+    });
+    let (origin, dir) = if sp.horizontal {
+        ([sp.a0, sp.edge], "+x")
+    } else {
+        ([sp.edge, sp.a0], "+y")
+    };
+    let rect = ruler_r4(
+        sp.horizontal,
+        sp.a0,
+        sp.a0 + sp.len,
+        sp.edge,
+        sp.edge + sp.d * max_len,
+    );
+    let ticks_point = match (sp.horizontal, sp.d > 0.0) {
+        (true, true) => "down",
+        (true, false) => "up",
+        (false, true) => "right",
+        (false, false) => "left",
+    };
+    let e = b.el(
+        id,
+        "ruler",
+        "scale",
+        rect,
+        1.0,
+        json!({
+        "unit": if sp.inch { "in" } else { "mm" }, "mm_per_unit": if sp.inch { 25.4 } else { 1.0 },
+        "axis": if sp.horizontal { "x" } else { "y" }, "direction": dir,
+        "pitch_mm": pitch, "units_per_tick": if sp.inch { 1.0 / 16.0 } else { 1.0 }, "count": count,
+        "length_mm": count as f64 * pitch, "span_mm": sp.len,
+        "tiers": tiers.iter().map(|t| json!([t.0, t.1])).collect::<Vec<_>>(),
+        "tier_names": if sp.inch { json!(["1/16 in", "1/8 in", "1/4 in", "1/2 in", "1 in"]) } else { json!(["1 mm", "5 mm", "10 mm"]) },
+        "origin_mm": origin, "zero_line_mm": sp.a0, "tick_edge_mm": sp.edge, "ticks_point": ticks_point,
+        "tick_width_mm": TICK_W_MM, "strip_rect_mm": sp.strip,
+        "labels_every_mm": lab_every, "label_pt": RULER_LABEL_PT, "labels": labels,
+        "masked_mm": sp.mask.map(|m| vec![m]).unwrap_or_default(),
+        "ticks": ticks,
+        "shared_zero_line": "the metric and the inch scale of one strip start at the same zero line; the two scales sit on opposite edges of the strip"}),
+    );
+    // samples at the major ticks (inside the tick, away from the strip lines)
+    let major = if sp.inch { 16 } else { 10 };
+    for (idx, pos, _) in &keep {
+        if idx % major == 0 {
+            let a = sp.a0 + pos;
+            let c = sp.edge + sp.d * 0.8;
+            if sp.horizontal {
+                b.sample(e, a, c, INK, 190);
+            } else {
+                b.sample(e, c, a, INK, 190);
+            }
+        }
+    }
+}
+
+/// Strip lines of one ruler strip: baseline(s), zero line, end line.
+#[allow(clippy::too_many_arguments)]
+fn ruler_lines(
+    b: &mut B,
+    id: &str,
+    horizontal: bool,
+    a0: f64,
+    len: f64,
+    c_lo: f64,
+    c_hi: f64,
+    inch: bool,
+    metric: bool,
+) {
+    let t = 0.2;
+    let mut rs: Vec<R4> = vec![];
+    if metric {
+        rs.push(ruler_r4(
+            horizontal,
+            a0,
+            a0 + len,
+            c_lo - t / 2.0,
+            c_lo + t / 2.0,
+        ));
+    }
+    if inch {
+        rs.push(ruler_r4(
+            horizontal,
+            a0,
+            a0 + len,
+            c_hi - t / 2.0,
+            c_hi + t / 2.0,
+        ));
+    }
+    rs.push(ruler_r4(horizontal, a0 - 0.15, a0 + 0.15, c_lo, c_hi));
+    rs.push(ruler_r4(
+        horizontal,
+        a0 + len - 0.15,
+        a0 + len + 0.15,
+        c_lo,
+        c_hi,
+    ));
+    b.add(id, Prim::Rects { rs, c: INK });
+}
+
 fn blk_rulers(b: &mut B, r: R4, _sc: f64) {
     let cw = r[2] - r[0];
     let len = (((cw - 6.0) / 10.0).floor() * 10.0).max(10.0);
@@ -2051,93 +2467,412 @@ fn blk_rulers(b: &mut B, r: R4, _sc: f64) {
         120,
     );
     b.text("measure_bar", x0, r[1] + 5.4, &label, 6.0, INK, false);
-    // rulers share a baseline
-    let base = r[1] + 15.0;
-    let nlab = (len / 10.0) as u32;
-    let em = b.el("ruler_metric", "ruler", "scale", [x0, base - 3.5, x0 + len, base], 1.0, json!({
-        "unit": "mm", "pitch_mm": 1.0, "count": len as u32, "tiers": [[1, 1.5], [5, 2.5], [10, 3.5]], "origin_mm": [x0, base], "labels_every_mm": 10, "direction": "ticks point up"}));
-    b.rect("ruler_metric", [x0, base - 0.1, x0 + len, base + 0.1], INK);
-    b.add(
-        "ruler_metric",
-        Prim::Ticks {
-            x: x0,
-            y: base,
-            horizontal: true,
-            pitch: 1.0,
-            count: len as u32,
-            tiers: vec![(1, 1.5), (5, 2.5), (10, 3.5)],
-            w: 0.3,
-            down: false,
-            c: INK,
+    // the dual-sided strip: metric ticks hang from the top edge, inch ticks rise from the bottom edge
+    let rulers = b.spec.rulers;
+    let yt = r[1] + 9.6;
+    let yb = yt + HRULER_H_MM;
+    let strip = [x0, yt, x0 + len, yb];
+    ruler_lines(
+        b,
+        if rulers.metric() {
+            "ruler_metric"
+        } else {
+            "ruler_inch"
         },
+        true,
+        x0,
+        len,
+        yt,
+        yb,
+        rulers.inch(),
+        rulers.metric(),
     );
-    for i in 0..=(len as u32) {
-        if i % 10 == 0 {
-            b.sample(em, x0 + i as f64, base - 0.8, INK, 190);
+    for (id, inch, edge, d) in [
+        ("ruler_metric", false, yt, 1.0),
+        ("ruler_inch", true, yb, -1.0),
+    ] {
+        if (inch && !rulers.inch()) || (!inch && !rulers.metric()) {
+            dropped_el(
+                b,
+                id,
+                "ruler",
+                "scale",
+                "rulers parameter excludes this unit",
+            );
+            continue;
         }
-    }
-    for i in 0..nlab {
-        b.text(
-            "ruler_metric",
-            x0 + i as f64 * 10.0 + 0.4,
-            base - 7.0,
-            &i.to_string(),
-            5.0,
-            INK,
-            false,
+        draw_ruler(
+            b,
+            &RulerSpec {
+                id,
+                inch,
+                horizontal: true,
+                a0: x0,
+                edge,
+                d,
+                len,
+                strip,
+                mask: None,
+            },
         );
     }
-    let inches = ((cw - 6.0) / 25.4).floor().max(1.0) as u32;
-    let ilen = inches as f64 * 25.4;
-    let ei = b.el("ruler_inch", "ruler", "scale", [x0, base, x0 + ilen, base + 3.6], 1.0, json!({
-        "unit": "in", "pitch_mm": 25.4 / 16.0, "count": inches * 16, "length_mm": ilen,
-        "tiers": [[1, 1.2], [2, 1.8], [4, 2.4], [8, 3.0], [16, 3.6]], "origin_mm": [x0, base], "direction": "ticks point down"}));
+}
+
+// ---- fiducial columns (vertical rulers, brackets, edge-midpoint markers) --------------------------------
+#[allow(clippy::too_many_arguments)]
+fn draw_bracket(b: &mut B, id: &str, ex: f64, ey: f64, sx: f64, sy: f64, idx: usize, corner: &str) {
+    let br = fid::bracket(ex, ey, sx, sy, idx);
+    let mut bb = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    for q in &br.black {
+        bb = [
+            bb[0].min(q[0]),
+            bb[1].min(q[1]),
+            bb[2].max(q[2]),
+            bb[3].max(q[3]),
+        ];
+    }
+    let e = b.el(
+        id,
+        "corner_bracket",
+        "fiducial",
+        bb,
+        1.0,
+        json!({
+        "corner": corner, "elbow_mm": [ex, ey], "arm_mm": fid::BRACKET_ARM_MM, "thickness_mm": fid::BRACKET_THICK_MM,
+        "black_rects_mm": br.black, "white_mark_rect_mm": br.white_mark, "black_mark_rect_mm": br.black_mark,
+        "mark_offset_mm": 4.0 + 1.2 * idx as f64,
+        "meaning": "black L with a white square in the horizontal arm (its distance from the elbow differs per corner) and a black square in the inner corner: unambiguous orientation and an elbow point for sub-pixel corner location"}),
+    );
     b.add(
-        "ruler_inch",
-        Prim::Ticks {
-            x: x0,
-            y: base,
-            horizontal: true,
-            pitch: 25.4 / 16.0,
-            count: inches * 16,
-            tiers: vec![(1, 1.2), (2, 1.8), (4, 2.4), (8, 3.0), (16, 3.6)],
-            w: 0.3,
-            down: true,
+        id,
+        Prim::Rects {
+            rs: br.black.clone(),
             c: INK,
         },
     );
-    for i in 0..=inches {
-        b.sample(ei, x0 + i as f64 * 25.4, base + 0.8, INK, 190);
-        if i < inches {
-            b.text(
-                "ruler_inch",
-                x0 + i as f64 * 25.4 + 0.5,
-                base + 4.4,
-                &i.to_string(),
-                5.0,
-                INK,
-                false,
+    b.rect(id, br.white_mark, PAPER);
+    b.rect(id, br.black_mark, INK);
+    let mid = |q: R4| ((q[0] + q[2]) / 2.0, (q[1] + q[3]) / 2.0);
+    b.sample(
+        e,
+        ex + sx * 1.2,
+        ey + sy * fid::BRACKET_THICK_MM / 2.0,
+        INK,
+        120,
+    );
+    let (wx, wy) = mid(br.white_mark);
+    b.sample(e, wx, wy, PAPER, 140);
+    let (kx, ky) = mid(br.black_mark);
+    b.sample(e, kx, ky, INK, 150);
+}
+
+/// Draw the left / right fiducial columns: corner L-brackets, a vertical ruler each and the
+/// edge-midpoint ArUco markers. When the content box is too small everything is recorded as not drawn.
+fn draw_strips(b: &mut B, content: R4, active: bool) {
+    let names = ["tl", "tr", "bl", "br"];
+    let ids = [
+        ("ruler_v_metric", "ruler_v_inch", "marker_ml"),
+        ("ruler_vr_metric", "ruler_vr_inch", "marker_mr"),
+    ];
+    if !active {
+        let why = "content box too small for the fiducial columns";
+        for n in names {
+            dropped_el(
+                b,
+                &format!("bracket_{n}"),
+                "corner_bracket",
+                "fiducial",
+                why,
             );
         }
+        for (m, i, mk) in ids {
+            dropped_el(b, m, "ruler", "scale", why);
+            dropped_el(b, i, "ruler", "scale", why);
+            dropped_el(b, mk, "marker", "fiducial", why);
+        }
+        return;
+    }
+    let ym = (content[1] + content[3]) / 2.0;
+    let corners = [
+        (content[0] + 0.5, content[1] + 0.5, 1.0, 1.0),
+        (content[2] - 0.5, content[1] + 0.5, -1.0, 1.0),
+        (content[0] + 0.5, content[3] - 0.5, 1.0, -1.0),
+        (content[2] - 0.5, content[3] - 0.5, -1.0, -1.0),
+    ];
+    let cnames = ["top_left", "top_right", "bottom_left", "bottom_right"];
+    for (i, (ex, ey, sx, sy)) in corners.into_iter().enumerate() {
+        draw_bracket(
+            b,
+            &format!("bracket_{}", names[i]),
+            ex,
+            ey,
+            sx,
+            sy,
+            i,
+            cnames[i],
+        );
+    }
+    let rulers = b.spec.rulers;
+    let side_m = 6.0 * SIDE_MARKER_MODULE_MM;
+    let half_win = side_m / 2.0 + SIDE_MARKER_MODULE_MM;
+    let y0 = content[1] + 12.0;
+    let len = (((content[3] - 12.0 - y0) / 10.0).floor() * 10.0).max(0.0);
+    for (ci, (mid, iid, mk)) in ids.into_iter().enumerate() {
+        let col_x = if ci == 0 {
+            content[0]
+        } else {
+            content[2] - STRIP_COL_MM
+        };
+        let xs = col_x + (STRIP_COL_MM - VRULER_W_MM) / 2.0;
+        let xr = xs + VRULER_W_MM;
+        let strip = [xs, y0, xr, y0 + len];
+        let mask = Some([ym - half_win, ym + half_win]);
+        if len >= 40.0 {
+            ruler_lines(
+                b,
+                if rulers.metric() { mid } else { iid },
+                false,
+                y0,
+                len,
+                xs,
+                xr,
+                rulers.inch(),
+                rulers.metric(),
+            );
+            for (id, inch, edge, d) in [(mid, false, xs, 1.0), (iid, true, xr, -1.0)] {
+                if (inch && !rulers.inch()) || (!inch && !rulers.metric()) {
+                    dropped_el(
+                        b,
+                        id,
+                        "ruler",
+                        "scale",
+                        "rulers parameter excludes this unit",
+                    );
+                    continue;
+                }
+                draw_ruler(
+                    b,
+                    &RulerSpec {
+                        id,
+                        inch,
+                        horizontal: false,
+                        a0: y0,
+                        edge,
+                        d,
+                        len,
+                        strip,
+                        mask,
+                    },
+                );
+            }
+        } else {
+            dropped_el(
+                b,
+                mid,
+                "ruler",
+                "scale",
+                "column too short for a vertical ruler",
+            );
+            dropped_el(
+                b,
+                iid,
+                "ruler",
+                "scale",
+                "column too short for a vertical ruler",
+            );
+        }
+        let cx = col_x + STRIP_COL_MM / 2.0;
+        draw_aruco(
+            b,
+            mk,
+            if ci == 0 { ARUCO_ID_ML } else { ARUCO_ID_MR },
+            [
+                cx - side_m / 2.0,
+                ym - side_m / 2.0,
+                cx + side_m / 2.0,
+                ym + side_m / 2.0,
+            ],
+            if ci == 0 { "left_mid" } else { "right_mid" },
+        );
+    }
+}
+
+// ---- calibration boards ------------------------------------------------------------------------------------
+fn board_dropped(b: &mut B, id: &str, rect: R4, why: &str) {
+    let e = b.el(id, "board", "calibration", rect, 1.0, json!({}));
+    b.els[e].drawn = false;
+    b.els[e].reason = Some(why.to_string());
+}
+
+fn blk_chess(b: &mut B, r: R4, sc: f64) {
+    let sq = CHESS_SQ_MM * sc;
+    if sq < fid::MIN_SQUARE_MM {
+        return board_dropped(b, "chessboard", r, "square below the minimum size");
+    }
+    let [cols, rows] = CHESS_SQUARES;
+    let (pw, ph) = (cols as f64 * sq, rows as f64 * sq);
+    let (bw, bh) = (r[2] - r[0], r[3] - r[1]);
+    let (x0, y0) = (r[0] + (bw - pw) / 2.0, r[1] + (bh - ph) / 2.0);
+    let (black, inner) = fid::chessboard(x0, y0, cols, rows, sq);
+    let e = b.el(
+        "chessboard",
+        "chessboard",
+        "calibration",
+        [x0, y0, x0 + pw, y0 + ph],
+        sc,
+        json!({
+        "squares": [cols, rows], "inner_corners": [cols - 1, rows - 1], "square_mm": sq, "origin_mm": [x0, y0],
+        "first_square": "black (top-left)", "quiet_mm": sq, "min_square_mm": fid::MIN_SQUARE_MM,
+        "inner_corner_positions_mm": inner,
+        "opencv": format!("cv2.findChessboardCorners(img, ({}, {}))", cols - 1, rows - 1)}),
+    );
+    b.add("chessboard", Prim::Rects { rs: black, c: INK });
+    if sq * b.k >= 2.5 {
+        for rr in 0..rows {
+            for cc in 0..cols {
+                let (want, tol) = if (rr + cc) % 2 == 0 {
+                    (INK, 90)
+                } else {
+                    (PAPER, 140)
+                };
+                b.sample(
+                    e,
+                    x0 + (cc as f64 + 0.5) * sq,
+                    y0 + (rr as f64 + 0.5) * sq,
+                    want,
+                    tol,
+                );
+            }
+        }
+    }
+}
+
+fn blk_charuco(b: &mut B, r: R4, sc: f64) {
+    let sq = CHARUCO_SQ_MM * sc;
+    let ml = sq * CHARUCO_MARKER_RATIO;
+    if sq < fid::MIN_SQUARE_MM || ml / 6.0 < fid::MIN_MODULE_MM * 0.7 {
+        return board_dropped(
+            b,
+            "charuco_board",
+            r,
+            "square or marker module below the minimum size",
+        );
+    }
+    let [cols, rows] = CHARUCO_SQUARES;
+    let (pw, ph) = (cols as f64 * sq, rows as f64 * sq);
+    let (bw, bh) = (r[2] - r[0], r[3] - r[1]);
+    let (x0, y0) = (r[0] + (bw - pw) / 2.0, r[1] + (bh - ph) / 2.0);
+    let cb = fid::charuco(x0, y0, cols, rows, sq, ml, CHARUCO_FIRST_ID);
+    let ids: Vec<usize> = cb.markers.iter().map(|m| m.0).collect();
+    let id_first = ids[0];
+    let id_last = *ids.last().unwrap();
+    let e = b.el(
+        "charuco_board",
+        "charuco",
+        "calibration",
+        [x0, y0, x0 + pw, y0 + ph],
+        sc,
+        json!({
+        "squares": [cols, rows], "square_mm": sq, "marker_mm": ml, "marker_module_mm": ml / 6.0,
+        "dictionary": fid::ARUCO_DICT_NAME, "marker_ids": ids, "legacy_pattern": false,
+        "first_square": "black (top-left); markers in the squares with odd row + col, ids row-major",
+        "origin_mm": [x0, y0], "quiet_mm": sq, "chessboard_corners_mm": cb.corners,
+        "corner_count": cb.corners.len(),
+        "opencv": format!(
+            "cv2.aruco.CharucoBoard(({cols}, {rows}), square_mm, marker_mm, DICT_4X4_50, np.arange({id_first}, {}))",
+            id_last + 1),
+        "markers": cb.markers.iter().map(|(id, q)| json!({"id": id, "rect_mm": q, "corners_mm": fid::corners_of(*q)})).collect::<Vec<_>>()}),
+    );
+    b.add(
+        "charuco_board",
+        Prim::Rects {
+            rs: cb.black_squares.clone(),
+            c: INK,
+        },
+    );
+    if sq * b.k >= 2.5 {
+        for sqr in &cb.black_squares {
+            b.sample(e, (sqr[0] + sqr[2]) / 2.0, (sqr[1] + sqr[3]) / 2.0, INK, 90);
+        }
+    }
+    for (aid, q) in &cb.markers {
+        draw_aruco(b, &format!("charuco_marker_{aid}"), *aid, *q, "charuco");
+    }
+}
+
+fn blk_circles(b: &mut B, r: R4, sc: f64) {
+    let sp = CIRCLES_SP_MM * sc;
+    if sp < fid::MIN_SQUARE_MM * 0.9 {
+        return board_dropped(b, "circle_grid", r, "spacing below the minimum size");
+    }
+    let [per_row, rows] = CIRCLES_GRID;
+    let (pw, ph) = ((2 * (per_row - 1) + 1) as f64 * sp, (rows - 1) as f64 * sp);
+    let (bw, bh) = (r[2] - r[0], r[3] - r[1]);
+    let (x0, y0) = (r[0] + (bw - pw) / 2.0, r[1] + (bh - ph) / 2.0);
+    let pts = fid::circle_grid(x0, y0, per_row, rows, sp);
+    let dia = sp * CIRCLES_DIAMETER_RATIO;
+    let e = b.el(
+        "circle_grid",
+        "circle_grid",
+        "calibration",
+        [
+            x0 - dia / 2.0,
+            y0 - dia / 2.0,
+            x0 + pw + dia / 2.0,
+            y0 + ph + dia / 2.0,
+        ],
+        sc,
+        json!({
+        "pattern": "asymmetric", "per_row": per_row, "rows": rows, "points": pts.len(),
+        "row_pitch_mm": sp, "in_row_pitch_mm": 2.0 * sp, "circle_diameter_mm": dia, "origin_mm": [x0, y0],
+        "centres_mm": pts, "layout": "x = (2 j + i % 2) * row_pitch, y = i * row_pitch (OpenCV asymmetric grid, row-major)",
+        "quiet_mm": 1.5 * sp,
+        "opencv": format!("cv2.findCirclesGrid(img, ({per_row}, {rows}), flags=cv2.CALIB_CB_ASYMMETRIC_GRID)")}),
+    );
+    for p in &pts {
+        b.add(
+            "circle_grid",
+            Prim::Circle {
+                c: *p,
+                r: dia / 2.0,
+                fill: Some(INK),
+                stroke: None,
+            },
+        );
+        if dia * b.k >= 3.0 {
+            b.sample(e, p[0], p[1], INK, 120);
+        }
+    }
+}
+
+/// Geometry of one corner cluster `[glyph][marker][registration cross]` at scale `u`.
+struct ClusterGeom {
+    gw: f64,
+    g1: f64,
+    m: f64,
+    g2: f64,
+    arm: f64,
+    width: f64,
+}
+
+fn cluster_geom(u: f64) -> ClusterGeom {
+    let gw = 5.0 * 1.25 * u;
+    let m = (8.0 * u).max(6.0 * fid::MIN_MODULE_MM);
+    let q = m / 6.0;
+    let g1 = (1.5 * u).max(q);
+    let g2 = (1.0 * u).max(q);
+    let arm = 3.8 * u * 0.7;
+    ClusterGeom {
+        gw,
+        g1,
+        m,
+        g2,
+        arm,
+        width: gw + g1 + m + g2 + 2.0 * arm,
     }
 }
 
 // ---- corner bands ---------------------------------------------------------------------------------------
-fn marker_cells(id: usize) -> [[bool; 6]; 6] {
-    let code = MARKER_CODES[id % 4];
-    let mut g = [[false; 6]; 6];
-    for (r, row) in g.iter_mut().enumerate() {
-        for (c, cell) in row.iter_mut().enumerate() {
-            *cell = if r == 0 || c == 0 || r == 5 || c == 5 {
-                true
-            } else {
-                (code >> (15 - ((r - 1) * 4 + (c - 1)))) & 1 == 1
-            };
-        }
-    }
-    g
-}
-
 fn draw_cross(b: &mut B, id: &str, c: [f64; 2], u: f64) {
     b.add(
         id,
@@ -2170,35 +2905,6 @@ fn draw_cross(b: &mut B, id: &str, c: [f64; 2], u: f64) {
     );
 }
 
-fn draw_marker(b: &mut B, id: &str, idx: usize, r: R4) {
-    let g = marker_cells(idx);
-    let cell = (r[2] - r[0]) / 6.0;
-    let rows: Vec<String> = g
-        .iter()
-        .map(|row| row.iter().map(|&v| if v { '1' } else { '0' }).collect())
-        .collect();
-    let e = b.el(id, "marker", "fiducial", r, 1.0, json!({
-        "dictionary": "fakescan-4x4-4", "marker_id": idx, "grid": 6, "cells": rows, "cell_mm": cell, "side_mm": r[2] - r[0],
-        "orientation": "the 4x4 code is not rotation symmetric; read it under the 4 rotations to find the page rotation"}));
-    for (ri, row) in g.iter().enumerate() {
-        for (ci, &v) in row.iter().enumerate() {
-            if v {
-                b.rect(
-                    id,
-                    [
-                        r[0] + ci as f64 * cell,
-                        r[1] + ri as f64 * cell,
-                        r[0] + (ci + 1) as f64 * cell,
-                        r[1] + (ri + 1) as f64 * cell,
-                    ],
-                    INK,
-                );
-            }
-        }
-    }
-    b.sample(e, r[0] + cell * 0.5, r[1] + cell * 0.5, INK, 40);
-}
-
 fn glyph_for(side: Option<PageSide>, corner: usize) -> (char, bool) {
     if side == Some(PageSide::Back) {
         (GLYPHS_BACK[corner], true)
@@ -2226,11 +2932,10 @@ pub fn glyph_bitmap(ch: char, mirror: bool) -> Vec<String> {
 
 fn corner_cluster(b: &mut B, r: R4, sc: f64, top: bool) {
     // r is the whole band. Left cluster [glyph][marker][cross], right cluster mirrored.
-    let h = r[3] - r[1];
     let u = sc;
     let gu = 1.25 * u;
-    let gw = 5.0 * gu;
-    let m = 8.0 * u;
+    let g = cluster_geom(u);
+    let (gw, m) = (g.gw, g.m);
     let yc = (r[1] + r[3]) / 2.0;
     let side = b.spec.side;
     for (i, left) in [true, false].into_iter().enumerate() {
@@ -2238,18 +2943,15 @@ fn corner_cluster(b: &mut B, r: R4, sc: f64, top: bool) {
         let (ch, mirror) = glyph_for(side, corner);
         let gid = ["orient_tl", "orient_tr", "orient_bl", "orient_br"][corner];
         let mid = ["marker_tl", "marker_tr", "marker_bl", "marker_br"][corner];
+        let aid = [ARUCO_ID_TL, ARUCO_ID_TR, ARUCO_ID_BL, ARUCO_ID_BR][corner];
         let cid = ["reg_tl", "reg_tr", "reg_bl", "reg_br"][corner];
         let (gx, mx, cx) = if left {
-            (
-                r[0],
-                r[0] + gw + 1.5 * u,
-                r[0] + gw + 1.5 * u + m + 1.0 * u + 3.8 * u,
-            )
+            (r[0], r[0] + gw + g.g1, r[0] + gw + g.g1 + m + g.g2 + g.arm)
         } else {
             (
                 r[2] - gw,
-                r[2] - gw - 1.5 * u - m,
-                r[2] - gw - 1.5 * u - m - 1.0 * u - 3.8 * u,
+                r[2] - gw - g.g1 - m,
+                r[2] - gw - g.g1 - m - g.g2 - g.arm,
             )
         };
         let gy = yc - 3.5 * gu;
@@ -2269,30 +2971,47 @@ fn corner_cluster(b: &mut B, r: R4, sc: f64, top: bool) {
             mirror,
         );
         let mrect = [mx, yc - m / 2.0, mx + m, yc + m / 2.0];
-        draw_marker(b, mid, corner, mrect);
+        draw_aruco(b, mid, aid, mrect, corner_name);
         draw_cross(b, cid, [cx, yc], u * 0.7);
         let (ax, ay) = (cx, yc);
         b.el(cid, "registration_cross", "fiducial", [ax - 3.8 * u * 0.7, ay - 3.8 * u * 0.7, ax + 3.8 * u * 0.7, ay + 3.8 * u * 0.7], sc, json!({
             "centre_mm": [ax, ay], "ring_radius_mm": 3.0 * u * 0.7, "arm_mm": 3.8 * u * 0.7, "line_mm": 0.3, "use": "affine fit: scale x/y, rotation, shear, offset"}));
     }
-    let _ = h;
 }
 
+#[allow(unused_assignments)]
 fn blk_band_top(b: &mut B, r: R4, sc: f64) {
     corner_cluster(b, r, sc, true);
     let u = sc;
-    let gw = 6.25 * u;
-    let cluster = gw + 1.5 * u + 8.0 * u + 1.0 * u + 7.6 * u * 0.7 + 3.0 * u;
+    let g = cluster_geom(u);
+    let cluster = g.width + 3.0 * u;
     let (x0, x1) = (r[0] + cluster, r[2] - cluster);
     let yc = (r[1] + r[3]) / 2.0;
     let page = b.spec.page;
+    let (mut lim, rx0) = band_mid_marker(b, r, yc, &g, x0, x1, "marker_tm", ARUCO_ID_TM, "top_mid");
+    let mut jumped = lim >= x1;
     let mut x = x0;
+    // flow cursor: items fill the left region, then continue right of the midpoint marker
+    macro_rules! fit {
+        ($need:expr) => {{
+            let n: f64 = $need;
+            if x + n <= lim {
+                true
+            } else if !jumped {
+                jumped = true;
+                x = rx0;
+                lim = x1;
+                x + n <= lim
+            } else {
+                false
+            }
+        }};
+    }
     // big page number
     let digits = (page + 1).to_string();
     let gu = 1.15 * u;
     let dw = (digits.len() * 6) as f64 * gu - gu;
-    let fits = |need: f64, x: f64| x + need <= x1;
-    if fits(dw, x) {
+    if fit!(dw) {
         let rect = [x, yc - 3.5 * gu, x + dw, yc + 3.5 * gu];
         let digit_bitmaps: Vec<Value> = "0123456789"
             .chars()
@@ -2322,7 +3041,7 @@ fn blk_band_top(b: &mut B, r: R4, sc: f64) {
     // order bars
     let (pitch, bw, bh) = (1.4 * u, 0.9 * u, 6.0 * u);
     let need = ORDER_SLOTS as f64 * pitch;
-    if fits(need, x) {
+    if fit!(need) {
         let filled = (page + 1).min(ORDER_SLOTS);
         let rect = [x, yc - bh / 2.0, x + need, yc + bh / 2.0];
         let slots: Vec<f64> = (0..ORDER_SLOTS)
@@ -2359,7 +3078,7 @@ fn blk_band_top(b: &mut B, r: R4, sc: f64) {
         None => "-",
     };
     let (lw, lh) = text_size_mm(label.len(), 6.0);
-    if fits(sm_w + 1.0 * u + lw, x) {
+    if fit!(sm_w + 1.0 * u + lw) {
         let sq = [x, yc - 3.5 * u, x + sm_w, yc + 3.5 * u];
         let half = if back {
             [sq[0] + sm_w / 2.0, sq[1], sq[2], sq[3]]
@@ -2404,7 +3123,7 @@ fn blk_band_top(b: &mut B, r: R4, sc: f64) {
     let (w1, h1) = text_size_mm(l1.len(), 6.0);
     let (w2, _) = text_size_mm(l2.len(), 6.0);
     let sw = w1.max(w2);
-    if fits(sw, x) {
+    if fit!(sw) {
         b.el("page_stamp", "page_stamp", "order", [x, yc - h1 - 0.6, x + sw, yc + h1 + 0.6], sc, json!({
             "lines": [l1, l2], "page": page, "copy": b.spec.copy, "total": b.spec.total, "job": b.spec.job, "pt": 6}));
         b.text("page_stamp", x, yc - h1 - 0.4, &l1, 6.0, INK, false);
@@ -2426,8 +3145,8 @@ fn blk_band_top(b: &mut B, r: R4, sc: f64) {
 fn blk_band_bottom(b: &mut B, r: R4, sc: f64) {
     corner_cluster(b, r, sc, false);
     let u = sc;
-    let gw = 6.25 * u;
-    let cluster = gw + 1.5 * u + 8.0 * u + 1.0 * u + 7.6 * u * 0.7 + 3.0 * u;
+    let g = cluster_geom(u);
+    let cluster = g.width + 3.0 * u;
     let (x0, x1) = (r[0] + cluster, r[2] - cluster);
     let yc = (r[1] + r[3]) / 2.0;
     let s = &b.spec;
@@ -2445,7 +3164,16 @@ fn blk_band_bottom(b: &mut B, r: R4, sc: f64) {
     );
     let (w1, h1) = text_size_mm(l1.len(), 6.0);
     let (w2, _) = text_size_mm(l2.len(), 6.0);
-    if x0 + w1.max(w2) <= x1 {
+    let (lim, rx0) = band_mid_marker(b, r, yc, &g, x0, x1, "marker_bm", ARUCO_ID_BM, "bottom_mid");
+    let wmax = w1.max(w2);
+    let lx = if x0 + wmax <= lim {
+        Some(x0)
+    } else if rx0 + wmax <= x1 {
+        Some(rx0)
+    } else {
+        None
+    };
+    if let Some(x0) = lx {
         b.el(
             "legend",
             "legend",
@@ -2547,6 +3275,15 @@ fn rows() -> Vec<Row> {
                 blk("text_ladder", 60.0, 14.0, false, false, blk_text_ladder),
                 opt(blk("pangram", 58.0, 14.0, false, false, blk_pangram)),
                 opt(blk("toc", 24.0, 13.6, false, false, blk_toc)),
+            ],
+        },
+        Row {
+            name: "boards",
+            prio: 6,
+            blocks: vec![
+                blk("chess", 38.5, 28.0, false, true, blk_chess),
+                blk("charuco", 44.0, 33.0, false, true, blk_charuco),
+                blk("circles", 42.0, 21.0, false, true, blk_circles),
             ],
         },
         Row {
@@ -2747,7 +3484,21 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
         frame[2] - pad,
         frame[3] - pad,
     ];
-    let (cw, ch) = (content[2] - content[0], content[3] - content[1]);
+    let strips = content[2] - content[0] >= STRIP_MIN_CONTENT_MM[0]
+        && content[3] - content[1] >= STRIP_MIN_CONTENT_MM[1];
+    // the rows live between the fiducial columns
+    let inner = if strips {
+        [
+            content[0] + STRIP_COL_MM + 1.0,
+            content[1],
+            content[2] - STRIP_COL_MM - 1.0,
+            content[3],
+        ]
+    } else {
+        content
+    };
+    draw_strips(&mut b, content, strips);
+    let (cw, ch) = (inner[2] - inner[0], inner[3] - inner[1]);
     let all = rows();
     let mut keep: Vec<bool> = vec![true; all.len()];
     let mut s = MIN_SCALE;
@@ -2848,13 +3599,13 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
         let used = sum_h + gap * (n as f64 - 1.0);
         let spare = (ch - used).max(0.0);
         // top band at the top, bottom band flush at the bottom, middle rows centred between them
-        let mut y = content[1];
+        let mut y = inner[1];
         for (i, (row, d)) in live.iter().zip(&fits).enumerate() {
             if i == 1 {
                 y += spare / 2.0;
             }
             if row.name == "band_bottom" {
-                y = content[3] - d.2;
+                y = inner[3] - d.2;
             }
             for (bi, drop) in d.0.iter().enumerate() {
                 if *drop {
@@ -2871,7 +3622,7 @@ pub fn build_layout(spec: &PageSpec) -> Layout {
                         Some("optional block dropped: row too wide for this sheet".into());
                 }
             }
-            place_row(&mut b, row, s, [content[0], y, content[2], y + d.2], &d.0);
+            place_row(&mut b, row, s, [inner[0], y, inner[2], y + d.2], &d.0);
             y += d.2 + gap;
         }
     } else if !live.is_empty() {
@@ -3214,15 +3965,405 @@ mod tests {
     }
 
     /// Pins: the generator is a pure function of its parameters; a change here is a layout change.
+    /// Layout 3 revision 1 (ArUco markers, dual-unit rulers, boards); revision 0 pins were f6aa3fda618d9b02 (A4@100),
+    /// beeebc4399ab038c (Letter@100) and 6aaaebb13625058a (A3@50).
     #[test]
     fn pinned_hashes() {
         for (paper, dpi, want) in [
-            ("A4", 100u32, 0xf6aa_3fda_618d_9b02u64),
-            ("LETTER", 100, 0xbeee_bc43_99ab_038c),
-            ("A3", 50, 0x6aaa_ebb1_3625_058a),
+            ("A4", 100u32, 0xf861_1b69_1b27_e9bcu64),
+            ("LETTER", 100, 0x9e2c_a63d_82d8_2af6),
+            ("A3", 50, 0x6200_ed7d_e6f9_1e9e),
         ] {
             let (img, _) = render(&spec(paper, false, dpi));
             assert_eq!(fnv64(img.as_raw()), want, "{paper}@{dpi}");
+        }
+    }
+
+    fn el<'a>(lay: &'a Value, id: &str) -> &'a Value {
+        lay["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap_or_else(|| panic!("no element {id}"))
+    }
+
+    fn f(v: &Value) -> f64 {
+        v.as_f64().unwrap()
+    }
+
+    fn luma(img: &RgbImage, x: u32, y: u32) -> i64 {
+        img.get_pixel(x, y).0[1] as i64
+    }
+
+    const SHEETS: [(&str, bool, u32); 8] = [
+        ("A4", false, 100),
+        ("A4", false, 150),
+        ("A4", false, 300),
+        ("LETTER", false, 100),
+        ("A3", false, 75),
+        ("A5", false, 150),
+        ("LEGAL", false, 100),
+        ("A4", true, 100),
+    ];
+
+    #[test]
+    fn aruco_markers_are_distinct_documented_and_match_pixels() {
+        for (paper, land, dpi) in SHEETS {
+            let sp = spec(paper, land, dpi);
+            let (img, lay) = render(&sp);
+            let l = lay.json();
+            assert_eq!(l["layout_revision"], LAYOUT_REVISION);
+            let mut ids = vec![];
+            for e in l["elements"].as_array().unwrap() {
+                if e["kind"] != "marker" || e["drawn"] != true {
+                    continue;
+                }
+                let x = &e["expected"];
+                assert_eq!(x["dictionary"], "DICT_4X4_50");
+                let id = x["marker_id"].as_u64().unwrap() as usize;
+                ids.push(id);
+                let rect = &e["rect_mm"];
+                let (x0, y0, x1, y1) = (f(&rect[0]), f(&rect[1]), f(&rect[2]), f(&rect[3]));
+                let cell = f(&x["module_mm"]);
+                assert!((x1 - x0 - 6.0 * cell).abs() < 1e-9 && (y1 - y0 - 6.0 * cell).abs() < 1e-9);
+                assert!(
+                    cell >= fid::MIN_MODULE_MM * 0.7 - 1e-9,
+                    "{paper} id {id} module {cell}"
+                );
+                assert_eq!(x["quiet_modules"], 1);
+                // corners: TL, TR, BR, BL
+                let c = x["corners_mm"].as_array().unwrap();
+                assert_eq!(c.len(), 4);
+                assert!((f(&c[0][0]) - x0).abs() < 1e-9 && (f(&c[2][0]) - x1).abs() < 1e-9);
+                assert!((f(&c[0][1]) - y0).abs() < 1e-9 && (f(&c[2][1]) - y1).abs() < 1e-9);
+                let k = sp.k();
+                if cell * k < 3.0 {
+                    continue;
+                }
+                let cells = fid::aruco_cells(id);
+                for (ri, row) in cells.iter().enumerate() {
+                    for (ci, &black) in row.iter().enumerate() {
+                        let (mx, my) =
+                            (x0 + (ci as f64 + 0.5) * cell, y0 + (ri as f64 + 0.5) * cell);
+                        let v = luma(&img, (mx * k) as u32, (my * k) as u32);
+                        if black {
+                            assert!(v < 90, "{paper}@{dpi} id {id} module {ri},{ci}: {v}");
+                        } else {
+                            assert!(v >= 120, "{paper}@{dpi} id {id} module {ri},{ci}: {v}");
+                        }
+                    }
+                }
+                // one module of paper around the marker (a dashed grey outline may cross it: >= 100)
+                let q = cell;
+                let px = |mm: f64| (mm * k).round() as i64;
+                let (a0, b0, a1, b1) = (
+                    px(x0 - q) + 1,
+                    px(y0 - q) + 1,
+                    px(x1 + q) - 1,
+                    px(y1 + q) - 1,
+                );
+                let (i0, j0, i1, j1) = (
+                    (x0 * k).floor() as i64 - 1,
+                    (y0 * k).floor() as i64 - 1,
+                    (x1 * k).ceil() as i64,
+                    (y1 * k).ceil() as i64,
+                );
+                for y in b0..b1 {
+                    for xx in a0..a1 {
+                        if xx > i0 && xx < i1 && y > j0 && y < j1 {
+                            continue;
+                        }
+                        assert!(
+                            luma(&img, xx as u32, y as u32) >= 100,
+                            "{paper}@{dpi} quiet zone of id {id} is not paper at px {xx},{y}"
+                        );
+                    }
+                }
+            }
+            let board_ids: Vec<usize> = ids.iter().copied().filter(|i| *i >= 8).collect();
+            let mut sorted = ids.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), ids.len(), "{paper}: duplicate marker ids");
+            for want in 0..4 {
+                assert!(ids.contains(&want), "{paper} lacks corner marker {want}");
+            }
+            if !land && (paper == "A4" || paper == "LETTER" || paper == "A3") {
+                for want in 0..8 {
+                    assert!(ids.contains(&want), "{paper} lacks marker {want}");
+                }
+                assert_eq!(board_ids.len(), 12, "{paper} ChArUco markers");
+            }
+        }
+    }
+
+    #[test]
+    fn marker_edge_ids_and_positions() {
+        let l = build_layout(&spec("A4", false, 100)).json();
+        for (id, aid) in [
+            ("marker_tl", 0),
+            ("marker_tr", 1),
+            ("marker_br", 2),
+            ("marker_bl", 3),
+            ("marker_tm", 4),
+            ("marker_mr", 5),
+            ("marker_bm", 6),
+            ("marker_ml", 7),
+        ] {
+            let e = el(&l, id);
+            assert_eq!(e["drawn"], true, "{id}");
+            assert_eq!(e["expected"]["marker_id"], aid, "{id}");
+        }
+        // edge midpoints are centred on the sheet axes
+        let cx = f(&l["box_mm"][0]) / 2.0;
+        for id in ["marker_tm", "marker_bm"] {
+            let r = &el(&l, id)["rect_mm"];
+            assert!(((f(&r[0]) + f(&r[2])) / 2.0 - cx).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn ruler_ticks_match_the_rendering_at_several_dpis_and_papers() {
+        let mut checked = 0usize;
+        for (paper, land, dpi) in SHEETS {
+            let sp = spec(paper, land, dpi);
+            if dpi < 100 {
+                continue;
+            }
+            let (img, lay) = render(&sp);
+            let l = lay.json();
+            let k = sp.k();
+            for e in l["elements"].as_array().unwrap() {
+                if e["kind"] != "ruler" || e["drawn"] != true {
+                    continue;
+                }
+                let x = &e["expected"];
+                let horizontal = x["axis"] == "x";
+                let pitch = f(&x["pitch_mm"]);
+                let (a0, edge) = (f(&x["zero_line_mm"]), f(&x["tick_edge_mm"]));
+                let d = if matches!(x["ticks_point"].as_str().unwrap(), "down" | "right") {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let cross = edge + d * 0.7;
+                let pos = x["ticks"]["pos_mm"].as_array().unwrap();
+                let len = x["ticks"]["length_mm"].as_array().unwrap();
+                assert_eq!(pos.len(), len.len());
+                assert!(!pos.is_empty());
+                // dashed grey media outlines may cross a ruler: skip ticks next to their edges
+                let edges: Vec<[f64; 2]> = l["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|o| {
+                        o["drawn"] == true && o["id"].as_str().unwrap().starts_with("outline_")
+                    })
+                    .map(|o| [f(&o["rect_mm"][2]), f(&o["rect_mm"][3])])
+                    .collect();
+                let near = |along: f64, across: f64| {
+                    edges.iter().any(|q| {
+                        let (qa, qc) = if horizontal {
+                            (q[0], q[1])
+                        } else {
+                            (q[1], q[0])
+                        };
+                        (along - qa).abs() < 1.5 || (across - qc).abs() < 1.5
+                    })
+                };
+                for (p, ln) in pos.iter().zip(len) {
+                    let a = a0 + f(p);
+                    if near(a, cross) {
+                        continue;
+                    }
+                    // centroid of darkness around the tick along the axis
+                    let (mut sw, mut swx) = (0.0, 0.0);
+                    let lo = ((a - pitch / 2.0) * k).ceil() as i64;
+                    let hi = ((a + pitch / 2.0) * k).floor() as i64;
+                    for i in lo..hi {
+                        let (ix, iy) = if horizontal {
+                            (i, (cross * k) as i64)
+                        } else {
+                            ((cross * k) as i64, i)
+                        };
+                        let w = (255 - luma(&img, ix as u32, iy as u32)) as f64;
+                        sw += w;
+                        swx += w * ((i as f64 + 0.5) / k);
+                    }
+                    assert!(sw > 0.0, "{paper}@{dpi} {} no ink at tick {p}", e["id"]);
+                    let c = swx / sw;
+                    assert!(
+                        (c - a).abs() < 0.5 * 25.4 / dpi as f64 + 0.03,
+                        "{paper}@{dpi} {} tick at {a:.3} mm measured {c:.3}",
+                        e["id"]
+                    );
+                    assert!(f(ln) >= 1.2 - 1e-9);
+                    checked += 1;
+                }
+                // tick pitch from the table is exactly 1 mm or 25.4/16 mm
+                let unit = x["unit"].as_str().unwrap();
+                let want = if unit == "mm" { 1.0 } else { 25.4 / 16.0 };
+                assert!((pitch - want).abs() < 1e-12);
+                for w in x["ticks"]["pos_mm"].as_array().unwrap().windows(2) {
+                    let step = f(&w[1]) - f(&w[0]);
+                    assert!(step > 0.0 && (step / pitch - (step / pitch).round()).abs() < 1e-9);
+                }
+            }
+        }
+        assert!(checked > 2000, "only {checked} ticks checked");
+    }
+
+    #[test]
+    fn rulers_are_dual_sided_on_both_axes_from_one_zero_line() {
+        let l = build_layout(&spec("A4", false, 100)).json();
+        for (m, i, axis) in [
+            ("ruler_metric", "ruler_inch", "x"),
+            ("ruler_v_metric", "ruler_v_inch", "y"),
+            ("ruler_vr_metric", "ruler_vr_inch", "y"),
+        ] {
+            let (em, ei) = (el(&l, m), el(&l, i));
+            assert_eq!(em["drawn"], true);
+            assert_eq!(ei["drawn"], true);
+            let (xm, xi) = (&em["expected"], &ei["expected"]);
+            assert_eq!(xm["axis"], axis);
+            assert_eq!(xi["axis"], axis);
+            // same zero line, opposite edges
+            assert!((f(&xm["zero_line_mm"]) - f(&xi["zero_line_mm"])).abs() < 1e-9);
+            assert!((f(&xm["tick_edge_mm"]) - f(&xi["tick_edge_mm"])).abs() > 5.0);
+            assert_eq!(xm["tiers"], json!([[1, 1.5], [5, 2.5], [10, 3.5]]));
+            assert_eq!(
+                xi["tiers"],
+                json!([[1, 1.2], [2, 1.8], [4, 2.4], [8, 3.0], [16, 3.6]])
+            );
+            assert!(f(&xm["span_mm"]) >= 100.0);
+        }
+        assert!(f(&el(&l, "ruler_v_metric")["expected"]["span_mm"]) >= 200.0);
+    }
+
+    #[test]
+    fn rulers_parameter_selects_the_scales_and_rides_the_qr() {
+        for (r, metric, inch) in [
+            (Rulers::Both, true, true),
+            (Rulers::Metric, true, false),
+            (Rulers::Inch, false, true),
+        ] {
+            let mut sp = spec("A4", false, 100);
+            sp.rulers = r;
+            let l = build_layout(&sp).json();
+            assert_eq!(l["spec"]["rulers"], r.as_str());
+            for (m, i) in [
+                ("ruler_metric", "ruler_inch"),
+                ("ruler_v_metric", "ruler_v_inch"),
+            ] {
+                assert_eq!(el(&l, m)["drawn"], metric);
+                assert_eq!(el(&l, i)["drawn"], inch);
+            }
+            assert!(sp.qr_payload().contains(&format!("|rl={}|", r.as_str())));
+            assert_eq!(
+                PageSpec::from_qr_payload(&sp.qr_payload()).unwrap().rulers,
+                r
+            );
+            let (a, _) = render(&sp);
+            let (b, _) = render(&PageSpec::from_qr_payload(&sp.qr_payload()).unwrap());
+            assert_eq!(a.as_raw(), b.as_raw());
+            check_samples(&sp);
+        }
+    }
+
+    #[test]
+    fn qr_payload_names_the_revision_dictionary_and_ids_and_old_payloads_still_parse() {
+        let sp = spec("A4", false, 100);
+        let p = sp.qr_payload();
+        assert!(p.contains("|lay=3|") && p.contains("|rev=1|") && p.contains("|ar=4x4_50|"));
+        assert!(p.contains("|id=0-19"));
+        let old = "fakescan|v1|page=2|pat=diag|side=front|lay=3|paper=A4|px=816x1144|dpi=100|m=4|b=0|copy=1|of=4|bn=44|g=0|job=AB-1";
+        let s = PageSpec::from_qr_payload(old).unwrap();
+        assert_eq!((s.page, s.dpi, s.rulers), (2, 100, Rulers::Both));
+        assert_eq!(s.job, "AB-1");
+    }
+
+    #[test]
+    fn calibration_boards_are_described_exactly() {
+        let l = build_layout(&spec("A4", false, 150)).json();
+        let ch = el(&l, "chessboard");
+        assert_eq!(ch["drawn"], true);
+        assert_eq!(ch["expected"]["inner_corners"], json!([8, 5]));
+        assert_eq!(
+            ch["expected"]["inner_corner_positions_mm"]
+                .as_array()
+                .unwrap()
+                .len(),
+            40
+        );
+        let cb = el(&l, "charuco_board");
+        assert_eq!(cb["drawn"], true);
+        let ids: Vec<u64> = cb["expected"]["marker_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, (8..20).collect::<Vec<u64>>());
+        assert_eq!(cb["expected"]["corner_count"], 15);
+        assert_eq!(cb["expected"]["legacy_pattern"], false);
+        let cg = el(&l, "circle_grid");
+        assert_eq!(cg["drawn"], true);
+        assert_eq!(cg["expected"]["points"], 30);
+        assert_eq!(cg["expected"]["pattern"], "asymmetric");
+        // squares are at least the documented minimum
+        assert!(f(&ch["expected"]["square_mm"]) >= fid::MIN_SQUARE_MM);
+        // every circle has a vector primitive
+        let n = l["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["id"] == "circle_grid" && p["op"] == "circle" && p["vector"] == true)
+            .count();
+        assert_eq!(n, 30);
+        // markers and boards are vector only (rect / polygon / circle): no raster-only op carries them
+        for p in l["primitives"].as_array().unwrap() {
+            let id = p["id"].as_str().unwrap();
+            if id.starts_with("marker_")
+                || id.starts_with("charuco")
+                || id.starts_with("bracket_")
+                || id == "chessboard"
+                || id.starts_with("ruler")
+            {
+                assert_eq!(p["vector"], true, "{id}");
+            }
+        }
+    }
+
+    #[test]
+    fn small_sheets_drop_the_columns_and_boards_with_a_reason() {
+        let l = build_layout(&spec("A6", false, 100)).json();
+        for id in ["marker_ml", "marker_mr", "ruler_v_metric", "bracket_tl"] {
+            let e = el(&l, id);
+            assert_eq!(e["drawn"], false, "{id}");
+            assert!(e["reason"].as_str().unwrap().contains("too small"), "{id}");
+        }
+        for e in l["elements"].as_array().unwrap() {
+            if e["drawn"] == false {
+                assert!(e["reason"].is_string(), "{} lacks a reason", e["id"]);
+            }
+        }
+    }
+
+    #[test]
+    fn markers_render_as_vector_rects_without_seams() {
+        // a marker module edge at a fractional pixel must not leave a lighter seam inside a black run
+        let sp = spec("A4", false, 100);
+        let (img, lay) = render(&sp);
+        let l = lay.json();
+        let e = el(&l, "marker_tl");
+        let r = &e["rect_mm"];
+        let k = sp.k();
+        let cell = f(&e["expected"]["module_mm"]);
+        // the top border row of 6 black modules is one run: every pixel inside is fully black
+        let y = (f(&r[1]) + cell * 0.5) * k;
+        for xi in ((f(&r[0]) + 1.0 / k) * k) as u32..((f(&r[2]) - 1.0 / k) * k) as u32 {
+            assert_eq!(luma(&img, xi, y as u32), 0, "seam at {xi}");
         }
     }
 

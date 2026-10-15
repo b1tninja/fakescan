@@ -42,7 +42,7 @@ curl -X POST http://127.0.0.1:3920/v1/pattern \
 
 | Id | Purpose |
 |----|---------|
-| `diag` | **Default.** Parametric diagnostic page, layout v3 (print marks, colour bars, ColorChecker, ramps, flat fields, resolution targets, orientation / duplex / page-order markers, QR with the page parameters); scales to the sheet. [diag-page-v3.md](diag-page-v3.md) |
+| `diag` | **Default.** Parametric diagnostic page, layout v3 revision 1 (print marks, colour bars, ColorChecker, ramps, flat fields, resolution targets, orientation / duplex / page-order markers, OpenCV-compatible ArUco markers, chessboard / ChArUco / circle-grid boards, dual-unit rulers, QR with the page parameters); scales to the sheet. [diag-page-v3.md](diag-page-v3.md) |
 | `page_id` | Numbered bars + center block (multi-page order); the previous default, see `--default-pattern` |
 | `wedges` | Gray step wedges (brightness / contrast / threshold) |
 | `patches` | R / G / B + gray patches (color mode) |
