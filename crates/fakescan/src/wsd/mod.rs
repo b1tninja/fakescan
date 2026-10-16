@@ -24,7 +24,6 @@ use uuid::Uuid;
 
 use crate::state::World;
 use crate::wsd::responses::jfif_wire_color;
-use crate::wsd::soap::SCAN_NS;
 use crate::wsd::xml::Element;
 
 /// See `elements::published_capability_xml`.
@@ -154,7 +153,7 @@ pub async fn scanner_service(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
-                soap::fault_with_code(subcode.as_deref(), &reason, relates.as_deref()),
+                soap::fault_with_code(subcode.as_deref(), &reason, relates),
             )
                 .into_response()
         }
@@ -181,6 +180,7 @@ enum SoapOut {
 
 /// All XSD-authorized fault subcodes + common real-driver extensions that
 /// drivers like Brother and Canon emit during actual scanning.
+#[allow(dead_code)] // reference list of the fault subcodes; not consulted by the server yet
 const ALL_FAULT_SUBCODES: &[&str] = &[
     "wscn:InvalidArgs",
     "wscn:OperationFailed",
