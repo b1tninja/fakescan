@@ -639,6 +639,7 @@ mod tests {
             page_index: 1,
             sheet_base: 0,
             stack_total: 0,
+            sheets_taken: 0,
             duplex: false,
             created_at: std::time::Instant::now(),
             last_activity: std::time::Instant::now(),

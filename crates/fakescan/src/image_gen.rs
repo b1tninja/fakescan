@@ -1,6 +1,6 @@
 //! Synthetic page bitmaps for RetrieveImage.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use image::{ImageBuffer, Rgb, RgbImage};
 use qrcode::{EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
@@ -576,7 +576,11 @@ pub fn encode_pattern_pages_ctx(
     let effective_dpi = {
         let (cw, _) = capped_page_pixels(dpi);
         let (ow, _) = optical_page_pixels(dpi);
-        if cw != ow { 150 } else { dpi }
+        if cw != ow {
+            150
+        } else {
+            dpi
+        }
     };
     let spec = PixelSpec {
         color,
@@ -1789,7 +1793,7 @@ fn encode_tiff_g3mh(imgs: &[&RgbImage], dpi: u32) -> Result<Vec<u8>> {
 }
 
 fn encode_g3mh_strip(img: &RgbImage) -> Result<Vec<u8>> {
-    use fax::maps::{EOL, black, white};
+    use fax::maps::{black, white, EOL};
     use fax::{BitWriter, Color, VecWriter};
 
     let w = img.width();
@@ -2234,8 +2238,8 @@ fn encode_xps_pages(
     gray: bool,
 ) -> Result<Vec<u8>> {
     use std::io::{Cursor, Write};
-    use zip::CompressionMethod;
     use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
 
     let mut jpegs = Vec::with_capacity(pages.len());
     for (img, idx, side) in pages {
@@ -5161,12 +5165,11 @@ mod bilevel_tests {
         assert_eq!(bmp.bpp, 8);
         assert!(!bmp.top_down, "8-bpp stays bottom-up");
         assert_eq!(bmp.palette.len(), 256);
-        assert!(
-            bmp.palette
-                .iter()
-                .enumerate()
-                .all(|(i, &v)| v as usize == i)
-        );
+        assert!(bmp
+            .palette
+            .iter()
+            .enumerate()
+            .all(|(i, &v)| v as usize == i));
         assert_eq!(bmp.stride, bmp.w.div_ceil(4) as usize * 4);
         assert_matches_ref(&bmp, &reference(ColorMode::Gray8, DPI, 0));
         let levels: std::collections::HashSet<u8> = bmp.pixels.iter().copied().collect();
@@ -5211,7 +5214,11 @@ mod bilevel_tests {
             let opt = |tag: u32| {
                 t.get(&tag).map(
                     |&(typ, _, at)| {
-                        if typ == 3 { u16le(b, at) } else { u32le(b, at) }
+                        if typ == 3 {
+                            u16le(b, at)
+                        } else {
+                            u32le(b, at)
+                        }
                     },
                 )
             };
@@ -5667,13 +5674,12 @@ mod bilevel_tests {
         })
         .unwrap();
         assert_eq!(e.bilevel_polarity, BilevelPolarity::BlackIsZero);
-        assert!(
-            e.apply_body(&EffectsBody {
+        assert!(e
+            .apply_body(&EffectsBody {
                 bilevel_polarity: Some("x".into()),
                 ..Default::default()
             })
-            .is_err()
-        );
+            .is_err());
     }
 }
 
