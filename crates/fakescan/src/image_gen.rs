@@ -1,6 +1,6 @@
 //! Synthetic page bitmaps for RetrieveImage.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use image::{ImageBuffer, Rgb, RgbImage};
 use qrcode::{EcLevel, QrCode};
 use serde::{Deserialize, Serialize};
@@ -576,11 +576,7 @@ pub fn encode_pattern_pages_ctx(
     let effective_dpi = {
         let (cw, _) = capped_page_pixels(dpi);
         let (ow, _) = optical_page_pixels(dpi);
-        if cw != ow {
-            150
-        } else {
-            dpi
-        }
+        if cw != ow { 150 } else { dpi }
     };
     let spec = PixelSpec {
         color,
@@ -921,7 +917,19 @@ pub fn encode_image(
     page_index: u32,
     side: Option<PageSide>,
 ) -> Result<Vec<u8>> {
-    let dpi = jfif_dpi_from_img(&img);
+    encode_image_at(wsd_format, img, page_index, side, None)
+}
+
+/// [`encode_image`] at a known resolution. `None` falls back to inferring it from a letter-wide page, which is
+/// only right for letter-wide images: an uploaded loopback page passes the density it carries ([`image_dpi`]).
+pub fn encode_image_at(
+    wsd_format: &str,
+    img: RgbImage,
+    page_index: u32,
+    side: Option<PageSide>,
+    dpi: Option<u32>,
+) -> Result<Vec<u8>> {
+    let dpi = dpi.unwrap_or_else(|| jfif_dpi_from_img(&img));
     encode_images(
         wsd_format,
         &[(img, page_index, side)],
@@ -1090,6 +1098,60 @@ fn take_single<'a>(
         bail!("{format} is single-page; got {} sheets", pages.len());
     }
     Ok((&pages[0].0, pages[0].1, pages[0].2))
+}
+
+/// The horizontal resolution an encoded image carries, in dots per inch: JFIF `APP0` (units 1 = inch, 2 = cm), PNG
+/// `pHYs` (per metre) or BMP pels per metre. `None` when it carries none that can be used.
+pub fn image_dpi(bytes: &[u8]) -> Option<u32> {
+    let sane =
+        |dpi: f64| (dpi.is_finite() && (10.0..=9600.0).contains(&dpi)).then(|| dpi.round() as u32);
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        // Walk the markers to APP0 "JFIF\0".
+        let mut at = 2usize;
+        while at + 4 <= bytes.len() && bytes[at] == 0xFF {
+            let marker = bytes[at + 1];
+            let len = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+            if marker == 0xE0 && bytes.get(at + 4..at + 9) == Some(b"JFIF\0".as_slice()) {
+                let units = *bytes.get(at + 11)?;
+                let x = u16::from_be_bytes([*bytes.get(at + 12)?, *bytes.get(at + 13)?]);
+                return match units {
+                    1 => sane(f64::from(x)),
+                    2 => sane(f64::from(x) * 2.54),
+                    _ => None,
+                };
+            }
+            if marker == 0xDA || len < 2 {
+                return None;
+            }
+            at += 2 + len;
+        }
+        return None;
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let mut at = 8usize;
+        while at + 8 <= bytes.len() {
+            let len = u32::from_be_bytes(bytes[at..at + 4].try_into().ok()?) as usize;
+            if &bytes[at + 4..at + 8] == b"pHYs" && len >= 9 {
+                let x = u32::from_be_bytes(bytes.get(at + 8..at + 12)?.try_into().ok()?);
+                return if *bytes.get(at + 16)? == 1 {
+                    sane(f64::from(x) * 0.0254)
+                } else {
+                    None
+                };
+            }
+            at += 12 + len;
+        }
+        return None;
+    }
+    if bytes.starts_with(b"BM") && bytes.len() >= 42 {
+        let x = i32::from_le_bytes(bytes[38..42].try_into().ok()?);
+        return if x > 0 {
+            sane(f64::from(x) * 0.0254)
+        } else {
+            None
+        };
+    }
+    None
 }
 
 /// Infer JFIF density from letter-sized RGB dimensions (fallback for encode_image).
@@ -1727,7 +1789,7 @@ fn encode_tiff_g3mh(imgs: &[&RgbImage], dpi: u32) -> Result<Vec<u8>> {
 }
 
 fn encode_g3mh_strip(img: &RgbImage) -> Result<Vec<u8>> {
-    use fax::maps::{black, white, EOL};
+    use fax::maps::{EOL, black, white};
     use fax::{BitWriter, Color, VecWriter};
 
     let w = img.width();
@@ -2172,8 +2234,8 @@ fn encode_xps_pages(
     gray: bool,
 ) -> Result<Vec<u8>> {
     use std::io::{Cursor, Write};
-    use zip::write::SimpleFileOptions;
     use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
 
     let mut jpegs = Vec::with_capacity(pages.len());
     for (img, idx, side) in pages {
@@ -5099,11 +5161,12 @@ mod bilevel_tests {
         assert_eq!(bmp.bpp, 8);
         assert!(!bmp.top_down, "8-bpp stays bottom-up");
         assert_eq!(bmp.palette.len(), 256);
-        assert!(bmp
-            .palette
-            .iter()
-            .enumerate()
-            .all(|(i, &v)| v as usize == i));
+        assert!(
+            bmp.palette
+                .iter()
+                .enumerate()
+                .all(|(i, &v)| v as usize == i)
+        );
         assert_eq!(bmp.stride, bmp.w.div_ceil(4) as usize * 4);
         assert_matches_ref(&bmp, &reference(ColorMode::Gray8, DPI, 0));
         let levels: std::collections::HashSet<u8> = bmp.pixels.iter().copied().collect();
@@ -5148,11 +5211,7 @@ mod bilevel_tests {
             let opt = |tag: u32| {
                 t.get(&tag).map(
                     |&(typ, _, at)| {
-                        if typ == 3 {
-                            u16le(b, at)
-                        } else {
-                            u32le(b, at)
-                        }
+                        if typ == 3 { u16le(b, at) } else { u32le(b, at) }
                     },
                 )
             };
@@ -5608,12 +5667,13 @@ mod bilevel_tests {
         })
         .unwrap();
         assert_eq!(e.bilevel_polarity, BilevelPolarity::BlackIsZero);
-        assert!(e
-            .apply_body(&EffectsBody {
+        assert!(
+            e.apply_body(&EffectsBody {
                 bilevel_polarity: Some("x".into()),
                 ..Default::default()
             })
-            .is_err());
+            .is_err()
+        );
     }
 }
 
@@ -5695,6 +5755,36 @@ mod container_tests {
         assert_eq!(typ, 5, "tag {tag} is a RATIONAL");
         let off = u32le(b, at) as usize;
         (u32le(b, off), u32le(b, off + 4))
+    }
+
+    #[test]
+    fn a_reencoded_upload_keeps_the_resolution_it_carries_whatever_its_width() {
+        // An A4-wide page at 100 dpi and an A5-wide page at 200 dpi: inferring from a letter width gave 97 and 137.
+        for (width, dpi) in [(827u32, 100u32), (1165, 200), (850, 100)] {
+            let img = RgbImage::from_pixel(width, 40, image::Rgb([200, 200, 200]));
+            let jfif = encode_images(
+                "jfif",
+                &[(img, 0, None)],
+                90,
+                EncodeOpts::default(),
+                dpi,
+                PixelSpec::default(),
+            )
+            .expect("jfif");
+            assert_eq!(image_dpi(&jfif), Some(dpi), "{width} px at {dpi} dpi");
+            let decoded = image::load_from_memory(&jfif).expect("decode").to_rgb8();
+            let tiff = encode_image_at(
+                "tiff-single-uncompressed",
+                decoded,
+                0,
+                None,
+                image_dpi(&jfif),
+            )
+            .expect("tiff");
+            assert_tiff_dpi(&tiff, dpi, &format!("{width} px"));
+        }
+        // Without a density the old inference still applies.
+        assert_eq!(image_dpi(b"not an image"), None);
     }
 
     fn assert_tiff_dpi(b: &[u8], dpi: u32, label: &str) {

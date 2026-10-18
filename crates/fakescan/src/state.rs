@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -3103,8 +3103,9 @@ fn emit_loopback(store: &[Vec<u8>], format: &str, sheets: &[u32]) -> Result<Vec<
     let img = image::load_from_memory(raw)
         .map_err(|e| anyhow!("loopback: decode page {}: {e}", sheets[0]))?
         .to_rgb8();
-    // Re-encode without COM so the blob stays close to the uploaded pixels.
-    image_gen::encode_image(&fmt, img, sheets[0], None)
+    // Re-encode without COM so the blob stays close to the uploaded pixels, at the resolution the upload carries: inferring
+    // it from a letter-wide page labelled an A4 page at 100 dpi as 97 dpi (and an A5 page at 200 dpi as 137).
+    image_gen::encode_image_at(&fmt, img, sheets[0], None, image_gen::image_dpi(raw))
 }
 
 /// Resolve JPEG COM enablement: `FAKESCAN_JPEG_COM` overrides the profile default.
@@ -3439,7 +3440,7 @@ fn extract_resolution(xml: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{boot_sequence_id, DiscoveryStats};
+    use crate::discovery::{DiscoveryStats, boot_sequence_id};
 
     fn brother_wsd() -> World {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
