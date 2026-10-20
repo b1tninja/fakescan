@@ -2477,6 +2477,11 @@ async fn create_with_source(w: &Arc<RwLock<World>>, source: &str) -> (StatusCode
     post_soap(app(w.clone()), &create).await
 }
 
+/// An empty-feeder delay that is long next to scheduler jitter on a loaded CI runner, so that "did not wait for it" is told
+/// from "was slow" by a wide margin: a path that must not wait finishes in under [`FAST`], half of it.
+const DELAY_MS: u64 = 3000;
+const FAST: std::time::Duration = std::time::Duration::from_millis(DELAY_MS / 2);
+
 async fn arm_empty_feeder(w: &Arc<RwLock<World>>, delay_ms: u64) {
     w.write().await.apply_faults(&fakescan::state::FaultBody {
         empty_feeder_brother: Some(true),
@@ -2522,17 +2527,15 @@ async fn empty_feeder_brother_refuses_feeder_job_busy_after_delay() {
 #[tokio::test]
 async fn empty_feeder_brother_does_not_block_other_requests_during_delay() {
     let w = world();
-    arm_empty_feeder(&w, 400).await;
+    // The delay is long next to any scheduling jitter, and the poll must come back in well under half of it.
+    arm_empty_feeder(&w, DELAY_MS).await;
     let w2 = w.clone();
     let slow = tokio::spawn(async move { create_with_source(&w2, "Feeder").await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let t0 = std::time::Instant::now();
     let (st, body) = post_soap(app(w.clone()), scanner_status_request()).await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    assert!(
-        t0.elapsed() < std::time::Duration::from_millis(250),
-        "status poll blocked by the delay"
-    );
+    assert!(t0.elapsed() < FAST, "status poll blocked by the delay");
     let (st, _) = slow.await.unwrap();
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
 }
@@ -2540,22 +2543,28 @@ async fn empty_feeder_brother_does_not_block_other_requests_during_delay() {
 #[tokio::test]
 async fn empty_feeder_brother_with_sheets_scans_normally() {
     let w = world();
-    arm_empty_feeder(&w, 150).await;
+    arm_empty_feeder(&w, DELAY_MS).await;
     w.write().await.set_pages(2);
     let t0 = std::time::Instant::now();
     let (st, body) = create_with_source(&w, "Feeder").await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    assert!(t0.elapsed() < std::time::Duration::from_millis(150));
+    assert!(
+        t0.elapsed() < FAST,
+        "a feeder with sheets must not pay the empty-feeder delay"
+    );
 }
 
 #[tokio::test]
 async fn empty_feeder_brother_glass_job_is_normal() {
     let w = world();
-    arm_empty_feeder(&w, 150).await;
+    arm_empty_feeder(&w, DELAY_MS).await;
     let t0 = std::time::Instant::now();
     let (st, body) = create_with_source(&w, "Platen").await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    assert!(t0.elapsed() < std::time::Duration::from_millis(150));
+    assert!(
+        t0.elapsed() < FAST,
+        "a glass job must not pay the empty-feeder delay"
+    );
 }
 
 #[tokio::test]
@@ -2564,7 +2573,10 @@ async fn empty_feeder_unarmed_keeps_quick_generic_failure() {
     w.write().await.set_feeder(false);
     let t0 = std::time::Instant::now();
     let (st, body) = create_with_source(&w, "Feeder").await;
-    assert!(t0.elapsed() < std::time::Duration::from_millis(100));
+    assert!(
+        t0.elapsed() < FAST,
+        "an unarmed empty feeder fails at once, not after the Brother delay"
+    );
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("feeder empty"), "{body}");
     assert!(!body.contains("ServerErrorNotAcceptingJobs"), "{body}");
