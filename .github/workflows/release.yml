@@ -21,6 +21,10 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# The build jobs only read the repository. The release job raises what it needs for itself.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   BIN: fakescan
@@ -33,6 +37,8 @@ jobs:
       version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - id: v
         shell: bash
         run: |
@@ -61,6 +67,8 @@ jobs:
           - { os: macos-latest,    target: x86_64-apple-darwin,       archive: tar.gz }
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -83,8 +91,11 @@ jobs:
 
       - name: package
         shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
-          name="${{ env.BIN }}-${{ needs.version.outputs.version }}-${{ matrix.target }}"
+          name="${BIN}-${VERSION}-${TARGET}"
           mkdir -p "dist/$name"
           exe="target/${{ matrix.target }}/release/${{ env.BIN }}"
           [[ "${{ runner.os }}" == "Windows" ]] && exe="$exe.exe"
@@ -133,6 +144,7 @@ jobs:
         with:
           sparse-checkout: .github/scripts
           path: _repo
+          persist-credentials: false
 
       - name: no Microsoft specification files in any artifact
         run: bash _repo/.github/scripts/check-artifacts.sh dist/*
