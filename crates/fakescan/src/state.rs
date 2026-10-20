@@ -64,6 +64,9 @@ pub struct ScanJob {
     /// Sheets in the loaded stack at Create (for `order=reverse`); equals the job's own
     /// sheet count when the job takes the whole stack.
     pub stack_total: u32,
+    /// Feeder sheets this job took from the tray at Create (0 for glass). A cancel or a timeout puts the ones it
+    /// never fed back ([`Self::unfed_sheets`]): a real feeder keeps the sheets it did not pull.
+    pub sheets_taken: u32,
     /// Hardware ADF duplex: each sheet yields front then back (2 faces).
     pub duplex: bool,
     /// When CreateScanJob accepted the ticket (JobTimedOut clock).
@@ -96,6 +99,16 @@ impl ScanJob {
     /// there while a stack scanned as several one-page jobs still counts 1, 2, 3.
     pub fn stack_position(&self) -> u32 {
         self.sheet_base * if self.duplex { 2 } else { 1 } + self.page_index
+    }
+
+    /// Sheets taken at Create that were never fed: a duplex sheet whose front was delivered is fed.
+    pub fn unfed_sheets(&self) -> u32 {
+        let fed = if self.duplex {
+            self.page_index.div_ceil(2)
+        } else {
+            self.page_index
+        };
+        self.sheets_taken.saturating_sub(fed)
     }
 
     pub fn job_state(&self) -> &'static str {
@@ -977,10 +990,12 @@ impl World {
             .jobs
             .get_mut(&job_id)
             .ok_or_else(|| anyhow!("job {job_id} not found"))?;
+        let unfed = if job.aborted { 0 } else { job.unfed_sheets() };
         job.aborted = true;
         job.state_reason = "JobTimedOut".into();
         job.pages_left = 0;
         let snap = job.clone();
+        self.return_sheets(unfed);
         self.push_job_history(&snap, "Aborted", "JobTimedOut");
         self.note(
             "job",
@@ -2646,6 +2661,7 @@ impl World {
         let duplex = wants_duplex && self.profile.feeder.duplex;
         let mut sheet_base = 0;
         let mut stack_total = 0;
+        let mut sheets_taken = 0;
         let pages = if is_adf {
             // Sticky FEED_READY can stay true with an empty stack (Brother quirk).
             // ADF Create still fails so Auto can fall back to glass.
@@ -2677,7 +2693,7 @@ impl World {
             };
             // A job consumes only the sheets it asked for (a real feeder keeps the rest
             // loaded for the next CreateScanJob); 0 / absent takes everything left.
-            let sheets_taken = if duplex { n.div_ceil(2) } else { n }.min(sheets);
+            sheets_taken = if duplex { n.div_ceil(2) } else { n }.min(sheets);
             sheet_base = self.feeder_loaded.saturating_sub(self.pages_remaining);
             stack_total = self.feeder_loaded.max(sheet_base + sheets);
             self.pages_remaining -= sheets_taken;
@@ -2709,6 +2725,7 @@ impl World {
             page_index: 0,
             sheet_base,
             stack_total,
+            sheets_taken,
             duplex,
             created_at: now,
             last_activity: now,
@@ -2740,6 +2757,7 @@ impl World {
             if !job.aborted && job.pages_left > 0 {
                 job.state_reason = "JobCanceledAtDevice".into();
                 self.push_job_history(&job, "Canceled", "JobCanceledAtDevice");
+                self.return_sheets(job.unfed_sheets());
             } else if job.pages_left == 0 && !job.aborted {
                 // Already completed via Retrieve — history may already hold it.
             }
@@ -2754,6 +2772,15 @@ impl World {
             &format!("id={job_id} removed={removed}"),
         );
         Ok(())
+    }
+
+    /// Sheets a cancelled or timed-out job never fed go back on the tray, so the next job starts at the first of them.
+    fn return_sheets(&mut self, sheets: u32) {
+        if sheets == 0 {
+            return;
+        }
+        self.pages_remaining = self.pages_remaining.saturating_add(sheets);
+        self.feeder_ready = true;
     }
 
     pub fn jobs_snapshot(&self) -> Vec<ScanJob> {
@@ -3103,8 +3130,9 @@ fn emit_loopback(store: &[Vec<u8>], format: &str, sheets: &[u32]) -> Result<Vec<
     let img = image::load_from_memory(raw)
         .map_err(|e| anyhow!("loopback: decode page {}: {e}", sheets[0]))?
         .to_rgb8();
-    // Re-encode without COM so the blob stays close to the uploaded pixels.
-    image_gen::encode_image(&fmt, img, sheets[0], None)
+    // Re-encode without COM so the blob stays close to the uploaded pixels, at the resolution the upload carries: inferring
+    // it from a letter-wide page labelled an A4 page at 100 dpi as 97 dpi (and an A5 page at 200 dpi as 137).
+    image_gen::encode_image_at(&fmt, img, sheets[0], None, image_gen::image_dpi(raw))
 }
 
 /// Resolve JPEG COM enablement: `FAKESCAN_JPEG_COM` overrides the profile default.
@@ -4799,6 +4827,79 @@ mod tests {
         assert_eq!(after.pages_remaining, 0);
         assert!(after.feeder_ready);
         assert!(after.sticky_ready);
+    }
+
+    /// A cancel mid-stack leaves the sheets the feeder never pulled in the tray (measured on Windows' own client: cancel
+    /// at 3 of 20 sheets, 5 fetched, then CancelJob); the next job starts at the first of them.
+    #[test]
+    fn a_cancelled_job_leaves_the_sheets_it_never_fed_in_the_tray() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        let mut w = World::new(
+            dir.clone(),
+            Profile::load(&dir, "wia-rich").expect("wia-rich"),
+        );
+        w.set_jpeg_com(true);
+        w.set_pages(20);
+        let all = ADF_ONE.replace("ImagesToTransfer>1<", "ImagesToTransfer>0<");
+        let job = w.create_job(&all).expect("create");
+        assert_eq!(
+            (job.pages_left, w.pages_remaining()),
+            (20, 0),
+            "the whole stack is the job's"
+        );
+        for _ in 0..5 {
+            w.retrieve_image(job.id, &job.token).expect("page");
+        }
+        w.cancel_job(job.id).unwrap();
+        assert_eq!(w.pages_remaining(), 15);
+        assert!(w.status().feeder_ready);
+        let next = w.create_job(ADF_ONE).expect("next job");
+        assert_eq!(next.sheet_base, 5);
+        let (_, bytes) = w.retrieve_image(next.id, &next.token).expect("page");
+        assert_eq!(
+            image_gen::read_page_marker(&bytes),
+            Some(5),
+            "the next job scans the sixth sheet"
+        );
+        // A cancel after the job completed returns nothing.
+        w.cancel_job(next.id).unwrap();
+        assert_eq!(w.pages_remaining(), 14);
+    }
+
+    /// A duplex sheet whose front was delivered has been fed; only untouched sheets go back. A timed-out job returns
+    /// its unfed sheets the same way.
+    #[test]
+    fn a_cancelled_or_timed_out_duplex_job_returns_only_untouched_sheets() {
+        let body = r#"
+          <wscn:Format>jfif</wscn:Format>
+          <wscn:ImagesToTransfer>0</wscn:ImagesToTransfer>
+          <wscn:InputSource>ADFDuplex</wscn:InputSource>
+          <wscn:Resolution><wscn:Width>100</wscn:Width><wscn:Height>100</wscn:Height></wscn:Resolution>
+        "#;
+        let mut w = brother_wsd_duplex();
+        w.set_pages(4);
+        let job = w.create_job(body).expect("create duplex");
+        for _ in 0..3 {
+            w.retrieve_image(job.id, &job.token).expect("face"); // sheet 1 front and back, sheet 2 front
+        }
+        w.cancel_job(job.id).unwrap();
+        assert_eq!(w.pages_remaining(), 2, "sheets 3 and 4");
+        assert_eq!(w.create_job(body).expect("next").sheet_base, 2);
+
+        let mut w = brother_wsd_duplex();
+        w.set_pages(4);
+        let job = w.create_job(body).expect("create duplex");
+        w.retrieve_image(job.id, &job.token).expect("face");
+        w.mark_job_timed_out(job.id).unwrap();
+        assert_eq!(w.pages_remaining(), 3);
+        w.mark_job_timed_out(job.id).unwrap();
+        assert_eq!(w.pages_remaining(), 3, "a second timeout returns nothing");
+        w.cancel_job(job.id).unwrap();
+        assert_eq!(
+            w.pages_remaining(),
+            3,
+            "nor does a cancel of the aborted job"
+        );
     }
 
     #[test]

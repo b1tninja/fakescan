@@ -1417,6 +1417,7 @@ mod tests {
             page_index: 1,
             sheet_base: 0,
             stack_total: 0,
+            sheets_taken: 0,
             duplex: false,
             created_at: Instant::now(),
             last_activity: Instant::now(),
