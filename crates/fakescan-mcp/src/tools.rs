@@ -15,11 +15,11 @@ fakescan-mcp drives a fake WSD scanner that is already running. It attaches to t
 /v1 control API and never starts or stops fakescan. Use it to arm pages, faults, \
 patterns, and scenarios before an acquire test.\n\
 \n\
-Names tell the effect: fakescan_send_* changes device state or sends traffic and \
-returns a plan until confirm=true; fakescan_write_* writes a local file and refuses \
+Names tell the effect: send_* changes device state or sends traffic and \
+returns a plan until confirm=true; write_* writes a local file and refuses \
 to replace one unless overwrite=true; every other tool only reads.\n\
 \n\
-Start with fakescan_server_status. If the device section says reachable is false, \
+Start with server_status. If the device section says reachable is false, \
 start fakescan yourself and fix --base-url (FAKESCAN_BASE_URL). Optional device id \
 selects /d/{id}/... and uses the same [A-Za-z0-9_-]{1,64} rule as the scanner.\n\
 \n\
@@ -80,7 +80,7 @@ pub fn capabilities() -> Value {
         "tools": tools,
         "tool_count": tools.len(),
         "attach_only": true,
-        "next": "Call fakescan_server_status. send_* returns a plan until confirm=true. write_* refuses an existing file unless overwrite=true. This server does not start or stop fakescan.",
+        "next": "Call server_status. send_* returns a plan until confirm=true. write_* refuses an existing file unless overwrite=true. This server does not start or stop fakescan.",
     })
 }
 
@@ -109,105 +109,105 @@ pub fn tool_list() -> Vec<Value> {
 
 fn catalog() -> Vec<Tool> {
     let device = json!({"type": "string", "description": "Device id. Selects /d/{id}/. Omit for the default device."});
-    let confirm = json!({"type": "boolean", "description": "Send only when true. Otherwise the tool returns a plan.", "default": false});
-    let overwrite = json!({"type": "boolean", "description": "Replace an existing file. Refused when false or omitted.", "default": false});
+    let confirm = json!({"type": "boolean", "description": "Send only when this is the JSON boolean true. The string \"true\" is rejected. Otherwise the tool returns a plan.", "default": false});
+    let overwrite = json!({"type": "boolean", "description": "Replace an existing file only when this is the JSON boolean true. The string \"true\" is rejected.", "default": false});
     let output_path = json!({"type": "string", "description": "File to write. Must sit in the working directory, temp, /workspace, or FAKESCAN_WRITE_DIRS."});
     vec![
         Tool {
-            name: "fakescan_server_status",
-            description: "Server version, feature flags, and tool names. sections: capabilities (default), device. capabilities does not contact the scanner. device reports reachable true or false. Example: fakescan_server_status(sections=['capabilities']).",
+            name: "server_status",
+            description: "Server version, feature flags, and tool names. sections: capabilities (default), device. capabilities does not contact the scanner. device reports reachable true or false. Example: server_status(sections=['capabilities']).",
             schema: object(
                 &[("sections", json!({"type": "array", "items": {"type": "string"}})), ("device", device.clone())],
                 &[],
             ),
         },
-        read("fakescan_ctl_info", "GET /v1/ctl. Commands this device accepts, plus port, uuid, and base URL. Read-only.", "/v1/ctl", &device),
-        read("fakescan_status", "GET /v1/status. Feeder, pages, faults, and the active profile. Read-only.", "/v1/status", &device),
-        read("fakescan_jobs", "GET /v1/jobs. Active and recent scan jobs. Read-only.", "/v1/jobs", &device),
-        read("fakescan_activity", "GET /v1/activity. Recent control and WSD calls. Optional after is a numeric cursor. Read-only.", "/v1/activity", &device),
-        read("fakescan_tickets", "GET /v1/tickets. Scan tickets the device has seen. Read-only.", "/v1/tickets", &device),
-        read("fakescan_scenarios", "GET /v1/scenarios. Named lab progressions. Read-only.", "/v1/scenarios", &device),
-        read("fakescan_devices", "GET /v1/devices. Devices this process is hosting. Read-only. Not scoped under /d/{id}.", "/v1/devices", &device),
-        read("fakescan_profiles", "GET /v1/profiles. Profile ids the process can load. Read-only.", "/v1/profiles", &device),
-        read("fakescan_loopback", "GET /v1/loopback. Whether hard loopback pages are armed. Read-only.", "/v1/loopback", &device),
-        read("fakescan_fault_plan", "GET /v1/faults/plan. The scripted fault plan, if any. Read-only.", "/v1/faults/plan", &device),
+        read("ctl_info", "GET /v1/ctl. Commands this device accepts, plus port, uuid, and base URL. Read-only.", "/v1/ctl", &device),
+        read("status", "GET /v1/status. Feeder, pages, faults, and the active profile. Read-only.", "/v1/status", &device),
+        read("jobs", "GET /v1/jobs. Active and recent scan jobs. Read-only.", "/v1/jobs", &device),
+        read("activity", "GET /v1/activity. Recent control and WSD calls. Optional after is a numeric cursor. Read-only.", "/v1/activity", &device),
+        read("tickets", "GET /v1/tickets. Scan tickets the device has seen. Read-only.", "/v1/tickets", &device),
+        read("scenarios", "GET /v1/scenarios. Named lab progressions. Read-only.", "/v1/scenarios", &device),
+        read("devices", "GET /v1/devices. Devices this process is hosting. Read-only. Not scoped under /d/{id}.", "/v1/devices", &device),
+        read("profiles", "GET /v1/profiles. Profile ids the process can load. Read-only.", "/v1/profiles", &device),
+        read("loopback", "GET /v1/loopback. Whether hard loopback pages are armed. Read-only.", "/v1/loopback", &device),
+        read("fault_plan", "GET /v1/faults/plan. The scripted fault plan, if any. Read-only.", "/v1/faults/plan", &device),
         Tool {
-            name: "fakescan_send_pages",
-            description: "POST /v1/pages. Loads the feeder with count sheets. confirm=false returns the plan and sends nothing. Example: fakescan_send_pages(count=2, confirm=true).",
+            name: "send_pages",
+            description: "POST /v1/pages. Loads the feeder with count sheets. confirm=false returns the plan and sends nothing. Example: send_pages(count=2, confirm=true).",
             schema: object(&[("count", json!({"type": "integer", "minimum": 0})), ("side", json!({"type": "string"})), ("order", json!({"type": "string"})), ("confirm", confirm.clone()), ("device", device.clone())], &["count"]),
         },
         Tool {
-            name: "fakescan_send_pattern",
+            name: "send_pattern",
             description: "POST /v1/pattern. Selects the synthetic page layout by id. confirm-gated.",
             schema: object(&[("id", json!({"type": "string"})), ("confirm", confirm.clone()), ("device", device.clone())], &["id"]),
         },
         Tool {
-            name: "fakescan_send_effects",
+            name: "send_effects",
             description: "POST /v1/effects. Applies an effects object (the same JSON the control API accepts). confirm-gated.",
             schema: object(&[("effects", json!({"type": "object"})), ("confirm", confirm.clone()), ("device", device.clone())], &["effects"]),
         },
         Tool {
-            name: "fakescan_send_scenario",
+            name: "send_scenario",
             description: "POST /v1/scenario. Applies one named progression step. confirm-gated.",
             schema: object(&[("id", json!({"type": "string"})), ("confirm", confirm.clone()), ("device", device.clone())], &["id"]),
         },
         Tool {
-            name: "fakescan_send_fault",
+            name: "send_faults",
             description: "POST /v1/fault. Sets jam, cover, offline, and the other fault flags. Pass the flags as fault={...}. confirm-gated. An empty fault object is a no-op on the device.",
             schema: object(&[("fault", json!({"type": "object"})), ("confirm", confirm.clone()), ("device", device.clone())], &["fault"]),
         },
         Tool {
-            name: "fakescan_send_feeder",
+            name: "send_feeder",
             description: "POST /v1/feeder. Sets whether the feeder reports ready. confirm-gated.",
             schema: object(&[("ready", json!({"type": "boolean"})), ("confirm", confirm.clone()), ("device", device.clone())], &["ready"]),
         },
         Tool {
-            name: "fakescan_send_profile",
+            name: "send_profile",
             description: "POST /v1/profile. Loads a profile by id ([A-Za-z0-9_-], 1-64). confirm-gated.",
             schema: object(&[("id", json!({"type": "string"})), ("confirm", confirm.clone()), ("device", device.clone())], &["id"]),
         },
         Tool {
-            name: "fakescan_send_slow",
+            name: "send_slow",
             description: "POST /v1/slow. Sets the retrieve delay (ms) and/or byte rate (bps). confirm-gated. At least one of ms or bps is required.",
             schema: object(&[("ms", json!({"type": "integer", "minimum": 0})), ("bps", json!({"type": "integer", "minimum": 0})), ("confirm", confirm.clone()), ("device", device.clone())], &[]),
         },
         Tool {
-            name: "fakescan_send_jpeg_com",
+            name: "send_jpeg_com",
             description: "POST /v1/jpeg-com. Turns JFIF comment markers on or off. confirm-gated.",
             schema: object(&[("enabled", json!({"type": "boolean"})), ("confirm", confirm.clone()), ("device", device.clone())], &["enabled"]),
         },
         Tool {
-            name: "fakescan_send_loopback",
+            name: "send_loopback",
             description: "POST /v1/loopback. Arms hard loopback from base64 page blobs. confirm-gated. The plan reports page count and sizes, not the blobs.",
             schema: object(&[("pages", json!({"type": "array", "items": {"type": "string"}})), ("confirm", confirm.clone()), ("device", device.clone())], &["pages"]),
         },
         Tool {
-            name: "fakescan_send_clear_loopback",
+            name: "send_loopback_clear",
             description: "DELETE /v1/loopback. Drops hard loopback pages. confirm-gated.",
             schema: object(&[("confirm", confirm.clone()), ("device", device.clone())], &[]),
         },
         Tool {
-            name: "fakescan_send_reset",
+            name: "send_reset",
             description: "POST /v1/reset. Returns the device to the profile defaults. confirm-gated.",
             schema: object(&[("confirm", confirm.clone()), ("device", device.clone())], &[]),
         },
         Tool {
-            name: "fakescan_send_push_scan",
+            name: "send_push_scan",
             description: "POST /v1/ctl cmd push_scan. Mints a ScanIdentifier and, when a NotifyTo sink is stored, posts ScanAvailableEvent. confirm-gated.",
             schema: object(&[("destination_token", json!({"type": "string"})), ("confirm", confirm.clone()), ("device", device.clone())], &[]),
         },
         Tool {
-            name: "fakescan_send_clear_tickets",
+            name: "send_tickets_clear",
             description: "DELETE /v1/tickets. Clears the ticket log. confirm-gated.",
             schema: object(&[("confirm", confirm.clone()), ("device", device.clone())], &[]),
         },
         Tool {
-            name: "fakescan_send_ctl",
+            name: "send_ctl",
             description: "POST /v1/ctl for a named command. confirm-gated. shutdown and open_settings are refused. Prefer the specific send_* tool when one exists.",
             schema: object(&[("cmd", json!({"type": "string"})), ("args", json!({"type": "object"})), ("confirm", confirm.clone()), ("device", device.clone())], &["cmd"]),
         },
         Tool {
-            name: "fakescan_write_log",
+            name: "write_log",
             description: "Writes a file: GET /v1/log saved to output_path. Refuses to replace an existing file unless overwrite=true. Writes only inside the working directory, temp, /workspace, or FAKESCAN_WRITE_DIRS.",
             schema: object(&[("output_path", output_path), ("overwrite", overwrite), ("after", json!({"type": "string", "description": "Numeric cursor. Omit for the whole log."})), ("device", device.clone())], &["output_path"]),
         },
@@ -216,10 +216,10 @@ fn catalog() -> Vec<Tool> {
 
 fn read(name: &'static str, description: &'static str, _path: &str, device: &Value) -> Tool {
     let mut schema_props_device = device.clone();
-    if name == "fakescan_activity" {
+    if name == "activity" {
         schema_props_device = device.clone();
     }
-    let schema = if name == "fakescan_activity" {
+    let schema = if name == "activity" {
         object(
             &[
                 ("after", json!({"type": "string"})),
@@ -272,40 +272,38 @@ impl<C: DeviceClient> Session<C> {
             return Err(ToolError::new(
                 format!("unknown tool {name}"),
                 "unknown_tool",
-                Some("Call fakescan_server_status for the tool list.".into()),
+                Some("Call server_status for the tool list.".into()),
             ));
         }
         let args = arguments.as_object().cloned().unwrap_or_default();
         match name {
-            "fakescan_server_status" => self.server_status(&args),
-            "fakescan_ctl_info" => self.get_json(&args, "/v1/ctl", true),
-            "fakescan_status" => self.get_json(&args, "/v1/status", true),
-            "fakescan_jobs" => self.get_json(&args, "/v1/jobs", true),
-            "fakescan_activity" => self.activity(&args),
-            "fakescan_tickets" => self.get_json(&args, "/v1/tickets", true),
-            "fakescan_scenarios" => self.get_json(&args, "/v1/scenarios", true),
-            "fakescan_devices" => self.get_json(&args, "/v1/devices", false),
-            "fakescan_profiles" => self.get_json(&args, "/v1/profiles", false),
-            "fakescan_loopback" => self.get_json(&args, "/v1/loopback", true),
-            "fakescan_fault_plan" => self.get_json(&args, "/v1/faults/plan", true),
-            "fakescan_send_pages" => self.send_pages(&args),
-            "fakescan_send_pattern" => self.send_id(&args, "send_pattern", "/v1/pattern"),
-            "fakescan_send_effects" => {
-                self.send_object(&args, "send_effects", "/v1/effects", "effects")
-            }
-            "fakescan_send_scenario" => self.send_id(&args, "send_scenario", "/v1/scenario"),
-            "fakescan_send_fault" => self.send_object(&args, "send_fault", "/v1/fault", "fault"),
-            "fakescan_send_feeder" => self.send_feeder(&args),
-            "fakescan_send_profile" => self.send_profile(&args),
-            "fakescan_send_slow" => self.send_slow(&args),
-            "fakescan_send_jpeg_com" => self.send_jpeg_com(&args),
-            "fakescan_send_loopback" => self.send_loopback(&args),
-            "fakescan_send_clear_loopback" => self.send_no_body(&args, "DELETE", "/v1/loopback"),
-            "fakescan_send_reset" => self.send_no_body(&args, "POST", "/v1/reset"),
-            "fakescan_send_push_scan" => self.send_push_scan(&args),
-            "fakescan_send_clear_tickets" => self.send_no_body(&args, "DELETE", "/v1/tickets"),
-            "fakescan_send_ctl" => self.send_ctl(&args),
-            "fakescan_write_log" => self.write_log(&args),
+            "server_status" => self.server_status(&args),
+            "ctl_info" => self.get_json(&args, "/v1/ctl", true),
+            "status" => self.get_json(&args, "/v1/status", true),
+            "jobs" => self.get_json(&args, "/v1/jobs", true),
+            "activity" => self.activity(&args),
+            "tickets" => self.get_json(&args, "/v1/tickets", true),
+            "scenarios" => self.get_json(&args, "/v1/scenarios", true),
+            "devices" => self.get_json(&args, "/v1/devices", false),
+            "profiles" => self.get_json(&args, "/v1/profiles", false),
+            "loopback" => self.get_json(&args, "/v1/loopback", true),
+            "fault_plan" => self.get_json(&args, "/v1/faults/plan", true),
+            "send_pages" => self.send_pages(&args),
+            "send_pattern" => self.send_id(&args, "send_pattern", "/v1/pattern"),
+            "send_effects" => self.send_object(&args, "send_effects", "/v1/effects", "effects"),
+            "send_scenario" => self.send_id(&args, "send_scenario", "/v1/scenario"),
+            "send_faults" => self.send_object(&args, "send_faults", "/v1/fault", "fault"),
+            "send_feeder" => self.send_feeder(&args),
+            "send_profile" => self.send_profile(&args),
+            "send_slow" => self.send_slow(&args),
+            "send_jpeg_com" => self.send_jpeg_com(&args),
+            "send_loopback" => self.send_loopback(&args),
+            "send_loopback_clear" => self.send_no_body(&args, "DELETE", "/v1/loopback"),
+            "send_reset" => self.send_no_body(&args, "POST", "/v1/reset"),
+            "send_push_scan" => self.send_push_scan(&args),
+            "send_tickets_clear" => self.send_no_body(&args, "DELETE", "/v1/tickets"),
+            "send_ctl" => self.send_ctl(&args),
+            "write_log" => self.write_log(&args),
             _ => Err(ToolError::new(
                 format!("unknown tool {name}"),
                 "unknown_tool",
@@ -748,11 +746,17 @@ fn expect_keys(args: &Map<String, Value>, allowed: &[&str]) -> Result<(), ToolEr
     }
 }
 
+/// `confirm` and `overwrite` are JSON booleans. A string `"true"`, `1`, or any other
+/// truthy value is rejected so a quoted flag cannot send traffic or replace a file.
 fn flag(args: &Map<String, Value>, name: &str) -> Result<bool, ToolError> {
     match args.get(name) {
         None | Some(Value::Null) => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(invalid(name, format!("{name} must be a boolean"))),
+        Some(_) => Err(ToolError::new(
+            format!("{name} must be a boolean"),
+            "invalid_argument",
+            Some("Use true or false. A string such as \"true\" is not accepted.".into()),
+        )),
     }
 }
 
@@ -846,9 +850,14 @@ mod tests {
             .unwrap()
             .iter()
             .any(|v| v == "write_overwrite_guard"));
-        assert!(names.contains(&"fakescan_server_status"));
-        assert!(names.iter().any(|n| n.starts_with("fakescan_send_")));
-        assert!(names.iter().any(|n| n.starts_with("fakescan_write_")));
+        assert!(names.contains(&"server_status"));
+        assert!(names.contains(&"send_faults"));
+        assert!(names.contains(&"send_tickets_clear"));
+        assert!(names.contains(&"write_log"));
+        for name in &names {
+            assert!(!name.starts_with("fakescan_"), "{name}");
+            assert!(!name.starts_with("hardly_"), "{name}");
+        }
         let listed: Vec<String> = tool_list()
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
@@ -859,7 +868,7 @@ mod tests {
     #[test]
     fn send_pages_without_confirm_does_not_call_the_device() {
         let mut s = session();
-        let out = s.call("fakescan_send_pages", &json!({"count": 2})).unwrap();
+        let out = s.call("send_pages", &json!({"count": 2})).unwrap();
         assert_eq!(out["confirmed"], false);
         assert_eq!(out["sent"], false);
         assert_eq!(out["plan"]["method"], "POST");
@@ -874,7 +883,7 @@ mod tests {
         let mut s = session();
         s.client.body = br#"{"pages_remaining":2}"#.to_vec();
         let out = s
-            .call("fakescan_send_pages", &json!({"count": 2, "confirm": true}))
+            .call("send_pages", &json!({"count": 2, "confirm": true}))
             .unwrap();
         assert_eq!(out["pages_remaining"], 2);
         assert_eq!(s.client.calls.len(), 1);
@@ -890,10 +899,10 @@ mod tests {
     fn device_id_is_prefixed_and_a_bad_id_is_rejected_before_any_call() {
         let mut s = Session::new(ScriptedClient::default(), Some("lab1".into())).unwrap();
         s.client.body = b"{}".to_vec();
-        s.call("fakescan_status", &json!({})).unwrap();
+        s.call("status", &json!({})).unwrap();
         assert_eq!(s.client.calls[0].path, "/d/lab1/v1/status");
         let err = s
-            .call("fakescan_status", &json!({"device": "../other"}))
+            .call("status", &json!({"device": "../other"}))
             .unwrap_err();
         assert_eq!(err.code, "invalid_argument");
         assert_eq!(s.client.calls.len(), 1);
@@ -903,10 +912,7 @@ mod tests {
     fn shutdown_is_refused_even_when_confirmed() {
         let mut s = session();
         let err = s
-            .call(
-                "fakescan_send_ctl",
-                &json!({"cmd": "shutdown", "confirm": true}),
-            )
+            .call("send_ctl", &json!({"cmd": "shutdown", "confirm": true}))
             .unwrap_err();
         assert_eq!(err.code, "not_supported");
         assert!(s.client.calls.is_empty());
@@ -916,11 +922,11 @@ mod tests {
     fn unreachable_device_is_an_error_and_status_still_reports_capabilities() {
         let mut s = session();
         s.client.fail = Some("connection refused".into());
-        let err = s.call("fakescan_status", &json!({})).unwrap_err();
+        let err = s.call("status", &json!({})).unwrap_err();
         assert_eq!(err.code, "device_unreachable");
         let status = s
             .call(
-                "fakescan_server_status",
+                "server_status",
                 &json!({"sections": ["capabilities", "device"]}),
             )
             .unwrap();
@@ -934,7 +940,7 @@ mod tests {
         s.client.body = b"line\n".to_vec();
         let err = s
             .call(
-                "fakescan_write_log",
+                "write_log",
                 &json!({"output_path": "/no-such-fakescan-write/log.txt"}),
             )
             .unwrap_err();
@@ -947,10 +953,7 @@ mod tests {
         let file = dir.join("log.txt");
         std::fs::write(&file, b"old").unwrap();
         let err = s
-            .call(
-                "fakescan_write_log",
-                &json!({"output_path": file.to_str().unwrap()}),
-            )
+            .call("write_log", &json!({"output_path": file.to_str().unwrap()}))
             .unwrap_err();
         assert_eq!(err.code, "output_exists");
         assert_eq!(std::fs::read(&file).unwrap(), b"old");
@@ -959,7 +962,7 @@ mod tests {
         let fresh = dir.join("fresh.txt");
         let out = s
             .call(
-                "fakescan_write_log",
+                "write_log",
                 &json!({"output_path": fresh.to_str().unwrap()}),
             )
             .unwrap();
@@ -969,10 +972,39 @@ mod tests {
     }
 
     #[test]
+    fn confirm_and_overwrite_reject_a_truthy_string() {
+        let mut s = session();
+        for confirm in [json!("true"), json!(1), json!("yes")] {
+            let err = s
+                .call("send_pages", &json!({"count": 2, "confirm": confirm}))
+                .unwrap_err();
+            assert_eq!(err.code, "invalid_argument");
+            assert!(err.hint.unwrap().contains("true or false"));
+        }
+        assert!(s.client.calls.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("fakescan-mcp-bool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("log.txt");
+        std::fs::write(&file, b"old").unwrap();
+        let err = s
+            .call(
+                "write_log",
+                &json!({"output_path": file.to_str().unwrap(), "overwrite": "true"}),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_argument");
+        assert_eq!(std::fs::read(&file).unwrap(), b"old");
+        assert!(s.client.calls.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn server_status_capabilities_does_not_touch_the_client() {
         let mut s = session();
         s.client.fail = Some("down".into());
-        let out = s.call("fakescan_server_status", &json!({})).unwrap();
+        let out = s.call("server_status", &json!({})).unwrap();
         assert!(out["capabilities"]["tools"].is_array());
         assert!(s.client.calls.is_empty());
     }

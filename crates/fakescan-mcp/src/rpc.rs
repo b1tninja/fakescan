@@ -179,7 +179,7 @@ mod tests {
             "jsonrpc": "2.0",
             "id": "p",
             "method": "tools/call",
-            "params": {"name": "fakescan_send_fault", "arguments": {"fault": {"jam": true}}}
+            "params": {"name": "send_faults", "arguments": {"fault": {"jam": true}}}
         });
         let response = handle(&mut session, &call).unwrap();
         assert_eq!(response["id"], "p");

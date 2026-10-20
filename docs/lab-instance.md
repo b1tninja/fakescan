@@ -250,7 +250,7 @@ result) if the device is not reachable.  Available tools: `ctl_info`, `status`,
 
 The package above is the external Python server and is not in this tree. The
 in-repo server is the optional `fakescan-mcp` crate (`docs/proposals/mcp.md`):
-stdio JSON-RPC, `fakescan_send_*` confirm-gated, `fakescan_write_*` refuses to
+stdio JSON-RPC, `send_*` confirm-gated, `write_*` refuses to
 overwrite, everything else read-only.
 
 ## Running multiple instances
