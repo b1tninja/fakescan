@@ -5136,9 +5136,11 @@ mod tests {
         let t1 = Instant::now();
         w.retrieve_image(id, &token).expect("second");
         let second_ms = t1.elapsed().as_millis();
-        // Second image skips warm-up (page_index > 0): it must not pay the 400 ms again.
+        // Second image skips warm-up (page_index > 0): it must not pay the 400 ms again. Compare the
+        // two rather than testing an absolute time: a debug-build encode on a loaded CI runner alone
+        // can take several hundred ms, but the first image is always the warm-up slower.
         assert!(
-            second_ms < u128::from(WARMUP_MS) - 50,
+            second_ms + u128::from(WARMUP_MS) / 2 < first_ms,
             "first={first_ms} second={second_ms}"
         );
     }
