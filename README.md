@@ -12,6 +12,17 @@ A **fake scanner** for testing acquire paths: scriptable glass/feeder, synthetic
 
 Built for [pdfcraft](https://github.com/storytold/pdfcraft) and similar apps (sticky `FEED_READY`, page counts, format refusals, deskew/despeckle stress). **pdfcraft** implements WIA/UI; **fakescan** implements the fake device and control API; end-to-end pdfcraft exerciser tests live in **pdfcraft-fakescan** ([stack](https://github.com/storytold/pdfcraft-fakescan/blob/main/docs/stack.md) when published, or `../pdfcraft-fakescan/docs/stack.md` in a monorepo). Companion **[fakeprint](https://github.com/b1tninja/fakeprint)** covers WSD Print on `:3921`. How the two scan/print labs differ: [docs/siblings.md](docs/siblings.md).
 
+## The diag page
+
+The default scan is fakescan's `diag` test page: a parametric layout that is generated, not stored, for any sheet size. It carries ArUco corner and edge markers, a chessboard and ChArUco board, dual-unit rulers, resolution and tone targets, and a QR payload that regenerates the exact page. The same page prints from [fakeprint](https://github.com/b1tninja/fakeprint) as a PDF at the real physical size, so a scanner and a printer are checked against one reference.
+
+<p align="center">
+  <img src="docs/diag-page-v3.png" alt="The diag page (layout v3), A4 at 100 dpi" width="360" />
+  <img src="docs/diag-page-v3-closeup.png" alt="Close-up at 300 dpi: dual-unit rulers, an ArUco corner marker, a chessboard and a ChArUco board" width="360" />
+</p>
+
+Layout, parameters and what each element measures: [docs/diag-page-v3.md](docs/diag-page-v3.md).
+
 ## Docs
 
 | Doc | Start here for… |
