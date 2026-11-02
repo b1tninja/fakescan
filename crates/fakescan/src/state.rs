@@ -3579,14 +3579,7 @@ mod tests {
         let mut w = brother_wsd();
         assert!(w.trace_since(0).events.is_empty());
         w.note_wsd("wsd", "192.0.2.10:1", "Get", "ok", 0, "soap");
-        w.note_wsd(
-            "wsd",
-            "192.0.2.10:2",
-            "ValidateScanTicket",
-            "ok",
-            1,
-            "soap",
-        );
+        w.note_wsd("wsd", "192.0.2.10:2", "ValidateScanTicket", "ok", 1, "soap");
         let cursor = w.trace_since(0).seq;
         w.note_wsd(
             "wsd",
