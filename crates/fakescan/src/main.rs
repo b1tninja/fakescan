@@ -40,6 +40,23 @@ struct Args {
     #[arg(long)]
     no_wsd: bool,
 
+    /// Keep the Scan Service but send and answer no WS-Discovery at all (no Hello, no :3702), so
+    /// nothing on the LAN learns of this scanner.
+    #[arg(long)]
+    no_discovery: bool,
+
+    /// Headless mode for client test suites and CI: one loopback listener (an ephemeral port
+    /// unless --listen is given), the Scan Service on, no WS-Discovery, no tray, no
+    /// single-instance lock, no named pipe, logs on stderr. Prints one `FAKESCAN_READY {json}`
+    /// line on stdout once it accepts connections (see docs/headless.md).
+    #[arg(long)]
+    headless: bool,
+
+    /// Shut down cleanly when stdin reaches end of file (a harness that owns the process closes
+    /// the pipe instead of signalling).
+    #[arg(long)]
+    exit_on_stdin_close: bool,
+
     /// Load N sheets into every device's feeder at start and on reset (devices that set their
     /// own `initial_pages` keep it; clamped to tray capacity). Default: each profile's
     /// `feeder.initial_pages`, which is 0 (empty) in every shipped profile.
@@ -161,7 +178,15 @@ async fn main() -> anyhow::Result<()> {
             "fakescan=info,tower_http=info".into()
         }
     });
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    if args.headless {
+        // stdout carries the one machine-readable ready line; logs go to stderr.
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     // Priority: CLI > registry row (via --lab-name) > compiled defaults.
     let lab_name = args.lab_name.clone();
@@ -170,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|name| Registry::load().ok().and_then(|r| r.find(name).cloned()));
 
     let listen: SocketAddr = args.listen.unwrap_or_else(|| {
+        if args.headless {
+            return SocketAddr::from(([127, 0, 0, 1], 0));
+        }
         reg_row
             .as_ref()
             .and_then(|r| r.listen.parse().ok())
@@ -219,16 +247,23 @@ async fn main() -> anyhow::Result<()> {
     // Tray (Windows, feature `tray`): daemon-style runs only (--manage or --lab-name), never for
     // control-only --no-wsd runs. The embedded library path (server::serve called directly) never
     // starts one: this is main.rs only.
-    let want_tray = !args.no_tray && !args.no_wsd && (args.manage || lab_name.is_some());
+    let want_tray =
+        !args.no_tray && !args.no_wsd && !args.headless && (args.manage || lab_name.is_some());
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<fakescan::server::Ready>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    // The ready signal and the stop switch go to the tray, or (headless) to the ready line and
+    // the stdin watcher; never both. A stop switch nobody took stays alive here until the end, as
+    // dropping it would stop the server.
+    let mut ready_rx = Some(ready_rx);
+    let mut stop_tx = Some(stop_tx);
     #[cfg(all(windows, feature = "tray"))]
     let tray_task = want_tray.then(|| {
+        let (ready_rx, stop_tx) = (ready_rx.take(), stop_tx.take());
         tokio::spawn(async move {
-            let Ok(ready) = ready_rx.await else {
+            let Ok(ready) = ready_rx?.await else {
                 return None;
             };
-            let stop_tx = std::sync::Mutex::new(Some(stop_tx));
+            let stop_tx = std::sync::Mutex::new(stop_tx);
             fakescan::tray::spawn(fakescan::tray::TrayConfig {
                 port: ready.local_addr.port(),
                 quit: std::sync::Arc::new(move || {
@@ -240,23 +275,37 @@ async fn main() -> anyhow::Result<()> {
         })
     });
     #[cfg(not(all(windows, feature = "tray")))]
-    let (ready_rx, stop_tx) = {
-        let _ = want_tray;
-        (ready_rx, stop_tx)
-    };
+    let _ = want_tray;
+    if let Some(ready_rx) = ready_rx.take().filter(|_| args.headless) {
+        tokio::spawn(async move {
+            if let Ok(ready) = ready_rx.await {
+                print_ready(&ready);
+            }
+        });
+    }
+    if let Some(stop_tx) = stop_tx.take().filter(|_| args.exit_on_stdin_close) {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 256];
+            let mut stdin = std::io::stdin();
+            while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+            let _ = stop_tx.send(());
+        });
+    }
+    let discovery = !args.no_wsd && !args.no_discovery && !args.headless;
 
     let served = serve(
         ServerConfig {
             listen,
             advertise,
             wsd: !args.no_wsd,
-            discovery: !args.no_wsd,
+            discovery,
             profiles: args.profiles,
             devices,
             lab_name,
-            probe_listen: args.probe_listen && !args.no_probe_listen,
-            instance_lock: true,
-            named_pipe: true,
+            probe_listen: discovery && args.probe_listen && !args.no_probe_listen,
+            instance_lock: !args.headless,
+            named_pipe: !args.headless,
             ctrl_c: true,
             registry,
             manage: args.manage,
@@ -276,9 +325,37 @@ async fn main() -> anyhow::Result<()> {
             h.stop();
         }
     }
-    #[cfg(not(all(windows, feature = "tray")))]
     let _ = (ready_rx, stop_tx);
     served
+}
+
+/// The machine-readable line of `--headless`: `FAKESCAN_READY ` and a JSON object with the base
+/// (control-plane) URL, the default scanner's Scan Service URL, the port, and every device's
+/// endpoints.
+fn print_ready(ready: &fakescan::server::Ready) {
+    let base = format!("http://{}", ready.local_addr);
+    let rows: Vec<serde_json::Value> = ready
+        .devices
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "profile": d.profile,
+                "scanner_url": d.scan_endpoint,
+                "device_url": d.device_endpoint,
+            })
+        })
+        .collect();
+    let first = rows.first().cloned().unwrap_or(serde_json::Value::Null);
+    let line = serde_json::json!({
+        "base_url": base,
+        "scanner_url": first["scanner_url"],
+        "port": ready.local_addr.port(),
+        "devices": rows,
+    });
+    println!("FAKESCAN_READY {line}");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 }
 
 /// Parse `ID=PROFILE[@UUID]`.

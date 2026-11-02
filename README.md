@@ -29,6 +29,7 @@ Layout, parameters and what each element measures: [docs/diag-page-v3.md](docs/d
 |-----|-----------------|
 | [docs/README.md](docs/README.md) | Full index |
 | [docs/siblings.md](docs/siblings.md) | vs fakeprint (ports, loopback ≠ capture) |
+| [docs/headless.md](docs/headless.md) | A client's test suite or CI: loopback, ephemeral port, ready line |
 | [docs/lab-harness.md](docs/lab-harness.md) | Python client + hard loopback; `GET /v1/jobs`, `/v1/activity`, `/v1/log` |
 | [docs/windows.md](docs/windows.md) | WIA install assist (person clicks Add device) |
 | [docs/architecture.md](docs/architecture.md) | Layout, ports, control API |
@@ -60,6 +61,15 @@ cargo run -p fakescan -- --profiles profiles --profile brother-wsd
 # Stable Windows identity: --device-uuid 00000000-0000-4000-8000-0000000000f2
 ```
 
+For a client's test suite or CI: loopback, an ephemeral port, no WS-Discovery, and one
+`FAKESCAN_READY {json}` line on stdout with the scanner's URL ([docs/headless.md](docs/headless.md)):
+
+```bash
+cargo run -p fakescan -- --headless --exit-on-stdin-close --profiles profiles --profile wia-lossless --initial-pages 3
+```
+
+`--no-discovery` keeps the Scan Service on any listen address and sends no WS-Discovery at all.
+
 Default port **3920** (fakeprint uses **3921**). Both can run on the same host with distinct UUIDs.
 
 ## Profiles
@@ -69,6 +79,10 @@ Default port **3920** (fakeprint uses **3921**). Both can run on the same host w
 - `profiles/wia-lossless.json` — no jfif; WIA glass can ticket wire `dib` via FormatNotSupported fallback ([reference/format.md](docs/reference/format.md), [formats.md](docs/formats.md))
 - `profiles/accept-dib.json` — `dib` only (SOAP lossless / `fakescan-lab acquire-dib`)
 - `profiles/wia-rich.json` — all encodable WIA/WSD formats (see [docs/formats.md](docs/formats.md))
+- `profiles/accept-tiff.json` — `tiff-single-uncompressed` and `dib`
+- `profiles/glass-wsd.json`, `profiles/glass-jfif.json` — glass only (no feeder)
+- `profiles/feeder-tray5.json`, `feeder-tray50.json`, `feeder-a4only.json`, `feeder-duplex30.json` — feeders of
+  5, 50 (Letter/A4/Legal), A4-only and duplex 30 sheets
 - Formats matrix: [docs/formats.md](docs/formats.md)
 
 ```bash
@@ -144,7 +158,12 @@ See [docs/windows.md](docs/windows.md) for soap-only vs on-wire-discoverable vs 
 
 ## Develop
 
+The schema tests read Microsoft's WS-Scan XSDs, which are not in the repository (their licence does
+not allow it). Fetch them once into `docs/reference/schema/` (gitignored) before `cargo test`;
+without them those tests panic. The binary does not need them.
+
 ```bash
+pwsh ./scripts/Get-WsdSpecs.ps1 -AcceptLicense
 cargo fmt --all -- --check
 cargo clippy -p fakescan --all-targets -- -D warnings
 cargo test -p fakescan
@@ -154,7 +173,7 @@ pytest ../fakescan-python/tests -m "not live and not local"
 
 ## CI
 
-- `.github/workflows/ci.yml` — fmt / clippy / test on Ubuntu and Windows; Docker smoke; sane-airscan; Python lab
+- `.github/workflows/ci.yml` — fmt / clippy / test on Ubuntu and Windows; Docker smoke; sane-airscan
 - `.github/workflows/docker.yml` — GHCR push
 
 ## Contributing
