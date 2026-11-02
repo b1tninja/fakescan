@@ -6,6 +6,7 @@ Root [README](../README.md) is the quick start.
 |-----|------------|
 | [siblings.md](siblings.md) | **vs fakeprint** — ports, ground truth, what not to copy |
 | [runbook-fake-scanner.md](runbook-fake-scanner.md) | **Operator checklist** — build → Advertise → Add → WIA acquire by name |
+| [headless.md](headless.md) | **A client's test suite or CI**: `--headless`, loopback, ephemeral port, `FAKESCAN_READY` line |
 | [lab-harness.md](lab-harness.md) | **Python client** + hard loopback (optional; WIA/lab); read-only `GET /v1/jobs`, `/v1/activity`, `/v1/log` |
 | [deploy.md](deploy.md) | Docker / GHCR / LAN advertise |
 | [windows.md](windows.md) | PowerShell helpers, discovery verdicts, elevated helper for Imaging remove, Add device (person required) |

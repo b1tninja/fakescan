@@ -531,7 +531,9 @@ impl Fault {
         self
     }
 
-    pub fn to_xml(&self, relates_to: Option<&str>) -> String {
+    /// The fault envelope, with `wscn` bound to `scan_ns`: the namespace the request used, so a
+    /// `wscn:` sub-code means the same service the client called.
+    pub fn to_xml(&self, relates_to: Option<&str>, scan_ns: &str) -> String {
         let mut code =
             Element::new("soap:Code").with(Element::text_el("soap:Value", "soap:Sender"));
         if let Some(sub) = &self.subcode {
@@ -545,7 +547,7 @@ impl Fault {
         );
         let fault = Element::new("soap:Fault").with(code).with(reason);
         Response::new()
-            .scan_ns(SCAN_NS)
+            .scan_ns(scan_ns)
             .action("http://schemas.xmlsoap.org/ws/2004/08/addressing/fault")
             .relates_to(relates_to.unwrap_or(""))
             .body(fault)
@@ -582,12 +584,17 @@ pub(crate) fn parse_body_children(body_xml: &str) -> Vec<Element> {
         .unwrap_or_default()
 }
 
-pub fn fault_with_code(subcode: Option<&str>, reason: &str, relates_to: Option<&str>) -> String {
+pub fn fault_with_code(
+    subcode: Option<&str>,
+    reason: &str,
+    relates_to: Option<&str>,
+    scan_ns: &str,
+) -> String {
     let mut fault = Fault::new(reason);
     if let Some(code) = subcode {
         fault = fault.subcode(code);
     }
-    fault.to_xml(relates_to)
+    fault.to_xml(relates_to, scan_ns)
 }
 
 pub fn esc(s: &str) -> String {

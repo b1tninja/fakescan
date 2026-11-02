@@ -59,7 +59,12 @@ pub async fn scanner_service(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
-            soap::fault_with_code(Some("soap:MustUnderstand"), finding.note, relates),
+            soap::fault_with_code(
+                Some("soap:MustUnderstand"),
+                finding.note,
+                relates,
+                req.scan_ns,
+            ),
         )
             .into_response();
     }
@@ -153,7 +158,7 @@ pub async fn scanner_service(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "application/soap+xml; charset=utf-8")],
-                soap::fault_with_code(subcode.as_deref(), &reason, relates),
+                soap::fault_with_code(subcode.as_deref(), &reason, relates, scan_ns),
             )
                 .into_response()
         }

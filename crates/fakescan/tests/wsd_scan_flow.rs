@@ -2600,3 +2600,38 @@ async fn empty_feeder_brother_reset_clears_and_status_field_present() {
     assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert!(body.contains("feeder empty"), "{body}");
 }
+
+/// A fault answers in the namespace the request used, like every other reply: a 2006/08 client
+/// must read `wscn:ClientErrorNoImagesAvailable` in 2006/08, not in 2006/01.
+#[tokio::test]
+async fn faults_echo_the_request_namespace() {
+    for ns in ["2006/08", "2006/01"] {
+        let retrieve = format!(
+            r#"<?xml version="1.0"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+  xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+  xmlns:wscn="http://schemas.microsoft.com/windows/{ns}/wdp/scan">
+  <soap:Header>
+    <wsa:Action>http://schemas.microsoft.com/windows/{ns}/wdp/scan/RetrieveImage</wsa:Action>
+    <wsa:MessageID>uuid:33333333-3333-3333-3333-333333333333</wsa:MessageID>
+  </soap:Header>
+  <soap:Body>
+    <wscn:RetrieveImageRequest>
+      <wscn:JobId>4242</wscn:JobId>
+      <wscn:JobToken>none</wscn:JobToken>
+      <wscn:DocumentDescription><wscn:DocumentName>x</wscn:DocumentName></wscn:DocumentDescription>
+    </wscn:RetrieveImageRequest>
+  </soap:Body>
+</soap:Envelope>"#
+        );
+        let (st, body) = post_soap(app(world()), &retrieve).await;
+        assert_ne!(st, StatusCode::OK, "{body}");
+        assert!(body.contains("<soap:Subcode>"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "xmlns:wscn=\"http://schemas.microsoft.com/windows/{ns}/wdp/scan\""
+            )),
+            "{ns}: {body}"
+        );
+    }
+}
