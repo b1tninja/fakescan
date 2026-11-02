@@ -338,7 +338,7 @@ Use fakescan `POST /v1/scenario` progression (`scenarios.rs`):
 
 ```powershell
 # fakescan server (normal user, LAN advertise)
-cargo run -p fakescan -- --listen 0.0.0.0:3920 --advertise 192.168.1.70 `
+cargo run -p fakescan -- --listen 0.0.0.0:3920 --advertise 192.0.2.10 `
   --profiles profiles --profile brother-wsd `
   --device-uuid 00000000-0000-4000-8000-0000000000f2 --probe-listen -v
 

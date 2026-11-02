@@ -156,7 +156,7 @@ Each row records identity, configuration and **install lifecycle**, persisted af
 ```jsonc
 {
   "name": "tray5",                       // device id (slug)
-  "listen": "0.0.0.0:3920", "advertise": "192.168.1.70",
+  "listen": "0.0.0.0:3920", "advertise": "192.0.2.10",
   "device_uuid": "00000000-0000-4000-8000-0000000000a5",
   "profile": "feeder-tray5",
   "friendly_name": "fakescan tray5",

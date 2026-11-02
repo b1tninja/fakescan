@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Import-Module (Join-Path $here 'Fakescan.psm1') -Force
 
-if (Test-FakescanLooksLike -Name 'Brother MFC-L2750DW series') {
+if (Test-FakescanLooksLike -Name 'Example Vendor MFP series') {
     throw 'Brother name must not match Test-FakescanLooksLike'
 }
 if (Test-FakescanLooksLike -Name 'WSD Scanner' -Port 'http://192.168.1.5/ScannerService') {
@@ -20,7 +20,7 @@ if (Test-FakescanLooksLike -Name 'WSD Scanner' -Port 'http://192.168.1.5/Scanner
 if (-not (Test-FakescanLooksLike -Name 'Fake WSD scanner (lite caps)')) {
     throw 'expected Fake WSD scanner name to match'
 }
-if (-not (Test-FakescanLooksLike -XAddrs @('http://192.168.1.70:3920/'))) {
+if (-not (Test-FakescanLooksLike -XAddrs @('http://192.0.2.10:3920/'))) {
     throw 'expected :3920 XAddr to match'
 }
 

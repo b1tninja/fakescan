@@ -3578,10 +3578,10 @@ mod tests {
     fn trace_ring_returns_only_calls_after_a_cursor() {
         let mut w = brother_wsd();
         assert!(w.trace_since(0).events.is_empty());
-        w.note_wsd("wsd", "192.168.1.70:1", "Get", "ok", 0, "soap");
+        w.note_wsd("wsd", "192.0.2.10:1", "Get", "ok", 0, "soap");
         w.note_wsd(
             "wsd",
-            "192.168.1.70:2",
+            "192.0.2.10:2",
             "ValidateScanTicket",
             "ok",
             1,
@@ -3590,7 +3590,7 @@ mod tests {
         let cursor = w.trace_since(0).seq;
         w.note_wsd(
             "wsd",
-            "192.168.1.70:3",
+            "192.0.2.10:3",
             "CreateScanJob",
             "fault",
             4,

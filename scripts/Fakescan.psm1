@@ -2420,15 +2420,15 @@ function Repair-FakescanScanner {
       # Prefer helper so this shell stays unelevated for remove:
       .\scripts\fakescan.ps1 helper
       .\scripts\fakescan.ps1 helper remove
-      .\scripts\fakescan.ps1 rebind -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120 -SkipRemove
+      .\scripts\fakescan.ps1 rebind -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120 -SkipRemove
       # Person: Printers & scanners → Add device next to Fake WSD scanner
 
     .EXAMPLE
       .\scripts\fakescan.ps1 elevated
-      Repair-FakescanScanner -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
+      Repair-FakescanScanner -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120
 
     .EXAMPLE
-      .\scripts\fakescan.ps1 rebind -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
+      .\scripts\fakescan.ps1 rebind -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120
     #>
     [CmdletBinding()]
     param(

@@ -25,7 +25,7 @@
     # then in the elevated shell:
     .\scripts\prove-associate.ps1
     # or with a LAN URL:
-    .\scripts\prove-associate.ps1 -BaseUrl http://192.168.1.70:3920
+    .\scripts\prove-associate.ps1 -BaseUrl http://192.0.2.10:3920
 
   Sticky WIA risk after remove:
     - fakescan keeps running with same --device-uuid / --advertise / port.
@@ -51,7 +51,7 @@
 .EXAMPLE
   # From elevated shell (.\scripts\fakescan.ps1 elevated):
   .\scripts\prove-associate.ps1
-  .\scripts\prove-associate.ps1 -BaseUrl http://192.168.1.70:3920 -FdWaitSeconds 120
+  .\scripts\prove-associate.ps1 -BaseUrl http://192.0.2.10:3920 -FdWaitSeconds 120
   .\scripts\prove-associate.ps1 -SkipRemove   # if already removed
 #>
 [CmdletBinding()]

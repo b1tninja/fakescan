@@ -2,12 +2,12 @@
 
 **Lab log** (dated run notes). Operator checklist: [runbook-fake-scanner.md](runbook-fake-scanner.md). Scripts / dead ends: [windows.md](windows.md).
 
-Date: 2026-10-11 / updated 2026-10-12 (local). Host: Windows, LAN `192.168.1.70`.
+Date: 2026-10-11 / updated 2026-10-12 (local). Host: Windows, LAN `192.0.2.10`.
 
 ## Run
 
 ```text
-fakescan.exe --listen 0.0.0.0:3920 --advertise 192.168.1.70 \
+fakescan.exe --listen 0.0.0.0:3920 --advertise 192.0.2.10 \
   --profiles profiles --profile brother-wsd \
   --device-uuid 00000000-0000-4000-8000-0000000000f2 \
   --probe-listen -v
@@ -67,7 +67,7 @@ Root cause: Create answered a Grayscale8 ticket with ColorProcessing RGB24 (Over
 
 ## Live Connect SOAP (2026-10-12)
 
-With fakescan native `--advertise 192.168.1.70:3920`, device already Associated:
+With fakescan native `--advertise 192.0.2.10:3920`, device already Associated:
 
 ```text
 Subscribe … destinations=5
@@ -114,7 +114,7 @@ Dumped MTOM checks clean: complete JFIF (`FFD8`…`FFD9`), SOF 1700×2200, no bo
 
 ### JPEG COM / format A/B (live, 2026-10-11 evening)
 
-Setup: fakescan rebuilt (`/v1/jpeg-com` in binary) + restarted on `192.168.1.70:3920`, `brother-wsd`, pattern `wedges`, glass, dpi 200, pages=1, **`jpeg_com=false`**. WIA Connect Fake **yes** (~21ms); device `Fake WSD scanner (lite caps)`. No MTOM packaging changes.
+Setup: fakescan rebuilt (`/v1/jpeg-com` in binary) + restarted on `192.0.2.10:3920`, `brother-wsd`, pattern `wedges`, glass, dpi 200, pages=1, **`jpeg_com=false`**. WIA Connect Fake **yes** (~21ms); device `Fake WSD scanner (lite caps)`. No MTOM packaging changes.
 
 | Case | Client | Result | Elapsed | CancelJob? | Output |
 |------|--------|--------|---------|------------|--------|
@@ -133,7 +133,7 @@ Earlier control (same night): `jpeg_com=true` + JPEG Transfer also CancelJob **~
 
 ### `wia_plain` live JPEG A/B (2026-10-11 night)
 
-Setup: fakescan rebuilt with `wia_plain` / `EncodeOpts::WIA_PLAIN`, restarted on `192.168.1.70:3920`, `brother-wsd` `…000f2`. `POST /v1/pattern` `{"id":"wia_plain"}` → **200**; `/v1/status` `image_pattern=wia_plain` (`jpeg_com=false`). Device `Fake WSD scanner (lite caps)`. No MTOM packaging changes.
+Setup: fakescan rebuilt with `wia_plain` / `EncodeOpts::WIA_PLAIN`, restarted on `192.0.2.10:3920`, `brother-wsd` `…000f2`. `POST /v1/pattern` `{"id":"wia_plain"}` → **200**; `/v1/status` `image_pattern=wia_plain` (`jpeg_com=false`). Device `Fake WSD scanner (lite caps)`. No MTOM packaging changes.
 
 | Case | Client | Result | Elapsed | CancelJob? | Output |
 |------|--------|--------|---------|------------|--------|
@@ -192,7 +192,7 @@ ImageInformation (fakescan Validate/Create): `PixelsPerLine`/`NumberOfLines` fro
 |------|--------|--------|---------|-------|
 | **F** BPL=0 + JPEG GUID | WIA.Transfer / ShowTransfer | **blocked @ Connect** | ~12–20ms | Person Add restored Fake (`FakescanInWia=True`, PnP OK). Connect → **`0x80210001`**. Trace: Subscribe + GSE + ValidateScanTicket **succeed**; COM still fails; **no** CreateScanJob / RetrieveImage. Brother Connect OK. ShowAcquireImage same `0x80210001` (~12s). |
 
-**Packing reconfirm (this session):** `reshape_jpeg_brother_layout` + tests `jfif_encode_matches_brother_structure` / `reshape_jpeg_packs_dqt_dht_and_reorders` **pass**. Before→after markers: `D8,E0,C0,DB×2,C4×4,DD,DA` → `D8,E0,DB,DD,C0,C4,DA`. fakescan Hidden on `192.168.1.70:3920` `…000f2`; fakeprint `:3921` not killed. No `mtom_response` churn.
+**Packing reconfirm (this session):** `reshape_jpeg_brother_layout` + tests `jfif_encode_matches_brother_structure` / `reshape_jpeg_packs_dqt_dht_and_reorders` **pass**. Before→after markers: `D8,E0,C0,DB×2,C4×4,DD,DA` → `D8,E0,DB,DD,C0,C4,DA`. fakescan Hidden on `192.0.2.10:3920` `…000f2`; fakeprint `:3921` not killed. No `mtom_response` churn.
 
 **Verdict:** BPL=0 is live on the wire (SOAP-proven). **WIA.Transfer accept for F still unknown** — re-Add got past uninstall, but Connect COM fails despite healthy Subscribe/Validate. Do **not** churn MTOM / JFIF packing on this evidence. Next: clear Connect `0x80210001` (elevated stisvc / remove+re-Add with fakescan **not** restarted mid-session), then **F Transfer**; if still CancelJob ~30s → Gray8 / 816×1144 / Brother RetrieveImage capture.
 
@@ -208,7 +208,7 @@ Fixes that moved the needle earlier (Connect path): envelope `xmlns:sca`; ColorE
 
 **Autoduck ticket A/B (negative):** re-Add with `DocumentSizeAutoDetect` ticket + Scaling 50–200 still left **Flatbed/Feeder props=0**, root 39 props, COM Connect FAIL. Autoduck alone is not the empty-item fix.
 
-**Brother live GSE** (`http://192.168.1.71/…/ScannerService` → `D:\temp\brother-gse-config.xml`): booleans **0/1**; ContentType **Auto only**; CompressionQuality **100–100**; Scaling **100–100**; Brightness/Contrast supported **1**; formats `tiff-single-uncompressed` then `jfif` (**no dib**); platen max **8500×11700**; min **556**; color order BW→Gray→RGB; DefaultScanTicket is a **full** document (InputMediaSize 8500×11700, Exposure, Scaling, Rotation, ScanRegion, dpi 300). Brother WIA Automation: `items=1` name=`Scan` props=32.
+**Brother live GSE** (`http://192.0.2.20/…/ScannerService` → a saved reply): booleans **0/1**; ContentType **Auto only**; CompressionQuality **100–100**; Scaling **100–100**; Brightness/Contrast supported **1**; formats `tiff-single-uncompressed` then `jfif` (**no dib**); platen max **8500×11700**; min **556**; color order BW→Gray→RGB; DefaultScanTicket is a **full** document (InputMediaSize 8500×11700, Exposure, Scaling, Rotation, ScanRegion, dpi 300). Brother WIA Automation: `items=1` name=`Scan` props=32.
 
 **Brother-shaped Config/Ticket — empty item cleared (2026-10-12):** after person Add of `D:\temp\fakescan-target-brother-shape\release\fakescan.exe` on `…000f2` / `brother-wsd` (tiff+jfif, 0/1 DeviceSettings, full DefaultScanTicket with ScanRegion/Exposure, platen max 8500×11700):
 
@@ -255,7 +255,7 @@ The scanner is advertising a letter platen on SOAP. The installed Imaging childr
 pnputil /remove-device "SWD\DAFWSDPROVIDER\urn:uuid:00000000-0000-4000-8000-0000000000f2\..."
 .\scripts\fakescan.ps1 aep          # expect Fake WSD scanner, CanPair=True
 .\scripts\fakescan.ps1 discoverable # verdict aep-pairable
-.\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
+.\scripts\fakescan.ps1 install -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120
 # person: Printers & scanners → Add device next to Fake WSD scanner
 .\scripts\fakescan.ps1 wia
 # -v logs should show Connect → Subscribe (DestinationResponses) → GetScannerElements
@@ -330,7 +330,7 @@ Remove-FakescanScanner                 # removes Image + SoftwareDevice nodes (n
 # then: .\scripts\fakescan.ps1 wia  -> FakescanInWia=True (if it works)
 
 # If Associate fails or FD shows empty:
-.\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
+.\scripts\fakescan.ps1 install -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120
 # (person Add device fallback)
 ```
 
@@ -362,7 +362,7 @@ Remove-FakescanScanner                 # removes Image + SoftwareDevice nodes (n
 ```powershell
 .\scripts\fakescan.ps1 elevated
 # then in the elevated window:
-.\scripts\prove-associate.ps1 -BaseUrl http://192.168.1.70:3920
+.\scripts\prove-associate.ps1 -BaseUrl http://192.0.2.10:3920
 ```
 
 **Expected HRs (when FD has an Installable hit):**
@@ -381,8 +381,8 @@ Remove-FakescanScanner                 # removes Image + SoftwareDevice nodes (n
 
 **Sticky WIA risk (documented):**
 - Remove may leave or immediately restore Imaging + SoftwareDevice nodes; while they remain, FD does not expose Installable and Associate cannot fire.
-- fakescan keeps running with the same `--device-uuid=000f2 --advertise 192.168.1.70 --port 3920`. Do **not** restart it between remove and prove.
-- If Associate fails or FD finds 0 instances, recovery is: `.\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120` (person Add device).
+- fakescan keeps running with the same `--device-uuid=000f2 --advertise 192.0.2.10 --port 3920`. Do **not** restart it between remove and prove.
+- If Associate fails or FD finds 0 instances, recovery is: `.\scripts\fakescan.ps1 install -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120` (person Add device).
 - fakeprint (`:3921`) is never touched by `Remove-FakescanScanner` (name/UUID filter is Fake-only).
 
 ## Matrix (from this run)

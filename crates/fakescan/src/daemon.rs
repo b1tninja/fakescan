@@ -121,11 +121,11 @@ mod tests {
             Path::new(r"C:\x\fakescan.exe"),
             Path::new(r"C:\x\profiles"),
             Some("0.0.0.0:3920"),
-            Some("192.168.1.70"),
+            Some("192.0.2.10"),
         );
         assert_eq!(
             c,
-            r#""C:\x\fakescan.exe" --manage --profiles "C:\x\profiles" --listen 0.0.0.0:3920 --advertise 192.168.1.70"#
+            r#""C:\x\fakescan.exe" --manage --profiles "C:\x\profiles" --listen 0.0.0.0:3920 --advertise 192.0.2.10"#
         );
         let a = create_args(&c);
         assert!(a.contains(&"ONLOGON".to_string()) && a.contains(&"LIMITED".to_string()));

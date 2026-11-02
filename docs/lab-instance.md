@@ -44,7 +44,7 @@ Row shape (every new field is optional on read):
 ```jsonc
 {
   "name": "tray5",
-  "listen": "0.0.0.0:3920", "advertise": "192.168.1.70",
+  "listen": "0.0.0.0:3920", "advertise": "192.0.2.10",
   "device_uuid": "00000000-0000-4000-8000-0000000000a5",
   "profile": "feeder-tray5",
   "friendly_name": "fakescan tray5",
@@ -111,7 +111,7 @@ Example (one instance, old single-row format, still valid):
     {
       "name": "default",
       "listen": "0.0.0.0:3920",
-      "advertise": "192.168.1.70",
+      "advertise": "192.0.2.10",
       "device_uuid": "00000000-0000-4000-8000-0000000000f2",
       "profile": "brother-wsd",
       "exe": "D:\\temp\\fakescan-target\\debug\\fakescan.exe",
@@ -206,7 +206,7 @@ the process started.
 
 ```bash
 # Start with name
-fakescan --lab-name default --advertise 192.168.1.70
+fakescan --lab-name default --advertise 192.0.2.10
 # After changing profile:
 curl -X POST http://127.0.0.1:3920/v1/ctl -d '{"cmd":"profile","args":{"id":"brother-usb"}}'
 curl -X POST http://127.0.0.1:3920/v1/ctl -d '{"cmd":"save"}'
@@ -239,7 +239,7 @@ Cursor / Claude MCP config entry (stdio):
 {
   "fakescan": {
     "command": "fakescan-mcp",
-    "args": ["--base-url", "http://192.168.1.70:3920"]
+    "args": ["--base-url", "http://192.0.2.10:3920"]
   }
 }
 ```
@@ -275,7 +275,7 @@ Add-device pass.
 
 ```powershell
 $a = New-ScheduledTaskAction -Execute fakescan.exe `
-     -Argument "--lab-name default --listen 0.0.0.0:3920 --advertise 192.168.1.70"
+     -Argument "--lab-name default --listen 0.0.0.0:3920 --advertise 192.0.2.10"
 $t = New-ScheduledTaskTrigger -AtLogOn
 Register-ScheduledTask -TaskName FakescanLab -Action $a -Trigger $t -RunLevel Highest
 ```
@@ -295,7 +295,7 @@ capabilities stay the same.
 **Install the logon task** (per user, unelevated; not a Windows service):
 
 ```powershell
-fakescan.exe daemon install --profiles D:\code\fakescan\profiles --listen 0.0.0.0:3920 --advertise 192.168.1.70
+fakescan.exe daemon install --profiles .\profiles --listen 0.0.0.0:3920 --advertise 192.0.2.10
 fakescan.exe daemon status      # shows the scheduled task `fakescan-daemon`
 fakescan.exe daemon uninstall
 ```
@@ -371,10 +371,10 @@ Older binaries without `GET /v1/ctl` still attach via `/health` + `/v1/status`.
 .\scripts\fakescan.ps1 ensure
 
 # Beep-free for shared offices
-.\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -Quiet
+.\scripts\fakescan.ps1 install -BaseUrl http://192.0.2.10:3920 -Quiet
 
 # Flash terminal window as well (good for background automation)
-.\scripts\fakescan.ps1 rebind -BaseUrl http://192.168.1.70:3920 -Loud
+.\scripts\fakescan.ps1 rebind -BaseUrl http://192.0.2.10:3920 -Loud
 
 # Direct attention signal without running install flow
 .\scripts\fakescan.ps1 add-device -Loud
