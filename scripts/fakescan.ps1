@@ -171,17 +171,17 @@ Control plane:
 Examples:
   .\scripts\fakescan.ps1 status
   .\scripts\fakescan.ps1 soap -BaseUrl http://192.168.1.10:3920
-  .\scripts\fakescan.ps1 discoverable -BaseUrl http://192.168.1.70:3920
+  .\scripts\fakescan.ps1 discoverable -BaseUrl http://192.0.2.10:3920
   .\scripts\fakescan.ps1 fd
   .\scripts\fakescan.ps1 aep
   .\scripts\fakescan.ps1 swd
-  .\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -ProbeDiscovery -WaitSeconds 120
+  .\scripts\fakescan.ps1 install -BaseUrl http://192.0.2.10:3920 -ProbeDiscovery -WaitSeconds 120
   .\scripts\fakescan.ps1 helper
   .\scripts\fakescan.ps1 helper remove
   .\scripts\fakescan.ps1 elevated
   .\scripts\fakescan.ps1 remove
-  .\scripts\fakescan.ps1 rebind -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
-  .\scripts\fakescan.ps1 e2e -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120 -Remove
+  .\scripts\fakescan.ps1 rebind -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120
+  .\scripts\fakescan.ps1 e2e -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120 -Remove
   .\scripts\fakescan.ps1 fault "{""jam_after_n"":2}"
   .\scripts\fakescan.ps1 lab loopback-soap page0.jpg page1.jpg
 '@ | Write-Host

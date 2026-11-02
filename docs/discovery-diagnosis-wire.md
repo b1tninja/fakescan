@@ -3,19 +3,19 @@
 Scope: what fakescan puts on the wire. Windows state (event logs, interfaces, firewall, pairing store) is out of scope here.
 Date: 2026-10-12. The live daemon (:3920, uuid ...f2) was only read passively (its log file) and never contacted. The Brother was never contacted.
 
-## 1. Finding that changes the premise: Windows (192.168.1.70) never fetched our metadata
+## 1. Finding that changes the premise: Windows (192.0.2.10) never fetched our metadata
 
 `D:\temp\fakescan-daemon\out.log` (daemon start 01:33Z to 01:50Z) has 622 `/WebServices/Device` + `/ScannerService` requests:
 
-- 618 from **192.168.1.81**: a Get every 5 s, sequential ephemeral source ports 36232..60074. All are inside 32768-60999, i.e. a Linux client, not Windows (49152+).
+- 618 from **192.0.2.30**: a Get every 5 s, sequential ephemeral source ports 36232..60074. All are inside 32768-60999, i.e. a Linux client, not Windows (49152+).
 - 4 from 127.0.0.1 (our own `GetScannerElements` probes).
-- **0 from 192.168.1.70**, which is this PC. A Windows host fetching its own XAddrs would show peer=192.168.1.70.
+- **0 from 192.0.2.10**, which is this PC. A Windows host fetching its own XAddrs would show peer=192.0.2.10.
 
 So "Windows SOAP-Gets after Hello" (docs/windows.md lab note) was most likely .81, not WSDAPI on the Add-device PC. If .70's dasHost never Gets, metadata content is not what gates the Add list in the current state: Windows is not acting on the Hello at all, or hides the device earlier (see ranking). Metadata can only matter after a Get happens.
 
-Passive wire checks (read-only UDP listener on 3702 joined to 239.255.255.250 via 192.168.1.70, 14 s and 45 s):
+Passive wire checks (read-only UDP listener on 3702 joined to 239.255.255.250 via 192.0.2.10, 14 s and 45 s):
 
-- Our Hello arrives from 192.168.1.70:<ephemeral>, 1161 bytes, every ~5 s (multicast loop and interface selection are fine at the socket level).
+- Our Hello arrives from 192.0.2.10:<ephemeral>, 1161 bytes, every ~5 s (multicast loop and interface selection are fine at the socket level).
 - No Probe/Resolve from Windows and no other device's Hello during those windows.
 - 3702 is shared (dasHost pid 7644 and an svchost both hold 0.0.0.0:3702), and a third reuse-socket binds and receives multicast fine, so `--probe-listen` can bind here.
 
@@ -84,7 +84,7 @@ No wire-level defect found in the metadata or Hello. This was not compared again
 
 ## 6. Live daemon step (user applies)
 
-Rebuild and restart the daemon, adding `--probe-listen` to its command line to test candidate 2. Then watch the log for `WS-Discovery request ... kind=ProbeMatch/ResolveMatch` and for a Get with peer=192.168.1.70.
+Rebuild and restart the daemon, adding `--probe-listen` to its command line to test candidate 2. Then watch the log for `WS-Discovery request ... kind=ProbeMatch/ResolveMatch` and for a Get with peer=192.0.2.10.
 
 ## 7. Could not verify
 

@@ -26,17 +26,17 @@ Import-Module .\scripts\Fakescan.psm1
 .\scripts\fakescan.ps1 status
 .\scripts\fakescan.ps1 soap -BaseUrl http://127.0.0.1:3920
 .\scripts\fakescan.ps1 discover
-.\scripts\fakescan.ps1 discoverable -BaseUrl http://192.168.1.70:3920
+.\scripts\fakescan.ps1 discoverable -BaseUrl http://192.0.2.10:3920
 .\scripts\fakescan.ps1 fd
 .\scripts\fakescan.ps1 aep
 .\scripts\fakescan.ps1 swd
 .\scripts\fakescan.ps1 wia
 .\scripts\fakescan.ps1 pages 3
-.\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -ProbeDiscovery -WaitSeconds 120
+.\scripts\fakescan.ps1 install -BaseUrl http://192.0.2.10:3920 -ProbeDiscovery -WaitSeconds 120
 .\scripts\fakescan.ps1 helper     # one UAC; then helper remove|whatif|unpair|bounce-fd|stop (suite stays unelevated)
 .\scripts\fakescan.ps1 elevated   # interactive UAC shell (remove / rebind / associate)
 .\scripts\fakescan.ps1 remove     # needs elevation in-process, or use helper remove
-.\scripts\fakescan.ps1 e2e -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
+.\scripts\fakescan.ps1 e2e -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120
 ```
 
 ### What each command does
@@ -104,7 +104,7 @@ Quick signals:
 | SWD DAFWSDPROVIDER | PnP association already created (installed WSD) | `swd` / `Get-FakescanSwdDevices` |
 | Already in WIA | Windows already installed it | `wia` / `discoverable` -> `AlreadyInstalled` |
 
-Lab note (2026-10-11, this PC `--advertise 192.168.1.70`):
+Lab note (2026-10-11, this PC `--advertise 192.0.2.10`):
 
 1. Early: **on-wire-discoverable** — Hellos + SOAP Get; FD/AEP only Brother.
 2. After restart with fresh `--device-uuid` + `--probe-listen` (+ ResolveMatch support in discovery): WinRT **`aep` lists `Fake WSD scanner (lite caps)` with `CanPair=true`** → verdict **`aep-pairable`**. Function Discovery COM still often omits fakescan.
@@ -115,7 +115,7 @@ Lab note (2026-10-11, this PC `--advertise 192.168.1.70`):
 .\scripts\fakescan.ps1 aep          # expect Fake WSD scanner, CanPair=True
 .\scripts\fakescan.ps1 discoverable # verdict aep-pairable
 .\scripts\fakescan.ps1 pair         # experimental; expect Failed
-.\scripts\fakescan.ps1 install -BaseUrl http://192.168.1.70:3920 -WaitSeconds 120
+.\scripts\fakescan.ps1 install -BaseUrl http://192.0.2.10:3920 -WaitSeconds 120
 # person: Printers & scanners → Add device next to Fake WSD scanner
 ```
 
@@ -177,8 +177,8 @@ Prefer a normal terminal (no UAC window) so logs stay visible:
 # Stop any previous fakescan.exe first.
 $env:RUST_LOG = 'fakescan=debug,tower_http=debug'   # optional; -v does the same when RUST_LOG unset
 & D:\temp\fakescan-target\debug\fakescan.exe `
-  --listen 0.0.0.0:3920 --advertise 192.168.1.70 `
-  --profiles D:\code\fakescan\profiles --profile brother-wsd `
+  --listen 0.0.0.0:3920 --advertise 192.0.2.10 `
+  --profiles .\profiles --profile brother-wsd `
   --device-uuid 00000000-0000-4000-8000-0000000000f2 `
   --probe-listen -v
 ```

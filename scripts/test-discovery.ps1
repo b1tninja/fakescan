@@ -14,7 +14,7 @@
     3. Find-FakescanDiscovery gets a fakescan ProbeMatch
 
 .EXAMPLE
-  .\scripts\test-discovery.ps1 -BaseUrl http://192.168.1.70:3920
+  .\scripts\test-discovery.ps1 -BaseUrl http://192.0.2.10:3920
 #>
 [CmdletBinding()]
 param(

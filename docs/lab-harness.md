@@ -88,7 +88,7 @@ Every ScanService request that carries a ticket (`ValidateScanTicket`, `CreateSc
 .\scripts\fakescan.ps1 wia-trace
 ```
 
-`wia-trace` connects only the Fake WIA device, prints the COM HRESULT and elapsed ms, and diffs `/v1/trace` (or `/v1/activity`) across that Connect. Rechecked with Fake installed as "Fake WSD scanner (lite caps)" and fakescan answering `http://192.168.1.70:3920`: Connect failed in about 26 ms with HRESULT `0x80210001` and no ScannerService call.
+`wia-trace` connects only the Fake WIA device, prints the COM HRESULT and elapsed ms, and diffs `/v1/trace` (or `/v1/activity`) across that Connect. Rechecked with Fake installed as "Fake WSD scanner (lite caps)" and fakescan answering `http://192.0.2.10:3920`: Connect failed in about 26 ms with HRESULT `0x80210001` and no ScannerService call.
 
 ## Python API
 
@@ -172,7 +172,7 @@ fakescan-lab --base-url http://127.0.0.1:3920 profile brother-wsd
 **SOAP path:**
 
 ```bash
-fakescan-lab --base-url http://127.0.0.1:3920 acquire-dib --out D:/temp/platen-dib.bmp --dpi 200
+fakescan-lab --base-url http://127.0.0.1:3920 acquire-dib --out platen-dib.bmp --dpi 200
 # restores the previous profile by default (--restore-profile '' leaves accept-dib)
 ```
 
@@ -186,7 +186,7 @@ Needs Fake listed in Imaging / `pdfcraft-cli scan devices`. WIA usually **re-enc
 
 ```bash
 fakescan-lab loopback-wia page0.jpg page1.jpg \
-  --pdfcraft-cli D:/code/pdfcraft/target/release/pdfcraft-cli.exe
+  --pdfcraft-cli path/to/pdfcraft-cli.exe
 # arm only (no CLI):
 fakescan-lab loopback-wia page0.jpg --arm-only
 ```

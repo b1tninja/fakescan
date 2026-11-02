@@ -756,7 +756,7 @@ mod tests {
       "port_policy": {"base": 3920, "step": 2},
       "future_top": {"k": 1},
       "devices": [
-        {"name": "default", "listen": "0.0.0.0:3920", "advertise": "192.168.1.70",
+        {"name": "default", "listen": "0.0.0.0:3920", "advertise": "192.0.2.10",
          "device_uuid": "00000000-0000-4000-8000-0000000000f2", "profile": "brother-wsd",
          "exe": "C:\\x\\fakescan.exe", "autostart": true, "added": {"pnp": true}, "mystery": [1,2]},
         {"name": "bpl0", "listen": "0.0.0.0:3922", "advertise": "",
